@@ -15,19 +15,16 @@
  *   limitations under the License.
  */
 
-#ifndef SRC_COUCH_KVSTORE_COUCH_KVSTORE_H_
-#define SRC_COUCH_KVSTORE_COUCH_KVSTORE_H_ 1
+#ifndef SRC_NOP_KVSTORE_COUCH_KVSTORE_H_
+#define SRC_NOP_KVSTORE_COUCH_KVSTORE_H_ 1
 
 #include "config.h"
-#include "libcouchstore/couch_db.h"
 
 #include <map>
 #include <string>
 #include <vector>
 
 #include "configuration.h"
-#include "couch-kvstore/couch-fs-stats.h"
-#include "couch-kvstore/couch-notifier.h"
 #include "histo.h"
 #include "item.h"
 #include "kvstore.h"
@@ -36,229 +33,13 @@
 
 #define COUCHSTORE_NO_OPTIONS 0
 
-/**
- * Stats and timings for couchKVStore
- */
-class CouchKVStoreStats {
-
-public:
-    /**
-     * Default constructor
-     */
-    CouchKVStoreStats() :
-      docsCommitted(0), numOpen(0), numClose(0),
-      numLoadedVb(0), numGetFailure(0), numSetFailure(0),
-      numDelFailure(0), numOpenFailure(0), numVbSetFailure(0),
-      readSizeHisto(ExponentialGenerator<size_t>(1, 2), 25),
-      writeSizeHisto(ExponentialGenerator<size_t>(1, 2), 25) {
-    }
-
-    void reset() {
-        docsCommitted.store(0);
-        numOpen.store(0);
-        numClose.store(0);
-        numLoadedVb.store(0);
-        numGetFailure.store(0);
-        numSetFailure.store(0);
-        numDelFailure.store(0);
-        numOpenFailure.store(0);
-        numVbSetFailure.store(0);
-
-        readTimeHisto.reset();
-        readSizeHisto.reset();
-        writeTimeHisto.reset();
-        writeSizeHisto.reset();
-        delTimeHisto.reset();
-        compactHisto.reset();
-        commitHisto.reset();
-        saveDocsHisto.reset();
-        batchSize.reset();
-        fsStats.reset();
-    }
-
-    // the number of docs committed
-    AtomicValue<size_t> docsCommitted;
-    // the number of open() calls
-    AtomicValue<size_t> numOpen;
-    // the number of close() calls
-    AtomicValue<size_t> numClose;
-    // the number of vbuckets loaded
-    AtomicValue<size_t> numLoadedVb;
-
-    //stats tracking failures
-    AtomicValue<size_t> numGetFailure;
-    AtomicValue<size_t> numSetFailure;
-    AtomicValue<size_t> numDelFailure;
-    AtomicValue<size_t> numOpenFailure;
-    AtomicValue<size_t> numVbSetFailure;
-
-    /* for flush and vb delete, no error handling in CouchKVStore, such
-     * failure should be tracked in MC-engine  */
-
-    // How long it takes us to complete a read
-    Histogram<hrtime_t> readTimeHisto;
-    // How big are our reads?
-    Histogram<size_t> readSizeHisto;
-    // How long it takes us to complete a write
-    Histogram<hrtime_t> writeTimeHisto;
-    // How big are our writes?
-    Histogram<size_t> writeSizeHisto;
-    // Time spent in delete() calls.
-    Histogram<hrtime_t> delTimeHisto;
-    // Time spent in couchstore commit
-    Histogram<hrtime_t> commitHisto;
-    // Time spent in couchstore compaction
-    Histogram<hrtime_t> compactHisto;
-    // Time spent in couchstore save documents
-    Histogram<hrtime_t> saveDocsHisto;
-    // Batch size of saveDocs calls
-    Histogram<size_t> batchSize;
-
-    // Stats from the underlying OS file operations done by couchstore.
-    CouchstoreStats fsStats;
-};
-
 class EventuallyPersistentEngine;
 class EPStats;
-
-typedef union {
-    Callback <mutation_result> *setCb;
-    Callback <int> *delCb;
-} CouchRequestCallback;
-
-// Additional 2 Bytes included: 1 for flex_meta_code and the other for datatype field
-const size_t COUCHSTORE_METADATA_SIZE(2 * sizeof(uint32_t) + sizeof(uint64_t) +
-                                      FLEX_DATA_OFFSET + EXT_META_LEN);
-
-/**
- * Class representing a document to be persisted in couchstore.
- */
-class CouchRequest
-{
-public:
-    /**
-     * Constructor
-     *
-     * @param it Item instance to be persisted
-     * @param rev vbucket database revision number
-     * @param cb persistence callback
-     * @param del flag indicating if it is an item deletion or not
-     */
-    CouchRequest(const Item &it, uint64_t rev, CouchRequestCallback &cb, bool del);
-
-    /**
-     * Get the vbucket id of a document to be persisted
-     *
-     * @return vbucket id of a document
-     */
-    uint16_t getVBucketId(void) {
-        return vbucketId;
-    }
-
-    /**
-     * Get the revision number of the vbucket database file
-     * where the document is persisted
-     *
-     * @return revision number of the corresponding vbucket database file
-     */
-    uint64_t getRevNum(void) {
-        return fileRevNum;
-    }
-
-    /**
-     * Get the couchstore Doc instance of a document to be persisted
-     *
-     * @return pointer to the couchstore Doc instance of a document
-     */
-    Doc *getDbDoc(void) {
-        if (deleteItem) {
-            return NULL;
-        } else {
-            return &dbDoc;
-        }
-    }
-
-    /**
-     * Get the couchstore DocInfo instance of a document to be persisted
-     *
-     * @return pointer to the couchstore DocInfo instance of a document
-     */
-    DocInfo *getDbDocInfo(void) {
-        return &dbDocInfo;
-    }
-
-    /**
-     * Get the callback instance for SET
-     *
-     * @return callback instance for SET
-     */
-    Callback<mutation_result> *getSetCallback(void) {
-        return callback.setCb;
-    }
-
-    /**
-     * Get the callback instance for DELETE
-     *
-     * @return callback instance for DELETE
-     */
-    Callback<int> *getDelCallback(void) {
-        return callback.delCb;
-    }
-
-    /**
-     * Get the time in ns elapsed since the creation of this instance
-     *
-     * @return time in ns elapsed since the creation of this instance
-     */
-    hrtime_t getDelta() {
-        return (gethrtime() - start) / 1000;
-    }
-
-    /**
-     * Get the length of a document body to be persisted
-     *
-     * @return length of a document body
-     */
-    size_t getNBytes() {
-        return dbDocInfo.rev_meta.size + dbDocInfo.size;
-    }
-
-    /**
-     * Return true if the document to be persisted is for DELETE
-     *
-     * @return true if the document to be persisted is for DELETE
-     */
-    bool isDelete() {
-        return deleteItem;
-    };
-
-    /**
-     * Get the key of a document to be persisted
-     *
-     * @return key of a document to be persisted
-     */
-    const std::string& getKey(void) const {
-        return key;
-    }
-
-private :
-    value_t value;
-    uint8_t meta[COUCHSTORE_METADATA_SIZE];
-    uint16_t vbucketId;
-    uint64_t fileRevNum;
-    std::string key;
-    Doc dbDoc;
-    DocInfo dbDocInfo;
-    bool deleteItem;
-    CouchRequestCallback callback;
-
-    hrtime_t start;
-};
 
 /**
  * KVStore with couchstore as the underlying storage system
  */
-class CouchKVStore : public KVStore
+class NopKVStore : public KVStore
 {
 public:
     /**
@@ -267,19 +48,19 @@ public:
      * @param theEngine EventuallyPersistentEngine instance
      * @param read_only flag indicating if this kvstore instance is for read-only operations
      */
-    CouchKVStore(EPStats &stats, Configuration &config, bool read_only = false);
+    NopKVStore(EPStats &stats, Configuration &config, bool read_only = false);
 
     /**
      * Copy constructor
      *
      * @param from the source kvstore instance
      */
-    CouchKVStore(const CouchKVStore &from);
+    NopKVStore(const NopKVStore &from);
 
     /**
      * Deconstructor
      */
-    ~CouchKVStore();
+    ~NopKVStore();
 
     /**
      * Reset database to a clean state.
@@ -552,7 +333,7 @@ public:
                                 bool metaOnly, bool fetchDelete = false);
     ENGINE_ERROR_CODE couchErr2EngineErr(couchstore_error_t errCode);
 
-    CouchKVStoreStats &getCKVStoreStat(void) { return st; }
+    NopKVStoreStats &getCKVStoreStat(void) { return st; }
 
     uint64_t getLastPersistedSeqno(uint16_t vbid);
 
@@ -594,7 +375,7 @@ private:
     bool notifyCompaction(const uint16_t vbid, uint64_t new_rev,
                           uint32_t result, uint64_t header_pos);
 
-    void operator=(const CouchKVStore &from);
+    void operator=(const NopKVStore &from);
 
     void open();
     void close();
@@ -646,7 +427,7 @@ private:
     bool dbFileRevMapPopulated;
 
     /* all stats */
-    CouchKVStoreStats   st;
+    NopKVStoreStats   st;
     couch_file_ops statCollectingFileOps;
     /* vbucket state cache*/
     std::vector<vbucket_state *> cachedVBStates;

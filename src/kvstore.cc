@@ -21,7 +21,7 @@
 #include <string>
 
 #include "common.h"
-#include "couch-kvstore/couch-kvstore.h"
+#include "nop-kvstore/nop-kvstore.h"
 #include "ep_engine.h"
 #include "kvstore.h"
 #include "stats.h"
@@ -34,7 +34,7 @@ KVStore *KVStoreFactory::create(EPStats &stats, Configuration &config,
     KVStore *ret = NULL;
     std::string backend = config.getBackend();
     if (backend.compare("couchdb") == 0) {
-        ret = new CouchKVStore(stats, config, read_only);
+        ret = new NopKVStore(stats, config, read_only);
     } else {
         LOG(EXTENSION_LOG_WARNING, "Unknown backend: [%s]", backend.c_str());
     }
