@@ -162,13 +162,6 @@ public:
    std::vector<vbucket_state *>  listPersistedVbuckets(void);
 
     /**
-     * Retrieve ths list of persisted engine stats
-     *
-     * @param stats map instance where the persisted engine stats will be added
-     */
-    void getPersistedStats(std::map<std::string, std::string> &stats);
-
-    /**
      * Persist a snapshot of the engine stats in the underlying storage.
      *
      * @param engine_stats map instance that contains all the engine stats
@@ -250,36 +243,6 @@ public:
     }
 
     /**
-     * Get the estimated number of items that are going to be loaded during warmup.
-     *
-     * @return the number of estimated items to be loaded during warmup
-     */
-    size_t getEstimatedItemCount(std::vector<uint16_t> &vbs);
-
-    /**
-     * Get the number of deleted items that are persisted to a vbucket file
-     *
-     * @param vbid The vbucket if of the file to get the number of deletes for
-     */
-    size_t getNumPersistedDeletes(uint16_t vbid);
-
-    /**
-     * Get the number of non-deleted items from a vbucket database file
-     *
-     * @param vbid The vbucket of the file to get the number of docs for
-     */
-    size_t getNumItems(uint16_t vbid);
-
-    /**
-     * Get the number of non-deleted items from a vbucket database file
-     *
-     * @param vbid The vbucket of the file to get the number of docs for
-     * @param min_seq The sequence number to start the count from
-     * @param max_seq The sequence number to stop the count at
-     */
-    size_t getNumItems(uint16_t vbid, uint64_t min_seq, uint64_t max_seq);
-
-    /**
      * Do a rollback to the specified seqNo on the particular vbucket
      *
      * @param vbid The vbucket of the file that's to be rolled back
@@ -289,49 +252,6 @@ public:
      */
     RollbackResult rollback(uint16_t vbid, uint64_t rollbackSeqno,
                             shared_ptr<RollbackCB> cb);
-
-    /**
-     * Perform the pre-optimizations before persisting dirty items
-     *
-     * @param items list of dirty items that can be pre-optimized
-     */
-    void optimizeWrites(std::vector<queued_item> &items);
-
-    /**
-     * Add all the kvstore stats to the stat response
-     *
-     * @param prefix stat name prefix
-     * @param add_stat upstream function that allows us to add a stat to the response
-     * @param cookie upstream connection cookie
-     */
-    void addStats(const std::string &prefix, ADD_STAT add_stat, const void *cookie);
-
-    /**
-     * Add all the kvstore timings stats to the stat response
-     *
-     * @param prefix stat name prefix
-     * @param add_stat upstream function that allows us to add a stat to the response
-     * @param cookie upstream connection cookie
-     */
-    void addTimingStats(const std::string &prefix, ADD_STAT add_stat,
-                        const void *c);
-
-    /**
-     * Resets couchstore stats
-     */
-    void resetStats() {
-        st.reset();
-    }
-
-    static int recordDbDump(Db *db, DocInfo *docinfo, void *ctx);
-    static int recordDbStat(Db *db, DocInfo *docinfo, void *ctx);
-    static int getMultiCb(Db *db, DocInfo *docinfo, void *ctx);
-    void readVBState(Db *db, uint16_t vbId, vbucket_state &vbState);
-
-    couchstore_error_t fetchDoc(Db *db, DocInfo *docinfo,
-                                GetValue &docValue, uint16_t vbId,
-                                bool metaOnly, bool fetchDelete = false);
-    ENGINE_ERROR_CODE couchErr2EngineErr(couchstore_error_t errCode);
 
     NopKVStoreStats &getCKVStoreStat(void) { return st; }
 
@@ -343,98 +263,13 @@ public:
     ENGINE_ERROR_CODE getAllKeys(uint16_t vbid, std::string &start_key,
                                  uint32_t count, AllKeysCB *cb);
 
-protected:
-    void loadDB(shared_ptr<Callback<GetValue> > cb,
-                shared_ptr<Callback<CacheLookup> > cl,
-                shared_ptr<Callback<SeqnoRange> > sr,
-                bool keysOnly, uint16_t vbid,
-                uint64_t startSeqno,
-                couchstore_docinfos_options options=COUCHSTORE_NO_OPTIONS);
-    bool setVBucketState(uint16_t vbucketId, vbucket_state &vbstate,
-                         uint32_t vb_change_type, Callback<kvstats_ctx> *cb,
-                         bool notify = true);
-    bool resetVBucket(uint16_t vbucketId, vbucket_state &vbstate) {
-        cachedDocCount[vbucketId] = 0;
-        return setVBucketState(vbucketId, vbstate, VB_STATE_CHANGED, NULL);
-    }
-
-    template <typename T>
-    void addStat(const std::string &prefix, const char *nm, T &val,
-                 ADD_STAT add_stat, const void *c);
-
 private:
-    /**
-     * Notify the result of Compaction to Mccouch
-     *
-     * @param vbid   - the vbucket id of the bucket where compaction was done
-     * @param rev    - the new file revision of the vbucket
-     * @param result - the result of the compaction attempt
-     * @param header_pos - new header position of the file
-     * @return true if mccouch was notified successfully, false otherwise
-     */
-    bool notifyCompaction(const uint16_t vbid, uint64_t new_rev,
-                          uint32_t result, uint64_t header_pos);
-
     void operator=(const NopKVStore &from);
 
-    void open();
-    void close();
-    bool commit2couchstore(Callback<kvstats_ctx> *cb, uint64_t snapStartSeqno,
-                           uint64_t snapEndSeqno);
-
-    uint64_t checkNewRevNum(std::string &dbname, bool newFile = false);
-    void populateFileNameMap(std::vector<std::string> &filenames,
-                             std::vector<uint16_t> *vbids);
-    void remVBucketFromDbFileMap(uint16_t vbucketId);
-    void updateDbFileMap(uint16_t vbucketId, uint64_t newFileRev);
-    couchstore_error_t openDB(uint16_t vbucketId, uint64_t fileRev, Db **db,
-                              uint64_t options, uint64_t *newFileRev = NULL);
-    couchstore_error_t openDB_retry(std::string &dbfile, uint64_t options,
-                                    const couch_file_ops *ops,
-                                    Db **db, uint64_t *newFileRev);
-    couchstore_error_t saveDocs(uint16_t vbid, uint64_t rev, Doc **docs,
-                                DocInfo **docinfos, size_t docCount,
-                                kvstats_ctx &kvctx,
-                                uint64_t snapStartSeqno,
-                                uint64_t snapEndSeqno);
-    void commitCallback(std::vector<CouchRequest *> &committedReqs,
-                        kvstats_ctx &kvctx,
-                        couchstore_error_t errCode);
-    couchstore_error_t saveVBState(Db *db, vbucket_state &vbState);
-    void setDocsCommitted(uint16_t docs);
-    void closeDatabaseHandle(Db *db);
-
-    /**
-     * Remove compact file
-     *
-     * @param dbname
-     * @param vbucket id
-     * @param current db rev number
-     */
-    void removeCompactFile(const std::string &dbname, uint16_t vbid,
-                           uint64_t currentRev);
-
-    void removeCompactFile(const std::string &filename);
-
     EPStats &epStats;
-    Configuration &configuration;
-    const std::string dbname;
-    CouchNotifier *couchNotifier;
-    std::vector<uint64_t>dbFileRevMap;
-    uint16_t numDbFiles;
-    std::vector<CouchRequest *> pendingReqsQ;
-    bool intransaction;
-    bool dbFileRevMapPopulated;
 
-    /* all stats */
-    NopKVStoreStats   st;
-    couch_file_ops statCollectingFileOps;
     /* vbucket state cache*/
     std::vector<vbucket_state *> cachedVBStates;
-    /* deleted docs in each file*/
-    unordered_map<uint16_t, size_t> cachedDeleteCount;
-    /* non-deleted docs in each file */
-    unordered_map<uint16_t, size_t> cachedDocCount;
 
 };
 
