@@ -47,56 +47,6 @@
 #include <JSON_checker.h>
 #include <snappy-c.h>
 
-extern "C" {
-    static int recordDbDumpC(Db *db, DocInfo *docinfo, void *ctx)
-    {
-        return NopKVStore::recordDbDump(db, docinfo, ctx);
-    }
-}
-
-extern "C" {
-    static int getMultiCbC(Db *db, DocInfo *docinfo, void *ctx)
-    {
-        return NopKVStore::getMultiCb(db, docinfo, ctx);
-    }
-}
-
-struct GetMultiCbCtx {
-    GetMultiCbCtx(NopKVStore &c, uint16_t v, vb_bgfetch_queue_t &f) :
-        cks(c), vbId(v), fetches(f) {}
-
-    NopKVStore &cks;
-    uint16_t vbId;
-    vb_bgfetch_queue_t &fetches;
-};
-
-struct StatResponseCtx {
-public:
-    StatResponseCtx(std::map<std::pair<uint16_t, uint16_t>, vbucket_state> &sm,
-                    uint16_t vb) : statMap(sm), vbId(vb) {
-        /* EMPTY */
-    }
-
-    std::map<std::pair<uint16_t, uint16_t>, vbucket_state> &statMap;
-    uint16_t vbId;
-};
-
-struct LoadResponseCtx {
-    shared_ptr<Callback<GetValue> > callback;
-    shared_ptr<Callback<CacheLookup> > lookup;
-    uint16_t vbucketId;
-    bool keysonly;
-    EPStats *stats;
-};
-
-struct AllKeysCtx {
-    AllKeysCtx(AllKeysCB *callback, uint32_t cnt) :
-        cb(callback), count(cnt) { }
-
-    AllKeysCB *cb;
-    uint32_t count;
-};
-
 NopKVStore::NopKVStore(EPStats &stats, Configuration &config, bool read_only) :
     KVStore(read_only), epStats(stats)
 {
@@ -112,12 +62,6 @@ NopKVStore::~NopKVStore() {
 
 void NopKVStore::reset(uint16_t vbucketId)
 {
-    if (vbucketId == 0) {
-	//Notify just for first vbucket
-        RememberingCallback<bool> cb;
-        couchNotifier->flush(cb);
-        cb.waitForValue();
-    }
 }
 
 void NopKVStore::set(const Item &itm, Callback<mutation_result> &cb)
@@ -155,7 +99,8 @@ void NopKVStore::getMulti(uint16_t vb, vb_bgfetch_queue_t &itms)
 void NopKVStore::del(const Item &itm,
                        Callback<int> &cb)
 {
-    cb.callback(ENGINE_KEY_ENOENT);
+    int success = 0;
+    cb.callback(success);
 }
 
 bool NopKVStore::delVBucket(uint16_t vbucket, bool recreate)
@@ -234,10 +179,6 @@ ENGINE_ERROR_CODE NopKVStore::getAllKeys(uint16_t vbid,
                                            std::string &start_key,
                                            uint32_t count,
                                            AllKeysCB *cb) {
-    Db *db = NULL;
-    uint64_t rev = dbFileRevMap[vbid];
-    couchstore_error_t errCode = openDB(vbid, rev, &db,
-                                        COUCHSTORE_OPEN_FLAG_RDONLY);
             return ENGINE_SUCCESS;
 }
 

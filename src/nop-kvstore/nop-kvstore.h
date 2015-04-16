@@ -73,9 +73,7 @@ public:
      * @return true if the transaction is started successfully
      */
     bool begin(void) {
-        cb_assert(!isReadOnly());
-        intransaction = true;
-        return intransaction;
+        return true;
     }
 
     /**
@@ -90,10 +88,6 @@ public:
      * Rollback a transaction (unless not currently in one).
      */
     void rollback(void) {
-        cb_assert(!isReadOnly());
-        if (intransaction) {
-            intransaction = false;
-        }
     }
 
     /**
@@ -252,8 +246,6 @@ public:
      */
     RollbackResult rollback(uint16_t vbid, uint64_t rollbackSeqno,
                             shared_ptr<RollbackCB> cb);
-
-    NopKVStoreStats &getCKVStoreStat(void) { return st; }
 
     uint64_t getLastPersistedSeqno(uint16_t vbid);
 
