@@ -166,7 +166,7 @@ bool NopKVStore::commit(Callback<kvstats_ctx> *cb, uint64_t snapStartSeqno,
 }
 
 uint64_t NopKVStore::getLastPersistedSeqno(uint16_t vbid) {
-    return 0; // TODO paf: 1?
+    return 9; // TODO paf: 1?
 }
 
 RollbackResult NopKVStore::rollback(uint16_t vbid, uint64_t rollbackSeqno,
