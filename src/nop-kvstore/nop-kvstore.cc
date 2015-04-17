@@ -117,7 +117,7 @@ bool NopKVStore::compactVBucket(const uint16_t vbid,
                                   compaction_ctx *hook_ctx,
                                   Callback<compaction_ctx> &cb,
                                   Callback<kvstats_ctx> &kvcb) {
-        return false;
+        return true;
 }
 
 bool NopKVStore::snapshotVBucket(uint16_t vbucketId, vbucket_state &vbstate,
