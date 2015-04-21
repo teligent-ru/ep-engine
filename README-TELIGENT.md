@@ -1,5 +1,5 @@
-введение
-========
+введение по сборке couchbase 3.0.3.teligent ветки под RHEL6 64 bit
+==================================================================
 
 все действия от root.
 
@@ -39,7 +39,8 @@ yum install cmake snappy-devel.x86_64 libicu-devel.x86_64
 установить couchbase-server-3.0.1 
 ---------------------------------
 
-(ссылка выше)
+http://autobuild.teligent.ru/kickstarts/3RD_PARTY/couchbase/RHEL6/x86_64/couchbase-server-community-3.0.1-centos6.x86_64.rpm
+
 (из него возьмётся libv8.so, которую собирать заморочно, а без неё не собирается memcached)
 
 установить спец-выкачиватель git-репозитариев
