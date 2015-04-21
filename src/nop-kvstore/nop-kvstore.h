@@ -266,6 +266,7 @@ private:
     void close();
 
     EPStats &epStats;
+    Configuration &configuration;
     CouchNotifier *couchNotifier;
 
     /* vbucket state cache*/

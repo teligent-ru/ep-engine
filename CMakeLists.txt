@@ -106,8 +106,9 @@ ADD_CUSTOM_COMMAND(OUTPUT
                   COMMENT "Generating code for configuration class")
 
 SET(KVSTORE_SOURCE src/crc32.c src/kvstore.cc src/mutation_log.cc)
-SET(NOP_KVSTORE_SOURCE src/nop-kvstore/nop-kvstore.cc
-            src/nop-kvstore/couch-notifier.cc)
+SET(COUCH_KVSTORE_SOURCE
+            src/couch-kvstore/couch-notifier.cc)
+SET(NOP_KVSTORE_SOURCE src/nop-kvstore/nop-kvstore.cc)
 SET(OBJECTREGISTRY_SOURCE src/objectregistry.cc)
 SET(CONFIG_SOURCE src/configuration.cc
   ${CMAKE_CURRENT_BINARY_DIR}/src/generated_configuration.cc)
@@ -130,7 +131,7 @@ ADD_LIBRARY(ep SHARED
             src/upr-response.cc src/upr-consumer.cc
             src/upr-producer.cc src/upr-stream.cc src/vbucket.cc
             src/vbucketmap.cc src/warmup.cc
-            ${KVSTORE_SOURCE} ${NOP_KVSTORE_SOURCE}
+            ${KVSTORE_SOURCE} ${COUCH_KVSTORE_SOURCE} ${NOP_KVSTORE_SOURCE}
             ${OBJECTREGISTRY_SOURCE} ${CONFIG_SOURCE})
 
 SET_TARGET_PROPERTIES(ep PROPERTIES PREFIX "")

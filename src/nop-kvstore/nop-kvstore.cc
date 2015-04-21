@@ -48,13 +48,14 @@
 #include <snappy-c.h>
 
 NopKVStore::NopKVStore(EPStats &stats, Configuration &config, bool read_only) :
-    KVStore(read_only), epStats(stats), couchNotifier(NULL)
+    KVStore(read_only), epStats(stats), configuration(config), couchNotifier(NULL)
 {
     open();
 }
 
 NopKVStore::NopKVStore(const NopKVStore &copyFrom) :
-    KVStore(copyFrom), epStats(copyFrom.epStats), couchNotifier(NULL)
+    KVStore(copyFrom), epStats(copyFrom.epStats),
+    configuration(copyFrom.configuration), couchNotifier(NULL)
 {
     open();
 }
@@ -140,7 +141,8 @@ bool NopKVStore::compactVBucket(const uint16_t vbid,
                                   Callback<compaction_ctx> &cb,
                                   Callback<kvstats_ctx> &kvcb) {
     // Notify MCCouch that compaction is Done...
-    newHeaderPos = 9; //maybe that'll make it happy? couchstore_get_header_position(targetDb);
+    uint64_t                   new_rev = 0; //maybe it will not mind it actually not changes? fileRev + 1;
+    uint64_t newHeaderPos = 9; //maybe that'll make it happy? couchstore_get_header_position(targetDb);
     bool retVal = notifyCompaction(vbid, new_rev, VB_COMPACTION_DONE,
                                    newHeaderPos);
 
@@ -151,7 +153,7 @@ bool NopKVStore::compactVBucket(const uint16_t vbid,
     return retVal;
 }
 
-bool CouchKVStore::notifyCompaction(const uint16_t vbid, uint64_t new_rev,
+bool NopKVStore::notifyCompaction(const uint16_t vbid, uint64_t new_rev,
                                     uint32_t result, uint64_t header_pos) {
     RememberingCallback<uint16_t> lcb;
 
@@ -176,8 +178,8 @@ bool NopKVStore::snapshotVBucket(uint16_t vbucketId, vbucket_state &vbstate,
     // not sure if this is ever used, so writing to log:
     LOG(EXTENSION_LOG_WARNING,
         "Warning: snapshotVBucket called, returning true blindly, doing no notifications. is this wrong?"
-        " vbucketId[%d], vbstate[%d]",
-        (int)vbucketId, (int)vbstate);
+        " vbucketId[%d], vbstate.state[%d]",
+        (int)vbucketId, (int)vbstate.state);
     return true;
 }
 
