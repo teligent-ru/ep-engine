@@ -73,4 +73,10 @@ V8_DIR=$PWD/v8 make PREFIX=/opt/couchbase CMAKE_PREFIX_PATH=/opt/couchbase
 ~~~
 
 выложить результат
-~~~~~~~~~~~~~~~~~~
+==================
+
+~~~
+[root@rualpe-vm1 ep-engine]# HASH=TODO-set-your-hash scp /opt/couchbase/lib/memcached/ep.so alexander.petrossian@gigant:/var/www/kickstarts/3RD_PARTY/couchbase/RHEL5/x86_64/ep-3.0.1.teligent.2.$HASH-centos5.x86_64.so
+ep.so                                                                                                                                                                                                       100%   21MB  10.7MB/s   00:02    
+[root@rualpe-vm1 ep-engine]# 
+~~~
