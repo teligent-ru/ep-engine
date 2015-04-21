@@ -49,6 +49,10 @@ http://autobuild.teligent.ru/kickstarts/3RD_PARTY/couchbase/RHEL6/x86_64/couchba
 ~~~
 curl https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
 chmod +x ~/bin/repo
+vim ~/bin/repo
+/MIN_GIT_VERSION
+исправьте на
+MIN_GIT_VERSION = (1, 7, 1)
 ~~~
 
 выкачать исходники по манифесту
