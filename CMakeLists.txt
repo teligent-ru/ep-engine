@@ -137,6 +137,8 @@ ADD_LIBRARY(ep SHARED
 SET_TARGET_PROPERTIES(ep PROPERTIES PREFIX "")
 TARGET_LINK_LIBRARIES(ep cJSON JSON_checker dirutils platform ${LIBEVENT_LIBRARIES})
 
+if(FALSE) # teligent does not need this now
+
 ADD_EXECUTABLE(ep-engine_atomic_ptr_test
   tests/module_tests/atomic_ptr_test.cc
   src/atomic.cc
@@ -222,6 +224,7 @@ ADD_LIBRARY(ep_testsuite SHARED
 SET_TARGET_PROPERTIES(ep_testsuite PROPERTIES PREFIX "")
 TARGET_LINK_LIBRARIES(ep_testsuite JSON_checker dirutils platform ${LIBEVENT_LIBRARIES} ${SNAPPY_LIBRARIES})
 
+endif()
 
 #ADD_CUSTOM_COMMAND(OUTPUT
 #                     ${CMAKE_CURRENT_BINARY_DIR}/generated_suite_0.c
