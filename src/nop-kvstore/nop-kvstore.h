@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "configuration.h"
+#include "couch-kvstore/couch-notifier.h"
 #include "histo.h"
 #include "item.h"
 #include "kvstore.h"
@@ -256,9 +257,16 @@ public:
                                  uint32_t count, AllKeysCB *cb);
 
 private:
+    bool notifyCompaction(const uint16_t vbid, uint64_t new_rev,
+                          uint32_t result, uint64_t header_pos);
+
     void operator=(const NopKVStore &from);
 
+    void open();
+    void close();
+
     EPStats &epStats;
+    CouchNotifier *couchNotifier;
 
     /* vbucket state cache*/
     std::vector<vbucket_state *> cachedVBStates;

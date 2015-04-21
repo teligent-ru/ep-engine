@@ -48,24 +48,39 @@
 #include <snappy-c.h>
 
 NopKVStore::NopKVStore(EPStats &stats, Configuration &config, bool read_only) :
-    KVStore(read_only), epStats(stats)
+    KVStore(read_only), epStats(stats), couchNotifier(NULL)
 {
+    open();
 }
 
 NopKVStore::NopKVStore(const NopKVStore &copyFrom) :
-    KVStore(copyFrom), epStats(copyFrom.epStats)
+    KVStore(copyFrom), epStats(copyFrom.epStats), couchNotifier(NULL)
 {
+    open();
 }
 
 NopKVStore::~NopKVStore() {
+    close();
 }
 
 void NopKVStore::reset(uint16_t vbucketId)
 {
+    //cb_assert(!isReadOnly());
+    // TODO CouchKVStore::flush() when couchstore api ready
+
+    if (vbucketId == 0) {
+//Notify just for first vbucket
+        RememberingCallback<bool> cb;
+        couchNotifier->flush(cb);
+        cb.waitForValue();
+    }
 }
 
 void NopKVStore::set(const Item &itm, Callback<mutation_result> &cb)
 {
+    // saveDocs had CouchNotifier logposition notification
+    // lets hope nobody was expecting this notification, not doint it
+    // our logposition never changes anyway, since we're not storing anything
 }
 
 void NopKVStore::get(const std::string &key, uint64_t, uint16_t vb,
@@ -105,7 +120,14 @@ void NopKVStore::del(const Item &itm,
 
 bool NopKVStore::delVBucket(uint16_t vbucket, bool recreate)
 {
-    return true;
+    cb_assert(!isReadOnly());
+    cb_assert(couchNotifier);
+    RememberingCallback<bool> cb;
+
+    couchNotifier->delVBucket(vbucket, cb);
+    cb.waitForValue();
+
+    return cb.val;
 }
 
 std::vector<vbucket_state *> NopKVStore::listPersistedVbuckets()
@@ -117,12 +139,45 @@ bool NopKVStore::compactVBucket(const uint16_t vbid,
                                   compaction_ctx *hook_ctx,
                                   Callback<compaction_ctx> &cb,
                                   Callback<kvstats_ctx> &kvcb) {
-        return true;
+    // Notify MCCouch that compaction is Done...
+    newHeaderPos = 9; //maybe that'll make it happy? couchstore_get_header_position(targetDb);
+    bool retVal = notifyCompaction(vbid, new_rev, VB_COMPACTION_DONE,
+                                   newHeaderPos);
+
+    //if (hook_ctx->expiredItems.size()) {
+        cb.callback(*hook_ctx);
+    //}
+
+    return retVal;
+}
+
+bool CouchKVStore::notifyCompaction(const uint16_t vbid, uint64_t new_rev,
+                                    uint32_t result, uint64_t header_pos) {
+    RememberingCallback<uint16_t> lcb;
+
+    VBStateNotification vbs(0, 0, result, vbid);
+
+    // keeping this, looks like they are not happy without this notification, CB-3
+    couchNotifier->notify_update(vbs, new_rev, header_pos, lcb);
+    if (lcb.val != PROTOCOL_BINARY_RESPONSE_SUCCESS) {
+        LOG(EXTENSION_LOG_WARNING,
+            "Warning: compactor failed to notify mccouch on vbucket "
+                    "%d. err %d", vbid, lcb.val);
+        return false;
+    }
+    return true;
 }
 
 bool NopKVStore::snapshotVBucket(uint16_t vbucketId, vbucket_state &vbstate,
                                    Callback<kvstats_ctx> *cb)
 {
+    // here they were were comparing our vbstate versus passed in argument
+    // when changed, they called setVBucketState which called notifier
+    // not sure if this is ever used, so writing to log:
+    LOG(EXTENSION_LOG_WARNING,
+        "Warning: snapshotVBucket called, returning true blindly, doing no notifications. is this wrong?"
+        " vbucketId[%d], vbstate[%d]",
+        (int)vbucketId, (int)vbstate);
     return true;
 }
 
@@ -167,6 +222,22 @@ bool NopKVStore::commit(Callback<kvstats_ctx> *cb, uint64_t snapStartSeqno,
 
 uint64_t NopKVStore::getLastPersistedSeqno(uint16_t vbid) {
     return 9; // TODO paf: 1?
+}
+
+void NopKVStore::open()
+{
+    // TODO intransaction, is it needed?
+    {//if (!isReadOnly()) {
+        couchNotifier = CouchNotifier::create(epStats, configuration);
+    }
+}
+
+void NopKVStore::close()
+{
+    {//if (!isReadOnly()) {
+        CouchNotifier::deleteNotifier();
+    }
+    couchNotifier = NULL;
 }
 
 RollbackResult NopKVStore::rollback(uint16_t vbid, uint64_t rollbackSeqno,

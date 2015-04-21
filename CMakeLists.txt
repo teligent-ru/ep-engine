@@ -106,7 +106,8 @@ ADD_CUSTOM_COMMAND(OUTPUT
                   COMMENT "Generating code for configuration class")
 
 SET(KVSTORE_SOURCE src/crc32.c src/kvstore.cc src/mutation_log.cc)
-SET(NOP_KVSTORE_SOURCE src/nop-kvstore/nop-kvstore.cc)
+SET(NOP_KVSTORE_SOURCE src/nop-kvstore/nop-kvstore.cc
+            src/nop-kvstore/couch-notifier.cc)
 SET(OBJECTREGISTRY_SOURCE src/objectregistry.cc)
 SET(CONFIG_SOURCE src/configuration.cc
   ${CMAKE_CURRENT_BINARY_DIR}/src/generated_configuration.cc)
