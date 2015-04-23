@@ -48,7 +48,7 @@
 #include <snappy-c.h>
 
 NopKVStore::NopKVStore(EPStats &stats, Configuration &config, bool read_only) :
-    KVStore(read_only), epStats(stats), configuration(config), couchNotifier(NULL)
+    KVStore(read_only), last_modified_vbid(0), epStats(stats), configuration(config), couchNotifier(NULL)
 {
     open();
 
@@ -56,13 +56,16 @@ NopKVStore::NopKVStore(EPStats &stats, Configuration &config, bool read_only) :
     uint16_t numDbFiles = static_cast<uint16_t>(configuration.getMaxVbuckets());
     cachedVBStates.reserve(numDbFiles);
     for (uint16_t i = 0; i < numDbFiles; i++) {
-        // pre-allocate to avoid rehashing for safe read-only operations
-        cachedVBStates.push_back((vbucket_state *)NULL);
+        vbucket_state *state = new vbucket_state(vbucket_state_active,
+            0, // _chkid,
+            0, // _maxDelSeqNum,
+            0); // _highSeqno)
+        cachedVBStates.push_back(state);
     }
 }
 
 NopKVStore::NopKVStore(const NopKVStore &copyFrom) :
-    KVStore(copyFrom), epStats(copyFrom.epStats),
+    KVStore(copyFrom), last_modified_vbid(0), epStats(copyFrom.epStats),
     configuration(copyFrom.configuration), couchNotifier(NULL)
 {
     open();
@@ -111,14 +114,20 @@ void NopKVStore::reset(uint16_t vbucketId)
 
 void NopKVStore::set(const Item &itm, Callback<mutation_result> &cb)
 {
-    // saveDocs had CouchNotifier logposition notification
-    // lets hope nobody was expecting this notification, not doint it
-    // our logposition never changes anyway, since we're not storing anything
+    static const int MUTATION_SUCCESS = 1;
+
+    saveDocs(itm.getVBucketId());
+    mutation_result mr(MUTATION_SUCCESS, true);
+    cb.callback(mr);
 }
 
 void NopKVStore::get(const std::string &key, uint64_t, uint16_t vb,
                        Callback<GetValue> &cb, bool fetchDelete)
 {
+    LOG(EXTENSION_LOG_WARNING,
+        "%s: not implemented. key[%s] vb[%u]",
+        __PRETTY_FUNCTION__, key.c_str(), vb);
+
     GetValue rv;
     rv.setStatus(ENGINE_KEY_ENOENT);
     cb.callback(rv);
@@ -127,6 +136,10 @@ void NopKVStore::get(const std::string &key, uint64_t, uint16_t vb,
 void NopKVStore::getWithHeader(void *dbHandle, const std::string &key,
                                  uint16_t vb, Callback<GetValue> &cb,
                                  bool fetchDelete) {
+    LOG(EXTENSION_LOG_WARNING,
+        "%s: not implemented. key[%s] vb[%u]",
+        __PRETTY_FUNCTION__, key.c_str(), vb);
+
     GetValue rv;
     rv.setStatus(ENGINE_KEY_ENOENT);
     cb.callback(rv);
@@ -147,6 +160,8 @@ void NopKVStore::getMulti(uint16_t vb, vb_bgfetch_queue_t &itms)
 void NopKVStore::del(const Item &itm,
                        Callback<int> &cb)
 {
+    saveDocs(itm.getVBucketId());
+
     int success = 0;
     cb.callback(success);
 }
@@ -277,6 +292,12 @@ bool NopKVStore::setVBucketState(uint16_t vbucketId, vbucket_state &vbstate,
     vbstate.maxDeletedSeqno = state->maxDeletedSeqno;
 
     // TODO: paf there was also if(notify) mech which sends out couchdb position, which we dont have. probaby something may still be wrong :(
+
+    // they originally save state.
+    // God knows if they assume vbstate.highSeqno will change
+    // will bump up highSeqno just in case (enough of failures)
+    saveDocs(vbucketId);
+
     return true;
 }
 
@@ -316,6 +337,18 @@ StorageProperties NopKVStore::getStorageProperties()
 bool NopKVStore::commit(Callback<kvstats_ctx> *cb, uint64_t snapStartSeqno,
                           uint64_t snapEndSeqno)
 {
+    cb_assert(last_modified_vbid);
+    vbucket_state *state = cachedVBStates[last_modified_vbid];
+    cb_assert(state);
+    //state->maxDeletedSeqno = TODO paf?
+    state->lastSnapStart = snapStartSeqno;
+    state->lastSnapEnd = snapEndSeqno;
+
+    // originally they write VBState to storage to retrive it in case of rollback
+    // that structure tases up some space, so +1 below
+    ///moved from here to set/del  state->highSeqno = snapEndSeqno+1;
+
+    // cb call is not needed, it only updates some file size stats which we do not have
     return true;
 }
 
@@ -346,14 +379,32 @@ void NopKVStore::close()
 RollbackResult NopKVStore::rollback(uint16_t vbid, uint64_t rollbackSeqno,
                                       shared_ptr<RollbackCB> cb) {
 
-        return RollbackResult(false, 0, 0, 0);
+    LOG(EXTENSION_LOG_WARNING,
+        "%s: not implemented. vbid[%d] rollbackSeqno[%lu]",
+        __PRETTY_FUNCTION__, vbid, rollbackSeqno);
+    return RollbackResult(false, 0, 0, 0);
 }
 
 ENGINE_ERROR_CODE NopKVStore::getAllKeys(uint16_t vbid,
                                            std::string &start_key,
                                            uint32_t count,
                                            AllKeysCB *cb) {
-            return ENGINE_SUCCESS;
+    LOG(EXTENSION_LOG_WARNING,
+        "%s: not implemented. vbid[%d] start_key[%s] count[%u]",
+        __PRETTY_FUNCTION__, vbid, start_key.c_str(), count);
+
+    return ENGINE_SUCCESS;
+}
+
+void NopKVStore::saveDocs(uint16_t vbid) {
+    last_modified_vbid = vbid;
+    vbucket_state *state = cachedVBStates[vbid];
+    cb_assert(state);
+    state->highSeqno++;
+
+    // saveDocs had CouchNotifier logposition notification
+    // lets hope nobody was expecting this notification, not doint it
+    // our logposition never changes anyway, since we're not storing anything
 }
 
 /* end of nop-kvstore.cc */

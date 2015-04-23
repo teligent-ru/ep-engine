@@ -264,6 +264,8 @@ private:
         return setVBucketState(vbucketId, vbstate, VB_STATE_CHANGED, NULL);
     }
 
+    void saveDocs(uint16_t vbid);
+
 private:
     bool notifyCompaction(const uint16_t vbid, uint64_t new_rev,
                           uint32_t result, uint64_t header_pos);
@@ -273,6 +275,7 @@ private:
     void open();
     void close();
 
+    uint16_t last_modified_vbid;
     EPStats &epStats;
     Configuration &configuration;
     CouchNotifier *couchNotifier;
