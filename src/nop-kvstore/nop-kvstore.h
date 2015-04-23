@@ -257,6 +257,14 @@ public:
                                  uint32_t count, AllKeysCB *cb);
 
 private:
+    bool setVBucketState(uint16_t vbucketId, vbucket_state &vbstate,
+                         uint32_t vb_change_type, Callback<kvstats_ctx> *cb,
+                         bool notify = true);
+    bool resetVBucket(uint16_t vbucketId, vbucket_state &vbstate) {
+        return setVBucketState(vbucketId, vbstate, VB_STATE_CHANGED, NULL);
+    }
+
+private:
     bool notifyCompaction(const uint16_t vbid, uint64_t new_rev,
                           uint32_t result, uint64_t header_pos);
 

@@ -58,10 +58,27 @@ NopKVStore::NopKVStore(const NopKVStore &copyFrom) :
     configuration(copyFrom.configuration), couchNotifier(NULL)
 {
     open();
+
+    // init db file map with default revision number, 1
+    uint16_t numDbFiles = static_cast<uint16_t>(configuration.getMaxVbuckets());
+    cachedVBStates.reserve(numDbFiles);
+    for (uint16_t i = 0; i < numDbFiles; i++) {
+        // pre-allocate to avoid rehashing for safe read-only operations
+        cachedVBStates.push_back((vbucket_state *)NULL);
+    }
 }
 
 NopKVStore::~NopKVStore() {
     close();
+
+    for (std::vector<vbucket_state *>::iterator it = cachedVBStates.begin();
+         it != cachedVBStates.end(); it++) {
+        vbucket_state *vbstate = *it;
+        if (vbstate) {
+            delete vbstate;
+            *it = NULL;
+        }
+    }
 }
 
 void NopKVStore::reset(uint16_t vbucketId)
@@ -74,6 +91,20 @@ void NopKVStore::reset(uint16_t vbucketId)
         RememberingCallback<bool> cb;
         couchNotifier->flush(cb);
         cb.waitForValue();
+    }
+
+    vbucket_state *state = cachedVBStates[vbucketId];
+    if (state) {
+        state->checkpointId = 0;
+        state->maxDeletedSeqno = 0;
+        state->highSeqno = 0;
+        state->lastSnapStart = 0;
+        state->lastSnapEnd = 0;
+        resetVBucket(vbucketId, *state);
+    } else {
+        LOG(EXTENSION_LOG_WARNING, "No entry in cached states "
+                "for vbucket %u", vbucketId);
+        cb_assert(false);
     }
 }
 
@@ -128,6 +159,21 @@ bool NopKVStore::delVBucket(uint16_t vbucket, bool recreate)
     couchNotifier->delVBucket(vbucket, cb);
     cb.waitForValue();
 
+    vbucket_state *vbstate = new vbucket_state(vbucket_state_dead, 0, 0, 0);
+    if (recreate) {
+        if (cachedVBStates[vbucket]) {
+            vbstate->state = cachedVBStates[vbucket]->state;
+            delete cachedVBStates[vbucket];
+        }
+        cachedVBStates[vbucket] = vbstate;
+        resetVBucket(vbucket, *vbstate);
+    } else {
+        if (cachedVBStates[vbucket]) {
+            delete cachedVBStates[vbucket];
+        }
+        cachedVBStates[vbucket] = vbstate;
+    }
+
     return cb.val;
 }
 
@@ -173,13 +219,63 @@ bool NopKVStore::notifyCompaction(const uint16_t vbid, uint64_t new_rev,
 bool NopKVStore::snapshotVBucket(uint16_t vbucketId, vbucket_state &vbstate,
                                    Callback<kvstats_ctx> *cb)
 {
-    // here they were were comparing our vbstate versus passed in argument
-    // when changed, they called setVBucketState which called notifier
-    // not sure if this is ever used, so writing to log:
-    LOG(EXTENSION_LOG_WARNING,
-        "Warning: snapshotVBucket called, returning true blindly, doing no notifications. is this wrong?"
-        " vbucketId[%d], vbstate.state[%d]",
-        (int)vbucketId, (int)vbstate.state);
+    //cb_assert(!isReadOnly());
+    bool success = true;
+
+    bool notify = false;
+    vbucket_state *state = cachedVBStates[vbucketId];
+    uint32_t vb_change_type = VB_NO_CHANGE;
+    if (state) {
+        if (state->state != vbstate.state) {
+            vb_change_type |= VB_STATE_CHANGED;
+            notify = true;
+        }
+        if (state->checkpointId != vbstate.checkpointId) {
+            vb_change_type |= VB_CHECKPOINT_CHANGED;
+            notify = true;
+        }
+
+        if (state->failovers.compare(vbstate.failovers) == 0 &&
+            vb_change_type == VB_NO_CHANGE) {
+            return true; // no changes
+        }
+        state->state = vbstate.state;
+        state->checkpointId = vbstate.checkpointId;
+        state->failovers = vbstate.failovers;
+        // Note that max deleted seq number is maintained within CouchKVStore
+        vbstate.maxDeletedSeqno = state->maxDeletedSeqno;
+    } else {
+        state = new vbucket_state();
+        *state = vbstate;
+        vb_change_type = VB_STATE_CHANGED;
+        cachedVBStates[vbucketId] = state;
+        notify = true;
+    }
+
+    success = setVBucketState(vbucketId, vbstate, vb_change_type, cb,
+                              notify);
+
+    if (!success) {
+        LOG(EXTENSION_LOG_WARNING,
+            "Warning: failed to set new state, %s, for vbucket %d\n",
+            VBucket::toString(vbstate.state), vbucketId);
+        return false;
+    }
+    return success;
+}
+
+bool NopKVStore::setVBucketState(uint16_t vbucketId, vbucket_state &vbstate,
+                                   uint32_t vb_change_type,
+                                   Callback<kvstats_ctx> *kvcb,
+                                   bool notify)
+{
+    vbucket_state *state = cachedVBStates[vbucketId];
+    vbstate.highSeqno = state->highSeqno;
+    vbstate.lastSnapStart = state->lastSnapStart;
+    vbstate.lastSnapEnd = state->lastSnapEnd;
+    vbstate.maxDeletedSeqno = state->maxDeletedSeqno;
+
+    // TODO: paf there was also if(notify) mech which sends out couchdb position, which we dont have. probaby something may still be wrong :(
     return true;
 }
 
@@ -223,7 +319,11 @@ bool NopKVStore::commit(Callback<kvstats_ctx> *cb, uint64_t snapStartSeqno,
 }
 
 uint64_t NopKVStore::getLastPersistedSeqno(uint16_t vbid) {
-    return 9; // TODO paf: 1?
+    vbucket_state *state = cachedVBStates[vbid];
+    if (state) {
+        return state->highSeqno;
+    }
+    return 0;
 }
 
 void NopKVStore::open()
