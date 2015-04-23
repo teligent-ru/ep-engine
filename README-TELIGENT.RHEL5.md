@@ -1,4 +1,4 @@
-введение по сборке couchbase 3.0.3.teligent ветки под RHEL6 64 bit
+введение по сборке couchbase 3.0.3.teligent ветки под RHEL5 64 bit
 ==================================================================
 
 все действия от root.
@@ -7,44 +7,28 @@
 ------------------------------
 
 из образа
-http://autobuild.teligent.ru/kickstarts/isos/RHEL/6/rhel-server-6.6-x86_64-dvd.iso
+http://autobuild.teligent.ru/kickstarts/isos/RHEL/5/rhel-server-5.11-x86_64-dvd.iso
 при установке выбрал пункт "Software development workstation".
-
-добавить в /etc/yum.repo.d файлик local64.repo
-----------------------------------------------
-
-~~~
-[root@rualpe-vm2 v8]# cat /etc/yum.repos.d/local64.repo 
-[local64]
-name=Red Hat Enterprise Linux  -  - Local64
-baseurl=http://autobuild.teligent.ru/kickstarts/redhat/rhel/6/os/x86_64/Server/
-enabled=1
-gpgcheck=0
-
-[opt]
-name=opt
-baseurl=http://autobuild.teligent.ru/kickstarts/redhat/rhel/6/optional/x86_64
-enabled=1
-gpgcheck=0
-[root@rualpe-vm2 v8]# 
-~~~
 
 установить пакеты
 -----------------
 
 ~~~
-yum install cmake snappy-devel.x86_64 libicu-devel.x86_64
+rpm -ihv http://autobuild.teligent.ru/kickstarts/3RD_PARTY/epel/5/x86_64/cmake28-2.8.11.2-2.el5.x86_64.rpm http://autobuild.teligent.ru/kickstarts/3RD_PARTY/epel/5/x86_64/libarchive-2.8.4-6.el5.x86_64.rpm
+ln -sf /usr/bin/cmake28 /usr/bin/cmake
 ~~~
 
 установить couchbase-server-3.0.1 
 ---------------------------------
 
-http://autobuild.teligent.ru/kickstarts/3RD_PARTY/couchbase/RHEL6/x86_64/couchbase-server-community-3.0.1-centos6.x86_64.rpm
+http://autobuild.teligent.ru/kickstarts/3RD_PARTY/couchbase/RHEL5/x86_64/couchbase-server-community-3.0.1-centos5.x86_64.rpm
 
 (из него возьмётся libv8.so, которую собирать заморочно, а без неё не собирается memcached)
 
 установить спец-выкачиватель git-репозитариев
 ---------------------------------------------
+
+TODO: реально поленился выкачивать и клонировал выкачанное на RHEL6.
 
 ~~~
 curl https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
@@ -57,6 +41,8 @@ MIN_GIT_VERSION = (1, 7, 1)
 
 выкачать исходники по манифесту
 -------------------------------
+
+TODO: реально поленился выкачивать и клонировал выкачанное на RHEL6.
 
 (он берёт ep-engine и tlb из веток 3.0.1.teligent, которые начались от 3.0.1 версии, подсмотренной в released/3.0.1.xml)
 ~~~
@@ -71,12 +57,26 @@ repo sync
 -----------------------------------------------------
 
 ~~~
-#v8 собирать самому можно, но очень трудно и долго
-ln -s /opt/couchbase/lib/libv8.so v8/
+vim tlm/cmake/Modules/CouchbaseGccOptions.cmake
+убрать -Wno-overlength-strings
+
+vim memcached/CMakeLists.txt
+#CHECK_INCLUDE_FILE_CXX("atomic" HAVE_ATOMIC)
+
+#это найдёт v8 в /opt/couchbase
 #и указываем на уже собранное:
 V8_DIR=$PWD/v8 make PREFIX=/opt/couchbase CMAKE_PREFIX_PATH=/opt/couchbase
 ...
 -- Installing: /opt/couchbase/lib/memcached/ep.so
 -- Set runtime path of "/opt/couchbase/lib/memcached/ep.so" to "$ORIGIN/../lib:$ORIGIN/../lib/memcached:/opt/couchbase/lib:/opt/couchbase/lib/memcached:/opt/couchbase/lib"
-[root@rualpe-vm2 couchbase# 
+[root@rualpe-vm2 couchbase]#
+~~~
+
+выложить результат
+==================
+
+~~~
+[root@rualpe-vm1 ep-engine]# HASH=TODO-set-your-hash scp /opt/couchbase/lib/memcached/ep.so alexander.petrossian@gigant:/var/www/kickstarts/3RD_PARTY/couchbase/RHEL5/x86_64/ep-3.0.1.teligent.2.$HASH-centos5.x86_64.so
+ep.so                                                                                                                                                                                                       100%   21MB  10.7MB/s   00:02    
+[root@rualpe-vm1 ep-engine]# 
 ~~~
