@@ -51,13 +51,6 @@ NopKVStore::NopKVStore(EPStats &stats, Configuration &config, bool read_only) :
     KVStore(read_only), epStats(stats), configuration(config), couchNotifier(NULL)
 {
     open();
-}
-
-NopKVStore::NopKVStore(const NopKVStore &copyFrom) :
-    KVStore(copyFrom), epStats(copyFrom.epStats),
-    configuration(copyFrom.configuration), couchNotifier(NULL)
-{
-    open();
 
     // init db file map with default revision number, 1
     uint16_t numDbFiles = static_cast<uint16_t>(configuration.getMaxVbuckets());
@@ -66,6 +59,14 @@ NopKVStore::NopKVStore(const NopKVStore &copyFrom) :
         // pre-allocate to avoid rehashing for safe read-only operations
         cachedVBStates.push_back((vbucket_state *)NULL);
     }
+}
+
+NopKVStore::NopKVStore(const NopKVStore &copyFrom) :
+    KVStore(copyFrom), epStats(copyFrom.epStats),
+    configuration(copyFrom.configuration), couchNotifier(NULL)
+{
+    open();
+
 }
 
 NopKVStore::~NopKVStore() {
