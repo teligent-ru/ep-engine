@@ -334,10 +334,17 @@ StorageProperties NopKVStore::getStorageProperties()
     return rv;
 }
 
+bool NopKVStore::begin(void) {
+    last_modified_vbid = 0;
+    return true;
+}
+
 bool NopKVStore::commit(Callback<kvstats_ctx> *cb, uint64_t snapStartSeqno,
                           uint64_t snapEndSeqno)
 {
-    cb_assert(last_modified_vbid);
+    if(!last_modified_vbid)
+        return true;
+    
     vbucket_state *state = cachedVBStates[last_modified_vbid];
     cb_assert(state);
     //state->maxDeletedSeqno = TODO paf?

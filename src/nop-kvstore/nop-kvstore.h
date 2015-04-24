@@ -73,9 +73,7 @@ public:
      *
      * @return true if the transaction is started successfully
      */
-    bool begin(void) {
-        return true;
-    }
+    bool begin(void);
 
     /**
      * Commit a transaction (unless not currently in one).
