@@ -48,7 +48,7 @@
 #include <snappy-c.h>
 
 NopKVStore::NopKVStore(EPStats &stats, Configuration &config, bool read_only) :
-    KVStore(read_only), last_modified_vbid(0), epStats(stats), configuration(config), couchNotifier(NULL)
+    KVStore(read_only), last_modified_vbid(0), changed_docs(0), epStats(stats), configuration(config), couchNotifier(NULL)
 {
     open();
 
@@ -65,7 +65,7 @@ NopKVStore::NopKVStore(EPStats &stats, Configuration &config, bool read_only) :
 }
 
 NopKVStore::NopKVStore(const NopKVStore &copyFrom) :
-    KVStore(copyFrom), last_modified_vbid(0), epStats(copyFrom.epStats),
+    KVStore(copyFrom), last_modified_vbid(0), changed_docs(0), epStats(copyFrom.epStats),
     configuration(copyFrom.configuration), couchNotifier(NULL)
 {
     open();
@@ -383,7 +383,7 @@ bool NopKVStore::commit(Callback<kvstats_ctx> *cb, uint64_t snapStartSeqno,
     //state->maxDeletedSeqno = TODO paf?
     state->lastSnapStart = snapStartSeqno;
     state->lastSnapEnd = snapEndSeqno;
-    state->highSeqno++;
+    state->highSeqno+=changed_docs;
     
     // originally they write VBState to storage to retrive it in case of rollback
     // that structure tases up some space, so +1 below
@@ -442,6 +442,7 @@ void NopKVStore::saveDocs(uint16_t vbid) {
     vbucket_state *state = cachedVBStates[vbid];
     cb_assert(state);
 //    state->highSeqno++;
+    changed_docs++;
 
     // saveDocs had CouchNotifier logposition notification
     // lets hope nobody was expecting this notification, not doint it

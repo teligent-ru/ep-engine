@@ -274,6 +274,7 @@ private:
     void close();
 
     uint16_t last_modified_vbid;
+    uint16_t changed_docs;
     EPStats &epStats;
     Configuration &configuration;
     CouchNotifier *couchNotifier;
