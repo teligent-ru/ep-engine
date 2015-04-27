@@ -309,7 +309,7 @@ bool NopKVStore::setVBucketState(uint16_t vbucketId, vbucket_state &vbstate,
     vbstate.lastSnapStart = state->lastSnapStart;
     vbstate.lastSnapEnd = state->lastSnapEnd;
     vbstate.maxDeletedSeqno = state->maxDeletedSeqno;
-
+/*
     // they originally save state.
     // God knows if they assume vbstate.highSeqno will change
     // will bump up highSeqno just in case (enough of failures)
@@ -318,10 +318,10 @@ bool NopKVStore::setVBucketState(uint16_t vbucketId, vbucket_state &vbstate,
         uint64_t newHeaderPos = state->highSeqno;
         RememberingCallback<uint16_t> lcb;
 
-        VBStateNotification vbs(0/*vbstate.checkpointId*/, vbstate.state,
+        VBStateNotification vbs(0/*vbstate.checkpointId* /, vbstate.state,
                 vb_change_type, vbucketId);
 
-        couchNotifier->notify_update(vbs, 1/*fileRev*/, newHeaderPos, lcb);
+        couchNotifier->notify_update(vbs, 1/*fileRev* /, newHeaderPos, lcb);
         if (lcb.val != PROTOCOL_BINARY_RESPONSE_SUCCESS) {
             cb_assert(lcb.val != PROTOCOL_BINARY_RESPONSE_ETMPFAIL);
             LOG(EXTENSION_LOG_WARNING,
@@ -330,7 +330,7 @@ bool NopKVStore::setVBucketState(uint16_t vbucketId, vbucket_state &vbstate,
                     vbucketId, lcb.val);
             return false;
         }
-
+*/
     return true;
 }
 
