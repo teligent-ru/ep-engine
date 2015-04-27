@@ -43,6 +43,9 @@ failover_entry_t FailoverTable::getLatestEntry() {
 }
 
 void FailoverTable::createEntry(uint64_t high_seqno) {
+        LOG(EXTENSION_LOG_WARNING, "%s (%llu)",
+            __FUNCTION__, high_seqno);
+
     LockHolder lh(lock);
     // Our failover table represents only *our* branch of history.
     // We must remove branches we've diverged from.
@@ -113,6 +116,9 @@ bool FailoverTable::needsRollback(uint64_t start_seqno,
 }
 
 void FailoverTable::pruneEntries(uint64_t seqno) {
+        LOG(EXTENSION_LOG_WARNING, "%s (%llu)",
+            __FUNCTION__, seqno);
+
     LockHolder lh(lock);
     table_t::iterator it = table.begin();
     for (; it != table.end(); ++it) {
@@ -187,6 +193,9 @@ ENGINE_ERROR_CODE FailoverTable::addFailoverLog(const void* cookie,
 }
 
 bool FailoverTable::loadFromJSON(cJSON *json) {
+        LOG(EXTENSION_LOG_WARNING, "%s (todo)",
+            __FUNCTION__);
+
     if (json->type != cJSON_Array) {
         return false;
     }
@@ -216,6 +225,9 @@ bool FailoverTable::loadFromJSON(cJSON *json) {
 }
 
 bool FailoverTable::loadFromJSON(const std::string& json) {
+        LOG(EXTENSION_LOG_WARNING, "%s (%s)",
+            __FUNCTION__, json.c_str());
+
     cJSON* parsed = cJSON_Parse(json.c_str());
     bool ret = true;
 
@@ -229,6 +241,9 @@ bool FailoverTable::loadFromJSON(const std::string& json) {
 }
 
 void FailoverTable::replaceFailoverLog(uint8_t* bytes, uint32_t length) {
+        LOG(EXTENSION_LOG_WARNING, "%s (TODO)",
+            __FUNCTION__);
+
     LockHolder lh(lock);
     cb_assert((length % 16) == 0 && length != 0);
     table.clear();

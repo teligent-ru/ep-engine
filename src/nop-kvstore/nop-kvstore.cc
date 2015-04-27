@@ -114,6 +114,11 @@ void NopKVStore::reset(uint16_t vbucketId)
 
 void NopKVStore::set(const Item &itm, Callback<mutation_result> &cb)
 {
+    vbucket_state *state = cachedVBStates[itm.getVBucketId()];
+            LOG(EXTENSION_LOG_WARNING,
+                    "%s itm.getVBucketId[%u] state->highSeqno[%llu]\n",
+                    __FUNCTION__, itm.getVBucketId(), state? state->highSeqno: -1);
+
     static const int MUTATION_SUCCESS = 1;
 
     saveDocs(itm.getVBucketId());
@@ -160,6 +165,11 @@ void NopKVStore::getMulti(uint16_t vb, vb_bgfetch_queue_t &itms)
 void NopKVStore::del(const Item &itm,
                        Callback<int> &cb)
 {
+    vbucket_state *state = cachedVBStates[itm.getVBucketId()];
+            LOG(EXTENSION_LOG_WARNING,
+                    "%s itm.getVBucketId[%u] state->highSeqno[%llu]\n",
+                    __FUNCTION__, itm.getVBucketId(), state? state->highSeqno: -1);
+
     saveDocs(itm.getVBucketId());
 
     int success = 0;
@@ -235,11 +245,15 @@ bool NopKVStore::notifyCompaction(const uint16_t vbid, uint64_t new_rev,
 bool NopKVStore::snapshotVBucket(uint16_t vbucketId, vbucket_state &vbstate,
                                    Callback<kvstats_ctx> *cb)
 {
+    vbucket_state *state = cachedVBStates[vbucketId];
+            LOG(EXTENSION_LOG_WARNING,
+                    "%s vbucketId[%u] state->highSeqno[%llu] vbstate.highSeqno[%llu]\n",
+                    __FUNCTION__, vbucketId, state? state->highSeqno: -1, vbstate.highSeqno);
+
     //cb_assert(!isReadOnly());
     bool success = true;
 
     bool notify = false;
-    vbucket_state *state = cachedVBStates[vbucketId];
     uint32_t vb_change_type = VB_NO_CHANGE;
     if (state) {
         if (state->state != vbstate.state) {
@@ -286,17 +300,36 @@ bool NopKVStore::setVBucketState(uint16_t vbucketId, vbucket_state &vbstate,
                                    bool notify)
 {
     vbucket_state *state = cachedVBStates[vbucketId];
+    cb_assert(state);
+            LOG(EXTENSION_LOG_WARNING,
+                    "%s vbucketId[%u] state->highSeqno[%llu] vbstate.highSeqno[%llu]\n",
+                    __FUNCTION__, vbucketId, state->highSeqno, vbstate.highSeqno);
+
     vbstate.highSeqno = state->highSeqno;
     vbstate.lastSnapStart = state->lastSnapStart;
     vbstate.lastSnapEnd = state->lastSnapEnd;
     vbstate.maxDeletedSeqno = state->maxDeletedSeqno;
 
-    // TODO: paf there was also if(notify) mech which sends out couchdb position, which we dont have. probaby something may still be wrong :(
-
     // they originally save state.
     // God knows if they assume vbstate.highSeqno will change
     // will bump up highSeqno just in case (enough of failures)
     saveDocs(vbucketId);
+
+        uint64_t newHeaderPos = state->highSeqno;
+        RememberingCallback<uint16_t> lcb;
+
+        VBStateNotification vbs(0/*vbstate.checkpointId*/, vbstate.state,
+                vb_change_type, vbucketId);
+
+        couchNotifier->notify_update(vbs, 1/*fileRev*/, newHeaderPos, lcb);
+        if (lcb.val != PROTOCOL_BINARY_RESPONSE_SUCCESS) {
+            cb_assert(lcb.val != PROTOCOL_BINARY_RESPONSE_ETMPFAIL);
+            LOG(EXTENSION_LOG_WARNING,
+                    "Warning: failed to notify CouchDB of update, "
+                    "vbid=%u error=0x%x\n",
+                    vbucketId, lcb.val);
+            return false;
+        }
 
     return true;
 }
