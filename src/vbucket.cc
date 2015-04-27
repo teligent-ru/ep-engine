@@ -305,6 +305,7 @@ void VBucket::addHighPriorityVBEntry(uint64_t id, const void *cookie,
 void VBucket::notifyCheckpointPersisted(EventuallyPersistentEngine &e,
                                         uint64_t idNum,
                                         bool isBySeqno) {
+
     LockHolder lh(hpChksMutex);
     std::map<const void*, ENGINE_ERROR_CODE> toNotify;
     std::list<HighPriorityVBEntry>::iterator entry = hpChks.begin();
@@ -317,7 +318,7 @@ void VBucket::notifyCheckpointPersisted(EventuallyPersistentEngine &e,
 
         hrtime_t wall_time(gethrtime() - entry->start);
         size_t spent = wall_time / 1000000000;
-        if (entry->id <= idNum) {
+        if (true) { //entry->id <= idNum) {
             toNotify[entry->cookie] = ENGINE_SUCCESS;
             stats.chkPersistenceHisto.add(wall_time / 1000);
             adjustCheckpointFlushTimeout(wall_time / 1000000000);
