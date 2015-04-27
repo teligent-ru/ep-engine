@@ -282,8 +282,8 @@ bool NopKVStore::snapshotVBucket(uint16_t vbucketId, vbucket_state &vbstate,
         notify = true;
     }
 
-    success = setVBucketState(vbucketId, vbstate, vb_change_type, cb,
-                              notify);
+    success = true; // setVBucketState(vbucketId, vbstate, vb_change_type, cb,
+                    //          notify);
 
     if (!success) {
         LOG(EXTENSION_LOG_WARNING,
