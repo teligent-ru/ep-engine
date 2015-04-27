@@ -318,10 +318,10 @@ bool NopKVStore::setVBucketState(uint16_t vbucketId, vbucket_state &vbstate,
         uint64_t newHeaderPos = state->highSeqno;
         RememberingCallback<uint16_t> lcb;
 
-        VBStateNotification vbs(0/*vbstate.checkpointId* /, vbstate.state,
+        VBStateNotification vbs(0/ *vbstate.checkpointId* /, vbstate.state,
                 vb_change_type, vbucketId);
 
-        couchNotifier->notify_update(vbs, 1/*fileRev* /, newHeaderPos, lcb);
+        couchNotifier->notify_update(vbs, 1/ *fileRev* /, newHeaderPos, lcb);
         if (lcb.val != PROTOCOL_BINARY_RESPONSE_SUCCESS) {
             cb_assert(lcb.val != PROTOCOL_BINARY_RESPONSE_ETMPFAIL);
             LOG(EXTENSION_LOG_WARNING,
@@ -383,7 +383,8 @@ bool NopKVStore::commit(Callback<kvstats_ctx> *cb, uint64_t snapStartSeqno,
     //state->maxDeletedSeqno = TODO paf?
     state->lastSnapStart = snapStartSeqno;
     state->lastSnapEnd = snapEndSeqno;
-
+    state->highSeqno++;
+    
     // originally they write VBState to storage to retrive it in case of rollback
     // that structure tases up some space, so +1 below
     ///moved from here to set/del  state->highSeqno = snapEndSeqno+1;
@@ -440,7 +441,7 @@ void NopKVStore::saveDocs(uint16_t vbid) {
     last_modified_vbid = vbid;
     vbucket_state *state = cachedVBStates[vbid];
     cb_assert(state);
-    state->highSeqno++;
+//    state->highSeqno++;
 
     // saveDocs had CouchNotifier logposition notification
     // lets hope nobody was expecting this notification, not doint it
