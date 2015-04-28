@@ -1730,7 +1730,14 @@ couchstore_error_t CouchKVStore::saveDocs(uint16_t vbid, uint64_t rev,
     couchstore_error_t errCode;
     uint64_t fileRev = rev;
     DbInfo info;
-    cb_assert(fileRev);
+//    cb_assert(fileRev);
+	fileRev = 0; // paf just checking it will do the trick
+	if(!fileRev) {
+		LOG(EXTENSION_LOG_WARNING,
+			"Warning: vbucketId = %d has zero fileRev, pretending it was 1, openDB will reopen it",
+			vbid);
+		fileRev = 1;
+	}
 
     Db *db = NULL;
     uint64_t newFileRev;
