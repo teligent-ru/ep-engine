@@ -88,3 +88,29 @@ V8_DIR=$PWD/v8 make PREFIX=/opt/couchbase CMAKE_PREFIX_PATH=/opt/couchbase
 -- Set runtime path of "/opt/couchbase/lib/memcached/ep.so" to "$ORIGIN/../lib:$ORIGIN/../lib/memcached:/opt/couchbase/lib:/opt/couchbase/lib/memcached:/opt/couchbase/lib"
 [root@rualpe-vm2 couchbase# 
 ~~~
+
+
+выложить результат
+------------------
+
+~~~
+# tar -czvf ~/couchbase-3.0.1-patch-to-3.0.3.teligent.2-centos6.x86_64.tgz opt/couchbase/{bin,lib}/memcached
+opt/couchbase/bin/memcached
+opt/couchbase/lib/memcached/
+opt/couchbase/lib/memcached/blackhole_logger.so
+opt/couchbase/lib/memcached/fragment_rw_ops.so
+opt/couchbase/lib/memcached/libmcd_util.so.1.0.0
+opt/couchbase/lib/memcached/stdin_term_handler.so
+opt/couchbase/lib/memcached/libmcd_util.so
+opt/couchbase/lib/memcached/ep.so
+opt/couchbase/lib/memcached/bucket_engine.so
+opt/couchbase/lib/memcached/default_engine.so
+opt/couchbase/lib/memcached/file_logger.so
+# scp ~/couchbase-3.0.1-patch-to-3.0.3.teligent.2-centos5.x86_64.tgz  alexander.petrossian@gigant:/var/www/kickstarts/3RD_PARTY/couchbase/RHEL5/x86_64/
+couchbase-3.0.1-patch-to-3.0.3.teligent.2-centos5.x86_64.tgz                                                                                                                                                100% 4770KB   4.7MB/s   00:00
+#
+~~~
+
+ссылка для скачивания
+---------------------
+http://gigant.teligent.ru/kickstarts/3RD_PARTY/couchbase/RHEL5/x86_64/couchbase-3.0.1-patch-to-3.0.3.teligent.2-centos5.x86_64.tgz
