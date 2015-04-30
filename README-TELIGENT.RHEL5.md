@@ -29,6 +29,12 @@ ln -sf /usr/bin/cmake28 /usr/bin/cmake
 vim memcached/CMakeLists.txt
 #CHECK_INCLUDE_FILE_CXX("atomic" HAVE_ATOMIC)
 
+#начните собирать, оно сломается, поправьте ниже и ещё раз сборка (не стал вникать)
+vim build/CMakeCache.txt
+#исправьте эти на такие
+HAVE_ARPA_INET_H:INTERNAL=1
+HAVE_INTTYPES_H:INTERNAL=1
+
 #это найдёт v8 в /opt/couchbase
 #и указываем на уже собранное:
 V8_DIR=$PWD/v8 make PREFIX=/opt/couchbase CMAKE_PREFIX_PATH=/opt/couchbase
