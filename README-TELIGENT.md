@@ -64,10 +64,10 @@ function g {
 #took hash keys from 3.0.3 manifest:
 #https://github.com/couchbase/manifest/blob/master/released/3.0.3.xml
 
-g ssh://git@github.com/teligent-ru ep-engine 3.0.3.teligent.1
+g ssh://git@github.com/teligent-ru ep-engine 3.0.3.teligent.2
 g git://github.com/couchbase memcached 4424e903ad7e44726dc46f73acebd07c960f8e72
 g git://github.com/couchbase platform 2a6d25c5cd2b6b7ed0771e15fee941f527a284a9
-g ssh://git@github.com/teligent-ru tlm 3.0.3.teligent.1
+g ssh://git@github.com/teligent-ru tlm 3.0.3.teligent.2
 cp -p tlm/{GNUmakefile,Makefile,CMakeLists.txt} .
 g git://github.com/couchbase v8 05120013843918f7e3712159c03b509d3e328cf7
 ~~~
