@@ -64,7 +64,7 @@ function g {
 #took hash keys from 3.0.3 manifest:
 #https://github.com/couchbase/manifest/blob/master/released/3.0.3.xml
 
-g ssh://git@github.com/teligent-ru ep-engine 3.0.3.teligent.2
+g ssh://git@github.com/teligent-ru ep-engine 3.0.3.teligent.3
 g git://github.com/couchbase memcached 4424e903ad7e44726dc46f73acebd07c960f8e72
 g git://github.com/couchbase platform 2a6d25c5cd2b6b7ed0771e15fee941f527a284a9
 g ssh://git@github.com/teligent-ru tlm 3.0.3.teligent.2
@@ -80,7 +80,7 @@ g git://github.com/couchbase v8 05120013843918f7e3712159c03b509d3e328cf7
 #v8 собирать самому можно, но очень трудно и долго
 ln -s /opt/couchbase/lib/libv8.so v8/
 #и указываем на уже собранное:
-V8_DIR=$PWD/v8 make PREFIX=/opt/couchbase CMAKE_PREFIX_PATH=/opt/couchbase CMAKE_BUILD_TYPE=RelWithDebInfo
+V8_DIR=$PWD/v8 make PREFIX=/opt/couchbase CMAKE_PREFIX_PATH=/opt/couchbase EXTRA_CMAKE_OPTIONS='-D CMAKE_BUILD_TYPE=RelWithDebInfo'
 ...
 -- Installing: /opt/couchbase/bin/memcached
 ...
