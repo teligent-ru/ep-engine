@@ -80,13 +80,13 @@ g git://github.com/couchbase v8 05120013843918f7e3712159c03b509d3e328cf7
 #v8 собирать самому можно, но очень трудно и долго
 ln -s /opt/couchbase/lib/libv8.so v8/
 #и указываем на уже собранное:
-V8_DIR=$PWD/v8 make PREFIX=/opt/couchbase CMAKE_PREFIX_PATH=/opt/couchbase
+V8_DIR=$PWD/v8 make PREFIX=/opt/couchbase CMAKE_PREFIX_PATH=/opt/couchbase CMAKE_BUILD_TYPE=RelWithDebInfo
 ...
 -- Installing: /opt/couchbase/bin/memcached
 ...
 -- Installing: /opt/couchbase/lib/memcached/ep.so
 -- Set runtime path of "/opt/couchbase/lib/memcached/ep.so" to "$ORIGIN/../lib:$ORIGIN/../lib/memcached:/opt/couchbase/lib:/opt/couchbase/lib/memcached:/opt/couchbase/lib"
-[root@rualpe-vm2 couchbase# 
+[root@rualpe-vm2 couchbase#] 
 ~~~
 
 
@@ -94,14 +94,15 @@ V8_DIR=$PWD/v8 make PREFIX=/opt/couchbase CMAKE_PREFIX_PATH=/opt/couchbase
 ------------------
 
 ~~~
-# tar -czvf ~/couchbase-3.0.1-patch-to-3.0.3.teligent.2-centos5.x86_64.tgz /opt/couchbase/{bin,lib}/memcached
-# tar -czvf ~/couchbase-3.0.1-patch-to-3.0.3.teligent.2-centos6.x86_64.tgz /opt/couchbase/{bin,lib}/memcached
+# tar -czvf ~/couchbase-3.0.1-patch-to-3.0.3.teligent.3-centos5.x86_64.tgz /opt/couchbase/{bin,lib}/memcached
+# tar -czvf ~/couchbase-3.0.1-patch-to-3.0.3.teligent.3-centos6.x86_64.tgz /opt/couchbase/{bin,lib}/memcached
 
-# scp ~/couchbase-3.0.1-patch-to-3.0.3.teligent.2-centos5.x86_64.tgz  alexander.petrossian@gigant:/var/www/kickstarts/3RD_PARTY/couchbase/RHEL5/x86_64/
-# scp ~/couchbase-3.0.1-patch-to-3.0.3.teligent.2-centos6.x86_64.tgz  alexander.petrossian@gigant:/var/www/kickstarts/3RD_PARTY/couchbase/RHEL6/x86_64/
+# scp ~/couchbase-3.0.1-patch-to-3.0.3.teligent.3-centos5.x86_64.tgz  alexander.petrossian@gigant:/var/www/kickstarts/3RD_PARTY/couchbase/RHEL5/x86_64/
+# scp ~/couchbase-3.0.1-patch-to-3.0.3.teligent.3-centos6.x86_64.tgz  alexander.petrossian@gigant:/var/www/kickstarts/3RD_PARTY/couchbase/RHEL6/x86_64/
 ~~~
 
 ссылка для скачивания
 ---------------------
-http://gigant.teligent.ru/kickstarts/3RD_PARTY/couchbase/RHEL5/x86_64/couchbase-3.0.1-patch-to-3.0.3.teligent.2-centos5.x86_64.tgz
-http://gigant.teligent.ru/kickstarts/3RD_PARTY/couchbase/RHEL6/x86_64/couchbase-3.0.1-patch-to-3.0.3.teligent.2-centos6.x86_64.tgz
+http://gigant.teligent.ru/kickstarts/3RD_PARTY/couchbase/RHEL5/x86_64/couchbase-3.0.1-patch-to-3.0.3.teligent.3-centos5.x86_64.tgz
+
+http://gigant.teligent.ru/kickstarts/3RD_PARTY/couchbase/RHEL6/x86_64/couchbase-3.0.1-patch-to-3.0.3.teligent.3-centos6.x86_64.tgz
