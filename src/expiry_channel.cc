@@ -36,6 +36,7 @@ ExpiryChannel::~ExpiryChannel() {
 }
 
 bool ExpiryChannel::open(const std::string& dstAddr, const int dstPort) {
+	LOG(EXTENSION_LOG_INFO, "%s: open(%s:%d)", __PRETTY_FUNCTION__, dstAddr.c_str(), dstPort);
 	if(mSocket >= 0)
 		close();
 	mSocket = socket(PF_INET, SOCK_DGRAM, 0);

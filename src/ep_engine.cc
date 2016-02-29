@@ -469,6 +469,15 @@ extern "C" {
                 validate(vsize, static_cast<uint64_t>(0),
                          std::numeric_limits<uint64_t>::max());
                 e->getConfiguration().setExpPagerStime((size_t)vsize);
+            } else if (strcmp(keyz, "expiry_host") == 0) {
+                e->getConfiguration().setExpiryHost(valz);
+            } else if (strcmp(keyz, "expiry_port") == 0) {
+                char *ptr = NULL;
+                checkNumeric(valz);
+                uint64_t vsize = strtoull(valz, &ptr, 10);
+                validate(vsize, static_cast<uint64_t>(0),
+                         std::numeric_limits<uint16_t>::max());
+                e->getConfiguration().setExpiryPort((size_t)vsize);
             } else if (strcmp(keyz, "access_scanner_enabled") == 0) {
                 if (strcmp(valz, "true") == 0) {
                     e->getConfiguration().setAccessScannerEnabled(true);
