@@ -25,7 +25,9 @@
 #include <errno.h>
 #include <sstream>
 
-#define MAX_PACKET_SIZE 65000
+#include <cJSON.h>
+
+static const size_t MAX_PACKET_SIZE=65000;
 
 
 ExpiryChannel::ExpiryChannel(): mSocket(-1) {
@@ -73,33 +75,67 @@ void ExpiryChannel::sendNotification(const std::string& name, const StoredValue*
         return;
     }
     if(!isConnected()) {
-		LOG(EXTENSION_LOG_ERROR, "%s[%s]: called with key[%s], but there is no connection (not configured? failed to open?), bailing out...", __PRETTY_FUNCTION__, name.c_str(), v->getKey().c_str());
+		LOG(EXTENSION_LOG_ERROR, "%s[%s.%s], but there is no connection (not configured? failed to open?), bailing out...", __PRETTY_FUNCTION__, name.c_str(), v->getKey().c_str());
 		return;
     }
-	// @TODO
-	const size_t buf_size = tptf->getSize(true);
-	char *buf = new char[buf_size];
-	
-	ssize_t sz = tptf->pack(buf, buf_size);
-	if (sz < 0) {
-		LOG(EXTENSION_LOG_ERROR, "%s: Failed to pack transaction into buffer! buf_size = %d", __PRETTY_FUNCTION__, buf_size);
-		delete[] buf;
+/*
+{
+  "bucket": "<STYPE>",
+  "id": "<SID>",
+  "expiry": "<EXPIRES>",
+  "cas": "<CAS value (version)>",
+  "flags": <flags>,
+  "body": <PAYLOAD in BOX format>  // datatype==0? "string", datatype==1(JSON) {...}
+}
+*/
+    cJSON* root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "bucket", name.c_str());
+    cJSON_AddStringToObject(root, "id", v->getKey().c_str());
+    cJSON_AddNumberToObject(root, "expiry", v->getExptime());
+    cJSON_AddNumberToObject(root, "cas", v->getCas());
+    cJSON_AddNumberToObject(root, "flags", v->getFlags());
+    
+    const value_t& b = v->getValue();
+    uint8_t t = b->getDataType();
+    switch(t) {
+        case PROTOCOL_BINARY_DATATYPE_JSON:
+            // @TODO
+            break;
+        case PROTOCOL_BINARY_RAW_BYTES: {
+            size_t vlength = d->vlength();
+            char *cstr = new char[vlength+1/*terminator for limited cJSON*/];
+            memcpy(cstr, d->getData(), vlength);
+            cstr[vlength] = 0; // terminator
+            cJSON_AddStringToObject(root, "body", cstr);
+            delete[] cstr;
+            break;
+        }
+        default:
+            LOG(EXTENSION_LOG_ERROR, "%s[%.%s]: can not handle its type[%d] (it's neither RAW=0 nor JSON=1), bailing out...", __PRETTY_FUNCTION__, name.c_str(), v->getKey().c_str(), t);
+            cJSON_Delete(root);
+            return;
+    }
+    char* json_cstr = cJSON_PrintUnformatted(list);
+	if (!json_cstr) {
+		LOG(EXTENSION_LOG_ERROR, "%s[%s.%s]: failed to serialize to json. Had good type[%d] (RAW=0, JSON=1), bailing out...", __PRETTY_FUNCTION__, name.c_str(), v->getKey().c_str(), t);
+        cJSON_Delete(root);
 		return;
 	}
-	if (sz > MAX_PACKET_SIZE)
-		sz = MAX_PACKET_SIZE;
+    size_t json_length = strlen(json_cstr);
+	if (json_length > MAX_PACKET_SIZE)
+		LOG(EXTENSION_LOG_ERROR, "%s[%s.%s]: serialized to json_length[%zu], which is more than MAX_PACKET_SIZE[%zu], bailing out...", __PRETTY_FUNCTION__, name.c_str(), v->getKey().c_str(), json_length, MAX_PACKET_SIZE);
+        free(json_cstr);
+        cJSON_Delete(root);
+		return;
+	}
 
-	LOG(EXTENSION_LOG_DEBUG, "%s: write_size=%d, buf_size=%d", __PRETTY_FUNCTION__, sz, buf_size);
-	
-	ssize_t writed = send(mSocket, buf, sz, 0);
-	
-	LOG(EXTENSION_LOG_DEBUG, "%s: size=%d writed=%d %s", __PRETTY_FUNCTION__, sz, writed, strerror(errno));
-	
-	if(writed < 0) {
-		LOG(EXTENSION_LOG_ERROR, "%s: size=%d writed=%d %s", __PRETTY_FUNCTION__, sz, writed, strerror(errno));
+	ssize_t written = send(mSocket, json_cstr, json_length, 0);
+	if(json_length!=written) {
+        LOG(EXTENSION_LOG_ERROR, "%s[%s.%s]: json_length[%zu] != written[%zu] errno[%s (%d)]", __PRETTY_FUNCTION__, name.c_str(), v->getKey().c_str(), json_length, written, strerror(errno), errno);
 	}
 	
-	delete[] buf;
+    free(json_cstr);
+    cJSON_Delete(root);
 }
 
 void ExpiryChannel::close() {
