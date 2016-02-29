@@ -67,12 +67,16 @@ bool ExpiryChannel::open(const std::string& dstAddr, const int dstPort) {
 	return true;
 }
 
-void ExpiryChannel::sendNotification(const StoredValue* v) {
-	if(!v || !isConnected())
+void ExpiryChannel::sendNotification(const std::string& name, const StoredValue* v) {
+	if(!v) {
+		LOG(EXTENSION_LOG_ERROR, "%s[%s]: called without StoredValue, bailing out...", __PRETTY_FUNCTION__, name.c_str());
+        return;
+    }
+    if(!isConnected()) {
+		LOG(EXTENSION_LOG_ERROR, "%s[%s]: called with key[%s], but there is no connection (not configured? failed to open?), bailing out...", __PRETTY_FUNCTION__, name.c_str(), v->getKey().c_str());
 		return;
+    }
 	// @TODO
-	// get total size of packed data
-	tptf->invalidateDataSize();
 	const size_t buf_size = tptf->getSize(true);
 	char *buf = new char[buf_size];
 	

@@ -47,7 +47,7 @@ public:
 	 * Send expiration info
 	 * @param v Stored value to send
 	 */
-	void sendNotification(const StoredValue* v);
+	void sendNotification(const std::string& name, const StoredValue* v);
 
 	/**
 	 * Close channel, cleanup

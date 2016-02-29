@@ -521,7 +521,7 @@ EventuallyPersistentStore::deleteExpiredItem(uint16_t vbid, std::string &key,
                 bool deleted = vb->ht.unlocked_del(key, bucket_num);
                 cb_assert(deleted);
             } else if (v->isExpired(startTime) && !v->isDeleted()) {
-                expiryPager.channel.sendNotification(v);
+                expiryPager.channel.sendNotification(name, v);
                 
                 vb->ht.unlocked_softDelete(v, 0, getItemEvictionPolicy());
                 queueDirty(vb, v, &lh, false);
@@ -572,7 +572,7 @@ StoredValue *EventuallyPersistentStore::fetchValidValue(RCPtr<VBucket> &vb,
                 return wantDeleted ? v : NULL;
             }
             if (queueExpired) {
-                expiryPager.channel.sendNotification(v);
+                expiryPager.channel.sendNotification(name, v);
                 incExpirationStat(vb, false);
                 vb->ht.unlocked_softDelete(v, 0, eviction_policy);
                 queueDirty(vb, v, NULL, false, true);
