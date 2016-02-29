@@ -98,16 +98,30 @@ void ExpiryChannel::sendNotification(const std::string& name, const StoredValue*
     const value_t& b = v->getValue();
     uint8_t t = b->getDataType();
     switch(t) {
-        case PROTOCOL_BINARY_DATATYPE_JSON:
-            // @TODO
+        case PROTOCOL_BINARY_DATATYPE_JSON: {
+            size_t vlength = d->vlength();
+            char* bodyz = new char[vlength+1/*terminator for limited cJSON*/];
+            memcpy(bodyz, d->getData(), vlength);
+            bodyz[vlength] = 0; // terminator
+
+            cJSON* jbody = cJSON_Parse(bodyz);
+            if (!jbody) {
+                LOG(EXTENSION_LOG_ERROR, "%s[%.%s]: reported its type as JSON but can not parse it, bailing out...", __PRETTY_FUNCTION__, name.c_str(), v->getKey().c_str());
+                delete[] bodyz;
+                cJSON_Delete(root);
+                return;
+            }
+            cJSON_AddItemToObject(root, "body", jbody); // assumes responsibility
+            delete[] bodyz;
             break;
+        }
         case PROTOCOL_BINARY_RAW_BYTES: {
             size_t vlength = d->vlength();
-            char *cstr = new char[vlength+1/*terminator for limited cJSON*/];
-            memcpy(cstr, d->getData(), vlength);
-            cstr[vlength] = 0; // terminator
-            cJSON_AddStringToObject(root, "body", cstr);
-            delete[] cstr;
+            char* bodyz = new char[vlength+1/*terminator for limited cJSON*/];
+            memcpy(bodyz, d->getData(), vlength);
+            bodyz[vlength] = 0; // terminator
+            cJSON_AddStringToObject(root, "body", bodyz);
+            delete[] bodyz;
             break;
         }
         default:
@@ -124,28 +138,27 @@ void ExpiryChannel::sendNotification(const std::string& name, const StoredValue*
     size_t json_length = strlen(json_cstr);
 	if (json_length > MAX_PACKET_SIZE)
 		LOG(EXTENSION_LOG_ERROR, "%s[%s.%s]: serialized to json_length[%zu], which is more than MAX_PACKET_SIZE[%zu], bailing out...", __PRETTY_FUNCTION__, name.c_str(), v->getKey().c_str(), json_length, MAX_PACKET_SIZE);
-        free(json_cstr);
+        cJSON_Free(json_cstr);
         cJSON_Delete(root);
 		return;
 	}
 
 	ssize_t written = send(mSocket, json_cstr, json_length, 0);
-	if(json_length!=written) {
+	if(json_length != written) {
         LOG(EXTENSION_LOG_ERROR, "%s[%s.%s]: json_length[%zu] != written[%zu] errno[%s (%d)]", __PRETTY_FUNCTION__, name.c_str(), v->getKey().c_str(), json_length, written, strerror(errno), errno);
 	}
 	
-    free(json_cstr);
+    cJSON_Free(json_cstr);
     cJSON_Delete(root);
 }
 
 void ExpiryChannel::close() {
-	if(mSocket >= 0) {
+	if(isConnected()) {
 		close();
 		mSocket = -1;
 	}
 }
 
-const bool ExpiryChannel::isConnected() const
-{
-	return (mSocket >= 0);
+const bool ExpiryChannel::isConnected() const {
+	return mSocket >= 0;
 }
