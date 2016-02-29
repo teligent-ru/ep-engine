@@ -129,17 +129,18 @@ void ExpiryChannel::sendNotification(const std::string& name, const StoredValue*
             cJSON_Delete(root);
             return;
     }
-    char* json_cstr = cJSON_PrintUnformatted(list);
+    
+    char* json_cstr = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    
 	if (!json_cstr) {
 		LOG(EXTENSION_LOG_ERROR, "%s[%s.%s]: failed to serialize to json. Had good type[%d] (RAW=0, JSON=1), bailing out...", __PRETTY_FUNCTION__, name.c_str(), v->getKey().c_str(), t);
-        cJSON_Delete(root);
 		return;
 	}
     size_t json_length = strlen(json_cstr);
 	if (json_length > MAX_PACKET_SIZE)
 		LOG(EXTENSION_LOG_ERROR, "%s[%s.%s]: serialized to json_length[%zu], which is more than MAX_PACKET_SIZE[%zu], bailing out...", __PRETTY_FUNCTION__, name.c_str(), v->getKey().c_str(), json_length, MAX_PACKET_SIZE);
         cJSON_Free(json_cstr);
-        cJSON_Delete(root);
 		return;
 	}
 
@@ -149,7 +150,6 @@ void ExpiryChannel::sendNotification(const std::string& name, const StoredValue*
 	}
 	
     cJSON_Free(json_cstr);
-    cJSON_Delete(root);
 }
 
 void ExpiryChannel::close() {
