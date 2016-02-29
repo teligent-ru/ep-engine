@@ -99,6 +99,10 @@ public:
             store.setCompactionWriteQueueCap(value);
         } else if (key.compare("exp_pager_stime") == 0) {
             store.setExpiryPagerSleeptime(value);
+        } else if (key.compare("expiry_host") == 0) {
+            store.setExpiryHost(value);
+        } else if (key.compare("expiry_port") == 0) {
+            store.setExpiryPort(value);
         } else if (key.compare("alog_sleep_time") == 0) {
             store.setAccessScannerSleeptime(value);
         } else if (key.compare("alog_task_time") == 0) {
@@ -2977,6 +2981,20 @@ void EventuallyPersistentStore::setExpiryPagerSleeptime(size_t val) {
         expiryPager.task = ExecutorPool::get()->schedule(expTask,
                                                         NONIO_TASK_IDX);
     }
+}
+
+void EventuallyPersistentStore::setExpiryHost(std::string val) {
+    LockHolder lh(expiryPager.mutex);
+
+    expiryPager.host = val;
+    expiryPager.channel.open(expiryPager.host, expiryPager.port);
+}
+
+void EventuallyPersistentStore::setExpiryPort(size_t val) {
+    LockHolder lh(expiryPager.mutex);
+
+    expiryPager.port = static_cast<int>(val);
+    expiryPager.channel.open(expiryPager.host, expiryPager.port);
 }
 
 void EventuallyPersistentStore::enableAccessScannerTask() {
