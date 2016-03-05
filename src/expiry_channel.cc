@@ -154,7 +154,7 @@ void ExpiryChannel::sendNotification(const std::string& name, const StoredValue*
 
 void ExpiryChannel::close() {
 	if(isConnected()) {
-		close();
+		close(mSocket);
 		mSocket = -1;
 	}
 }
