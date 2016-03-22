@@ -516,7 +516,7 @@ EventuallyPersistentStore::deleteExpiredItem(uint16_t vbid, std::string &key,
                 // This is a temporary item whose background fetch for metadata
                 // has completed.
 
-                LOG(EXTENSION_LOG_WARNING, "%s: key[%s] temporary--can not properly notify its expiration. Not notifying at all!", __PRETTY_FUNCTION__, key.c_str()); /// @TODO maybe wait for it to load all the way and only then report?
+                LOG(EXTENSION_LOG_WARNING, "%s: key[%s] temporary--can not properly notify its expiration. Not notifying at all!", __func__, key.c_str()); /// @TODO maybe wait for it to load all the way and only then report?
                 
                 bool deleted = vb->ht.unlocked_del(key, bucket_num);
                 cb_assert(deleted);
@@ -527,7 +527,7 @@ EventuallyPersistentStore::deleteExpiredItem(uint16_t vbid, std::string &key,
                 queueDirty(vb, v, &lh, false);
             }
         } else {
-            LOG(EXTENSION_LOG_WARNING, "%s: key[%s] not found--can not properly notify its expiration. Not notifying at all!", __PRETTY_FUNCTION__, key.c_str()); /// @TODO maybe BGFETCH and then it will automatically be retried on next expiration pass, and here do not try to do tricky things (below). currently we have 100% resident, so this is of no big importance (YET!)
+            LOG(EXTENSION_LOG_WARNING, "%s: key[%s] not found--can not properly notify its expiration. Not notifying at all!", __func__, key.c_str()); /// @TODO maybe BGFETCH and then it will automatically be retried on next expiration pass, and here do not try to do tricky things (below). currently we have 100% resident, so this is of no big importance (YET!)
 
             if (eviction_policy == FULL_EVICTION) {
                 // Create a temp item and delete and push it
