@@ -476,7 +476,7 @@ extern "C" {
                 checkNumeric(valz);
                 uint64_t vsize = strtoull(valz, &ptr, 10);
                 validate(vsize, static_cast<uint64_t>(0),
-                         std::numeric_limits<uint16_t>::max());
+                         static_cast<uint64_t>(std::numeric_limits<uint16_t>::max()));
                 e->getConfiguration().setExpiryPort((size_t)vsize);
             } else if (strcmp(keyz, "access_scanner_enabled") == 0) {
                 if (strcmp(valz, "true") == 0) {

@@ -149,9 +149,9 @@
             "type": "std::string"
         },
         "expiry_port": {
-            "default": "",
+            "default": "11300",
             "descr": "Expiration UDP messages are sent to expiry_host:expiry_port, if both are defined.",
-            "type": "int"
+            "type": "size_t"
         },
         "failpartialwarmup": {
             "default": "true",
