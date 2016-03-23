@@ -166,6 +166,8 @@ Available params for "set":
                                    tasks will be made to snooze, if there are already
                                    pending compaction tasks.
     exp_pager_stime              - Expiry Pager Sleeptime.
+    expiry_host                  - Expiration UDP messages are sent to
+    expiry_port                  - expiry_host:expiry_port, if both are defined.
     flushall_enabled             - Enable flush operation.
     pager_active_vb_pcnt         - Percentage of active vbuckets items among
                                    all ejected items by item pager.

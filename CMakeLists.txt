@@ -114,6 +114,7 @@ SET(CONFIG_SOURCE src/configuration.cc
   ${CMAKE_CURRENT_BINARY_DIR}/src/generated_configuration.cc)
 
 ADD_LIBRARY(ep SHARED
+            src/expiry_channel.cc
             src/access_scanner.cc src/atomic.cc src/backfill.cc
             src/bgfetcher.cc src/checkpoint.cc
             src/checkpoint_remover.cc src/conflict_resolution.cc

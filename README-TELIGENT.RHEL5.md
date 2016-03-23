@@ -20,7 +20,7 @@ ln -sf /usr/bin/cmake28 /usr/bin/cmake
 
 установить couchbase-server-3.0.1 и выкачать исходники
 ------------------------------------------------------
-см. README-TELIGENT.md
+[см](README-TELIGENT.md)
 
 запустить общую сборку, среди прочего получится ep.so
 -----------------------------------------------------
@@ -47,4 +47,4 @@ V8_DIR=$PWD/v8 make PREFIX=/opt/couchbase CMAKE_PREFIX_PATH=/opt/couchbase EXTRA
 выложить результат
 ==================
 
-см. README-TELIGENT.md
+[см](README-TELIGENT.md)

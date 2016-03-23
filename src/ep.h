@@ -40,6 +40,7 @@
 #include "atomic.h"
 #include "bgfetcher.h"
 #include "item_pager.h"
+#include "expiry_channel.h"
 #include "kvstore.h"
 #include "locks.h"
 #include "executorpool.h"
@@ -47,6 +48,7 @@
 #include "stored-value.h"
 #include "vbucket.h"
 #include "vbucketmap.h"
+#include "expiry_channel.h"
 
 /**
  * vbucket-aware hashtable visitor.
@@ -635,6 +637,8 @@ public:
     void setBackfillMemoryThreshold(double threshold);
 
     void setExpiryPagerSleeptime(size_t val);
+    void setExpiryHost(std::string val);
+    void setExpiryPort(size_t val);
 
     void enableAccessScannerTask();
     void disableAccessScannerTask();
@@ -859,9 +863,12 @@ private:
     uint32_t bgFetchDelay;
     double backfillMemoryThreshold;
     struct ExpiryPagerDelta {
-        ExpiryPagerDelta() : sleeptime(0), task(0) {}
+        ExpiryPagerDelta() : sleeptime(0), port(0), task(0) {}
         Mutex mutex;
         size_t sleeptime;
+        std::string host;
+        int port;
+        ExpiryChannel channel;
         size_t task;
     } expiryPager;
     struct ALogTask {

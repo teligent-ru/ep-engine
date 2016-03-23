@@ -54,6 +54,7 @@ TAGS
 ep-engine.vcxproj
 ep-engine.vcxproj.filters
 ep-engine.vcxproj.user
+ep-engine.xcodeproj
 tags
 /CMakeFiles/
 /CTestTestfile.cmake

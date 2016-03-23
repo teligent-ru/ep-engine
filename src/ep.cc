@@ -99,6 +99,8 @@ public:
             store.setCompactionWriteQueueCap(value);
         } else if (key.compare("exp_pager_stime") == 0) {
             store.setExpiryPagerSleeptime(value);
+        } else if (key.compare("expiry_port") == 0) {
+            store.setExpiryPort(value);
         } else if (key.compare("alog_sleep_time") == 0) {
             store.setAccessScannerSleeptime(value);
         } else if (key.compare("alog_task_time") == 0) {
@@ -131,6 +133,17 @@ public:
             }
         }
     }
+
+    virtual void stringValueChanged(const std::string &key, const char* value) {
+        if (key.compare("expiry_host") == 0) {
+            store.setExpiryHost(value);
+        } else {
+            LOG(EXTENSION_LOG_WARNING,
+                "Failed to change value for unknown variable, %s\n",
+                key.c_str());
+        }
+    }
+
 
 private:
     EventuallyPersistentStore &store;
@@ -334,6 +347,16 @@ bool EventuallyPersistentStore::initialize() {
     config.addValueChangedListener("exp_pager_stime",
                                    new EPStoreValueChangeListener(*this));
 
+    std::string expiryHost = config.getExpiryHost();
+    setExpiryHost(expiryHost);
+    config.addValueChangedListener("expiry_host",
+                                   new EPStoreValueChangeListener(*this));
+
+    size_t expiryPort = config.getExpiryPort();
+    setExpiryPort(expiryPort);
+    config.addValueChangedListener("expiry_port",
+                                   new EPStoreValueChangeListener(*this));
+
     ExTask htrTask = new HashtableResizerTask(this, 10);
     ExecutorPool::get()->schedule(htrTask, NONIO_TASK_IDX);
 
@@ -492,13 +515,20 @@ EventuallyPersistentStore::deleteExpiredItem(uint16_t vbid, std::string &key,
             if (v->isTempNonExistentItem() || v->isTempDeletedItem()) {
                 // This is a temporary item whose background fetch for metadata
                 // has completed.
+
+                LOG(EXTENSION_LOG_WARNING, "%s: key[%s] temporary--can not properly notify its expiration. Not notifying at all!", __func__, key.c_str()); /// @TODO maybe wait for it to load all the way and only then report?
+                
                 bool deleted = vb->ht.unlocked_del(key, bucket_num);
                 cb_assert(deleted);
             } else if (v->isExpired(startTime) && !v->isDeleted()) {
+                expiryPager.channel.sendNotification(engine.getName(), v);
+                
                 vb->ht.unlocked_softDelete(v, 0, getItemEvictionPolicy());
                 queueDirty(vb, v, &lh, false);
             }
         } else {
+            LOG(EXTENSION_LOG_WARNING, "%s: key[%s] not found--can not properly notify its expiration. Not notifying at all!", __func__, key.c_str()); /// @TODO maybe BGFETCH and then it will automatically be retried on next expiration pass, and here do not try to do tricky things (below). currently we have 100% resident, so this is of no big importance (YET!)
+
             if (eviction_policy == FULL_EVICTION) {
                 // Create a temp item and delete and push it
                 // into the checkpoint queue.
@@ -542,6 +572,7 @@ StoredValue *EventuallyPersistentStore::fetchValidValue(RCPtr<VBucket> &vb,
                 return wantDeleted ? v : NULL;
             }
             if (queueExpired) {
+                expiryPager.channel.sendNotification(engine.getName(), v);
                 incExpirationStat(vb, false);
                 vb->ht.unlocked_softDelete(v, 0, eviction_policy);
                 queueDirty(vb, v, NULL, false, true);
@@ -2977,6 +3008,20 @@ void EventuallyPersistentStore::setExpiryPagerSleeptime(size_t val) {
         expiryPager.task = ExecutorPool::get()->schedule(expTask,
                                                         NONIO_TASK_IDX);
     }
+}
+
+void EventuallyPersistentStore::setExpiryHost(std::string val) {
+    LockHolder lh(expiryPager.mutex);
+
+    expiryPager.host = val;
+    expiryPager.channel.open(expiryPager.host, expiryPager.port);
+}
+
+void EventuallyPersistentStore::setExpiryPort(size_t val) {
+    LockHolder lh(expiryPager.mutex);
+
+    expiryPager.port = static_cast<int>(val);
+    expiryPager.channel.open(expiryPager.host, expiryPager.port);
 }
 
 void EventuallyPersistentStore::enableAccessScannerTask() {
