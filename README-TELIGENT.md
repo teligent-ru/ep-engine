@@ -94,8 +94,8 @@ V8_DIR=$PWD/v8 make PREFIX=/opt/couchbase CMAKE_PREFIX_PATH=/opt/couchbase
 ------------------
 
 ~~~
-# tar -czvf ~/couchbase-3.0.1-patch-to-3.0.3.teligent.4-centos5.x86_64.tgz /opt/couchbase/{bin,lib}/memcached
-# tar -czvf ~/couchbase-3.0.1-patch-to-3.0.3.teligent.4-centos6.x86_64.tgz /opt/couchbase/{bin,lib}/memcached
+# tar -czvf ~/couchbase-3.0.1-patch-to-3.0.3.teligent.4-centos5.x86_64.tgz /opt/couchbase/{{bin,lib}/memcached,lib/libcJSON*}
+# tar -czvf ~/couchbase-3.0.1-patch-to-3.0.3.teligent.4-centos6.x86_64.tgz /opt/couchbase/{{bin,lib}/memcached,lib/libcJSON*}
 
 # scp ~/couchbase-3.0.1-patch-to-3.0.3.teligent.4-centos5.x86_64.tgz  alexander.petrossian@gigant:/var/www/kickstarts/3RD_PARTY/couchbase/RHEL5/x86_64/
 # scp ~/couchbase-3.0.1-patch-to-3.0.3.teligent.4-centos6.x86_64.tgz  alexander.petrossian@gigant:/var/www/kickstarts/3RD_PARTY/couchbase/RHEL6/x86_64/
