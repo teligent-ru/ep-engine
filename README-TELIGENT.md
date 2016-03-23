@@ -66,7 +66,7 @@ function g {
 
 g ssh://git@github.com/teligent-ru ep-engine 3.0.3.teligent.1 
 g ssh://git@github.com/teligent-ru memcached 3.0.3.teligent.1 #based on 4424e903ad7e44726dc46f73acebd07c960f8e72
-g git://github.com/couchbase platform 2a6d25c5cd2b6b7ed0771e15fee941f527a284a9
+g ssh://git@github.com/teligent-ru platform 3.0.3.teligent.4 #based on 2a6d25c5cd2b6b7ed0771e15fee941f527a284a9
 g ssh://git@github.com/teligent-ru tlm 3.0.3.teligent.1
 cp -p tlm/{GNUmakefile,Makefile,CMakeLists.txt} .
 g git://github.com/couchbase v8 05120013843918f7e3712159c03b509d3e328cf7
@@ -88,3 +88,21 @@ V8_DIR=$PWD/v8 make PREFIX=/opt/couchbase CMAKE_PREFIX_PATH=/opt/couchbase
 -- Set runtime path of "/opt/couchbase/lib/memcached/ep.so" to "$ORIGIN/../lib:$ORIGIN/../lib/memcached:/opt/couchbase/lib:/opt/couchbase/lib/memcached:/opt/couchbase/lib"
 [root@rualpe-vm2 couchbase# 
 ~~~
+
+
+выложить результат
+------------------
+
+~~~
+# tar -czvf ~/couchbase-3.0.1-patch-to-3.0.3.teligent.4-centos5.x86_64.tgz /opt/couchbase/{bin,lib}/memcached
+# tar -czvf ~/couchbase-3.0.1-patch-to-3.0.3.teligent.4-centos6.x86_64.tgz /opt/couchbase/{bin,lib}/memcached
+
+# scp ~/couchbase-3.0.1-patch-to-3.0.3.teligent.4-centos5.x86_64.tgz  alexander.petrossian@gigant:/var/www/kickstarts/3RD_PARTY/couchbase/RHEL5/x86_64/
+# scp ~/couchbase-3.0.1-patch-to-3.0.3.teligent.4-centos6.x86_64.tgz  alexander.petrossian@gigant:/var/www/kickstarts/3RD_PARTY/couchbase/RHEL6/x86_64/
+~~~
+
+ссылка для скачивания
+---------------------
+http://gigant.teligent.ru/kickstarts/3RD_PARTY/couchbase/RHEL5/x86_64/couchbase-3.0.1-patch-to-3.0.3.teligent.4-centos5.x86_64.tgz
+
+http://gigant.teligent.ru/kickstarts/3RD_PARTY/couchbase/RHEL6/x86_64/couchbase-3.0.1-patch-to-3.0.3.teligent.4-centos6.x86_64.tgz

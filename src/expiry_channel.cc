@@ -130,10 +130,10 @@ void ExpiryChannel::sendNotification(const std::string& name, const StoredValue*
 
 			cJSON* jbody = cJSON_Parse(bodyz);
 			if (!jbody) {
-			LOG(EXTENSION_LOG_WARNING, "%s[%.%s]: reported its type as JSON but can not parse it, bailing out...", __func__, name.c_str(), v->getKey().c_str());
-			delete[] bodyz;
-			cJSON_Delete(root);
-			return;
+				LOG(EXTENSION_LOG_WARNING, "%s[%.%s]: reported its type as JSON but can not parse it, bailing out...", __func__, name.c_str(), v->getKey().c_str());
+				delete[] bodyz;
+				cJSON_Delete(root);
+				return;
 			}
 			cJSON_AddItemToObject(root, "body", jbody); // assumes responsibility
 			delete[] bodyz;
