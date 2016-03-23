@@ -23,6 +23,8 @@
 #include <netinet/ip.h>
 #include <arpa/inet.h>
 #include <errno.h>
+#include <netdb.h>
+
 #include <sstream>
 
 #include <cJSON.h>
@@ -47,16 +49,38 @@ bool ExpiryChannel::open(const std::string& dstAddr, const int dstPort) {
 	}
 	
 	{
-		sockaddr_in addr;
-		int rc;
+		struct hostent htmp, *hp(NULL);
+		char aux_data[4*0x400];
+		int herr(0);
+
+		memset(&htmp, 0, sizeof (htmp));
 		
+		// Get hostname
+		const int res = gethostbyname_r(dstAddr.c_str(),
+			&htmp, aux_data, sizeof aux_data, &hp, &herr);
+		
+		if(res || !hp) {
+			LOG(EXTENSION_LOG_WARNING, "%s: gethostname_r failed: res=%d, herr[%s (%d)]",
+				__func__, res, strerror(herr), herr);
+			return false;
+		}
+		
+		if(!(hp->h_addr_list && hp->h_addr_list[0])) {
+			LOG(EXTENSION_LOG_WARNING, "%s: gethostname_r returned incorrect data",
+				__func__);
+			return false;
+		}
+
+		sockaddr_in addr;
 		memset(&addr, 0, sizeof(addr));
 		addr.sin_family = AF_INET;
-		inet_pton(AF_INET, dstAddr.c_str(), &addr.sin_addr);
+		memcpy((char *) &addr.sin_addr, (char *) hp->h_addr, hp->h_length);
 		addr.sin_port = htons(dstPort);
 		
-		if((rc=connect(mSocket, (sockaddr*)&addr, sizeof(addr))) < 0) {
-			LOG(EXTENSION_LOG_WARNING, "%s: conn(%d,%d)=%d: %d=%s", __func__, addr.sin_addr.s_addr, addr.sin_port, rc, errno, strerror(errno));
+		int rc;
+		if((rc = connect(mSocket, (sockaddr*)&addr, sizeof(addr))) < 0) {
+			LOG(EXTENSION_LOG_WARNING, "%s: conn(%d,%d)=%d: %d=%s",
+				__func__, addr.sin_addr.s_addr, addr.sin_port, rc, errno, strerror(errno));
 			close();
 			return false;
 		}
@@ -72,12 +96,12 @@ bool ExpiryChannel::open(const std::string& dstAddr, const int dstPort) {
 void ExpiryChannel::sendNotification(const std::string& name, const StoredValue* v) {
 	if(!v) {
 		LOG(EXTENSION_LOG_WARNING, "%s[%s]: called without StoredValue, bailing out...", __func__, name.c_str());
-        return;
-    }
-    if(!isConnected()) {
+		return;
+	}
+	if(!isConnected()) {
 		LOG(EXTENSION_LOG_WARNING, "%s[%s.%s], but there is no connection (not configured? failed to open?), bailing out...", __func__, name.c_str(), v->getKey().c_str());
 		return;
-    }
+	}
 /*
 {
   "bucket": "<STYPE>",
@@ -144,12 +168,30 @@ void ExpiryChannel::sendNotification(const std::string& name, const StoredValue*
 		return;
 	}
 
-	ssize_t written = send(mSocket, json_cstr, json_length, 0);
+	// here discovered errno==ECONNREFUSED to be returned if PREVIOUS message to that destination was not delivered
+	// (came ICMP with error as a reply to PREVIOUS message)
+	// official way to deal with it is to retry that case
+	static struct previous_tag {
+		std::string name;
+		std::string key;
+	} previous;
+	ssize_t written = -1;
+	for(int attempt = 0; attempt < 2; attempt++) {
+		written = send(mSocket, json_cstr, json_length, 0);
+		if(written < 0 && errno == ECONNREFUSED) {
+ 			continue;
+		}
+		break;
+	}
 	if(json_length != static_cast<size_t>(written)) {
-		LOG(EXTENSION_LOG_WARNING, "%s[%s.%s]: json_length[%zu] != written[%zu] errno[%s (%d)]", __func__, name.c_str(), v->getKey().c_str(), json_length, written, strerror(errno), errno);
+		LOG(EXTENSION_LOG_WARNING, "%s[%s.%s]: json_length[%zu] != written[%zd] errno[%s (%d)]",
+			__func__, name.c_str(), v->getKey().c_str(), json_length, written, strerror(errno), errno);
 	}
 
 	cJSON_Free(json_cstr);
+
+	previous.name = name;
+	previous.key = v->getKey();
 }
 
 void ExpiryChannel::close() {
