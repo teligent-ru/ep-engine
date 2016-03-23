@@ -179,7 +179,19 @@ void ExpiryChannel::sendNotification(const std::string& name, const StoredValue*
 	for(int attempt = 0; attempt < 2; attempt++) {
 		written = send(mSocket, json_cstr, json_length, 0);
 		if(written < 0 && errno == ECONNREFUSED) {
- 			continue;
+			// "probably" because it could be like this:
+			// 1. send(key1). previous.key:=key1
+			// 2. no ICMP error received yet
+			// 3. remote server started OK
+			// 4. send(key2). previous.key:=key2
+			// 5. ICMP error arrives (relating to key1 received)
+			// 6. send(key3) detects problem, but reports previous.key==key2 instead of key1
+			//
+			// due to this mess, maybe we should remove this confusing warning
+			// leaving it here for now to see if we will ever see that
+			LOG(EXTENSION_LOG_WARNING, "%s[%s.%s]: probably this notification was not delivered",
+				__func__, previous.name.c_str(), previous.key.c_str());
+			continue;
 		}
 		break;
 	}
