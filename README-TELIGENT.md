@@ -147,7 +147,7 @@ INCLUDE_DIRECTORIES(BEFORE ${CMAKE_INSTALL_PREFIX}/include
 [root@rualpe-vm1 couchbase.4.0.0.RHEL7]#
 
 
-запустить общую сборку, среди прочего получится ep.so, memcached, libcJSON
+запустить общую сборку, среди прочего получится ep.so, libcJSON
 --------------------------------------------------------------------------
 
 ~~~
