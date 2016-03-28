@@ -419,7 +419,7 @@ void TapProducer::setVBucketFilter(const std::vector<uint16_t> &vbuckets,
             if (vbucketFilter(*it)) {
                 RCPtr<VBucket> vb = vbMap.getBucket(*it);
                 if (vb) {
-                    vb->checkpointManager.removeTAPCursor(getName());
+                    vb->checkpointManager.removeCursor(getName());
                 }
                 backfillVBuckets.erase(*it);
                 backFillVBucketFilter.removeVBucket(*it);
@@ -965,7 +965,7 @@ bool BGFetchCallback::run() {
     EventuallyPersistentStore *epstore = epe->getEpStore();
     cb_assert(epstore);
 
-    epstore->getROUnderlying(vbucket)->get(key, rowid, vbucket, gcb, true);
+    epstore->getROUnderlying(vbucket)->get(key, vbucket, gcb, true);
     gcb.waitForValue();
     cb_assert(gcb.fired);
 
@@ -1028,7 +1028,7 @@ const char *TapProducer::opaqueCmdToString(uint32_t opaque_code) {
 }
 
 void TapProducer::queueBGFetch_UNLOCKED(const std::string &key, uint64_t id, uint16_t vb) {
-    ExTask task = new BGFetchCallback(&engine(), getName(), key, vb, id,
+    ExTask task = new BGFetchCallback(&engine(), getName(), key, vb,
                                       getConnectionToken(),
                                       Priority::TapBgFetcherPriority, 0);
     ExecutorPool::get()->schedule(task, AUXIO_TASK_IDX);
@@ -1228,10 +1228,8 @@ queued_item TapProducer::nextFgFetched_UNLOCKED(bool &shouldPause) {
             }
 
             bool isLastItem = false;
-            uint64_t endSeqno = 0;
             queued_item qi = vb->checkpointManager.nextItem(getName(),
-                                                            isLastItem,
-                                                            endSeqno);
+                                                            isLastItem);
             switch(qi->getOperation()) {
             case queue_op_set:
             case queue_op_del:
@@ -1266,7 +1264,7 @@ queued_item TapProducer::nextFgFetched_UNLOCKED(bool &shouldPause) {
                         // and acked. CHEKCPOINT_END message is going to be sent.
                         addCheckpointMessage_UNLOCKED(qi);
                     } else {
-                        vb->checkpointManager.decrTapCursorFromCheckpointEnd(getName());
+                        vb->checkpointManager.decrCursorFromCheckpointEnd(getName());
                         ++wait_for_ack_count;
                     }
                 }
@@ -1325,7 +1323,7 @@ size_t TapProducer::getRemainingOnCheckpoints_UNLOCKED() {
         if (!vb || (vb->getState() == vbucket_state_dead && !doTakeOver)) {
             continue;
         }
-        numItems += vb->checkpointManager.getNumItemsForTAPConnection(getName());
+        numItems += vb->checkpointManager.getNumItemsForCursor(getName());
     }
     return numItems;
 }
@@ -1692,7 +1690,7 @@ void TapProducer::registerCursor(const std::map<uint16_t, uint64_t> &lastCheckpo
             } else {
                 // If a TAP client doesn't specify the last closed checkpoint Id for a given vbucket,
                 // check if the checkpoint manager currently has the cursor for that TAP client.
-                uint64_t cid = vb->checkpointManager.getCheckpointIdForTAPCursor(getName());
+                uint64_t cid = vb->checkpointManager.getCheckpointIdForCursor(getName());
                 chk_id_to_start = cid > 0 ? cid : 1;
             }
 
@@ -1727,8 +1725,8 @@ void TapProducer::registerCursor(const std::map<uint16_t, uint64_t> &lastCheckpo
             bool prev_session_completed =
                 engine_.getTapConnMap().prevSessionReplicaCompleted(getName());
             // Check if the unified queue contains the checkpoint to start with.
-            bool chk_exists = vb->checkpointManager.registerTAPCursor(getName(),
-                                                                      chk_id_to_start);
+            bool chk_exists = vb->checkpointManager.registerCursor(getName(),
+                                                                   chk_id_to_start);
             if(!prev_session_completed || !chk_exists) {
                 uint64_t chk_id;
                 proto_checkpoint_state cstate;
@@ -1743,7 +1741,7 @@ void TapProducer::registerCursor(const std::map<uint16_t, uint64_t> &lastCheckpo
                         backfill_vbuckets.push_back(vbid);
                     }
                 } else { // Backfill age is in the future, simply start from the first checkpoint.
-                    chk_id = vb->checkpointManager.getCheckpointIdForTAPCursor(getName());
+                    chk_id = vb->checkpointManager.getCheckpointIdForCursor(getName());
                     cstate = checkpoint_start;
                     LOG(EXTENSION_LOG_INFO,
                         "%s Backfill age is greater than current time."
@@ -1798,9 +1796,11 @@ Item* TapProducer::getNextItem(const void *c, uint16_t *vbucket, uint16_t &ret,
         }
         *vbucket = checkpoint_msg->getVBucketId();
         uint64_t cid = htonll(checkpoint_msg->getRevSeqno());
-        value_t vblob(Blob::New((const char*)&cid, sizeof(cid), NULL, 0));
-        itm = new Item(checkpoint_msg->getKey(), 0, 0, vblob,
-                       0, -1, checkpoint_msg->getVBucketId());
+        const std::string& key = checkpoint_msg->getKey();
+        itm = new Item(key.data(), key.length(), /*flags*/0, /*exp*/0,
+                       &cid, sizeof(cid), /*ext_meta*/NULL, /*ext_len*/0,
+                       /*cas*/0, /*seqno*/-1,
+                       checkpoint_msg->getVBucketId());
         return itm;
     }
 
@@ -1872,8 +1872,11 @@ Item* TapProducer::getNextItem(const void *c, uint16_t *vbucket, uint16_t &ret,
                 ret = TAP_MUTATION;
             } else if (r == ENGINE_KEY_ENOENT) {
                 // Item was deleted and set a message type to tap_deletion.
-                itm = new Item(qi->getKey().c_str(), qi->getNKey(), 0,
-                               0, 0, NULL, 0, 0, -1, qi->getVBucketId());
+                itm = new Item(qi->getKey().c_str(), qi->getNKey(),
+                               /*flags*/0, /*exp*/0,
+                               /*data*/NULL, /*size*/0,
+                               /*ext_meta*/NULL, /*ext_len*/0,
+                               /*cas*/0, /*seqno*/-1, qi->getVBucketId());
                 itm->setRevSeqno(qi->getRevSeqno());
                 ret = TAP_DELETION;
             } else if (r == ENGINE_EWOULDBLOCK) {
@@ -1902,8 +1905,11 @@ Item* TapProducer::getNextItem(const void *c, uint16_t *vbucket, uint16_t &ret,
             }
             ++stats.numTapFGFetched;
         } else if (qi->getOperation() == queue_op_del) {
-            itm = new Item(qi->getKey().c_str(), qi->getNKey(), 0,
-                           0, 0, NULL, 0, qi->getCas(), -1, qi->getVBucketId());
+            itm = new Item(qi->getKey().c_str(), qi->getNKey(),
+                           /*flags*/0, /*exp*/0,
+                           /*data*/NULL, /*size*/0,
+                           /*ext_meta*/NULL, /*ext_len*/0,
+                           qi->getCas(), /*seqno*/-1, qi->getVBucketId());
             itm->setRevSeqno(qi->getRevSeqno());
             ret = TAP_DELETION;
             ++stats.numTapDeletes;
@@ -2010,7 +2016,11 @@ ENGINE_ERROR_CODE Consumer::setVBucketState(uint32_t opaque, uint16_t vbucket,
         "%s Received TAP/DCP_VBUCKET_SET with vbucket %d and state \"%s\"\n",
         logHeader(), vbucket, VBucket::toString(state));
 
-    return engine_.getEpStore()->setVBucketState(vbucket, state, true);
+    // For TAP-based VBucket takeover, we should create a new VBucket UUID
+    // to prevent any potential data loss after fully switching from TAP to
+    // DCP. Please refer to https://issues.couchbase.com/browse/MB-15837 for
+    // more details.
+    return engine_.getEpStore()->setVBucketState(vbucket, state, false);
 }
 
 void Consumer::processedEvent(uint16_t event, ENGINE_ERROR_CODE ret)
@@ -2134,7 +2144,7 @@ bool TapConsumer::processCheckpointCommand(uint8_t event, uint16_t vbucket,
         LOG(EXTENSION_LOG_INFO,
             "%s Received checkpoint_end message with id %llu for vbucket %d",
             logHeader(), checkpointId, vbucket);
-        ret = vb->checkpointManager.closeOpenCheckpoint(checkpointId);
+        ret = vb->checkpointManager.closeOpenCheckpoint();
         break;
     default:
         LOG(EXTENSION_LOG_WARNING,
@@ -2156,20 +2166,17 @@ ENGINE_ERROR_CODE TapConsumer::mutation(uint32_t opaque, const void* key,
                                         const void* meta, uint16_t nmeta) {
     ENGINE_ERROR_CODE ret = ENGINE_SUCCESS;
 
-    std::string key_str(static_cast<const char*>(key), nkey);
-    value_t vblob(Blob::New(static_cast<const char*>(value), nvalue, &datatype,
-                            EXT_META_LEN));
-    Item *item = new Item(key_str, flags, exptime, vblob);
-    item->setVBucketId(vbucket);
-    item->setCas(cas);
-    item->setRevSeqno(revSeqno);
+    Item *item = new Item(key, nkey, flags, exptime, value, nvalue,
+                          &datatype, EXT_META_LEN, cas, -1,
+                          vbucket, revSeqno);
 
     EventuallyPersistentStore* epstore = engine_.getEpStore();
     if (isBackfillPhase(vbucket)) {
         ret = epstore->addTAPBackfillItem(*item, nru, true);
     }
     else {
-        ret = epstore->setWithMeta(*item, 0, this, true, true, nru, true, true);
+        ret = epstore->setWithMeta(*item, 0, NULL, this, true, true, nru, true,
+                                   NULL, true);
     }
 
     delete item;
@@ -2216,9 +2223,9 @@ ENGINE_ERROR_CODE TapConsumer::deletion(uint32_t opaque, const void* key,
     }
 
     ItemMetaData itemMeta(cas, revSeqno, 0, 0);
-    ret = epstore->deleteWithMeta(key_str, &delCas, vbucket, this, true,
+    ret = epstore->deleteWithMeta(key_str, &delCas, NULL, vbucket, this, true,
                                   &itemMeta, isBackfillPhase(vbucket),
-                                  true, 0, true);
+                                  true, 0, NULL, true);
 
     if (ret == ENGINE_KEY_ENOENT) {
         ret = ENGINE_SUCCESS;

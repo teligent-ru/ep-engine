@@ -20,6 +20,7 @@
 
 #include "config.h"
 
+#include "ext_meta_parser.h"
 #include "item.h"
 
 typedef enum {
@@ -41,7 +42,6 @@ typedef enum {
     MARKER_FLAG_CHK    = 0x04,
     MARKER_FLAG_ACK    = 0x08
 } dcp_marker_flag_t;
-
 
 class DcpResponse {
 public:
@@ -274,26 +274,23 @@ private:
 
 class MutationResponse : public DcpResponse {
 public:
-    MutationResponse(queued_item item, uint32_t opaque)
+    MutationResponse(queued_item item, uint32_t opaque,
+                     ExtendedMetaData *e = NULL)
         : DcpResponse(item->isDeleted() ? DCP_DELETION : DCP_MUTATION, opaque),
-          item_(item) {}
+          item_(item), emd(e) {}
+
+    ~MutationResponse() {
+        if (emd) {
+            delete emd;
+        }
+    }
 
     queued_item& getItem() {
         return item_;
     }
 
     Item* getItemCopy() {
-        Item* ret = new Item(item_->getKey(), item_->getFlags(),
-                             item_->getExptime(), item_->getValue(),
-                             item_->getCas(), item_->getBySeqno(),
-                             item_->getVBucketId(), item_->getRevSeqno());
-        ret->setNRUValue(item_->getNRUValue());
-
-        if (item_->isDeleted()) {
-            ret->setDeleted();
-        }
-
-        return ret;
+        return new Item(*item_);
     }
 
     uint16_t getVBucket() {
@@ -312,7 +309,14 @@ public:
         uint32_t base = item_->isDeleted() ? deletionBaseMsgBytes :
                                              mutationBaseMsgBytes;
         uint32_t body = item_->getNKey() + item_->getNBytes();
+        if (emd) {
+            body += emd->getExtMeta().second;
+        }
         return base + body;
+    }
+
+    ExtendedMetaData* getExtMetaData() {
+        return emd;
     }
 
     static const uint32_t mutationBaseMsgBytes;
@@ -320,6 +324,7 @@ public:
 
 private:
     queued_item item_;
+    ExtendedMetaData *emd;
 };
 
 #endif  // SRC_DCP_RESPONSE_H_

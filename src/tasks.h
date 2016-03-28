@@ -33,6 +33,7 @@ typedef enum {
     TASK_DEAD
 } task_state_t;
 
+class BfilterCB;
 class BgFetcher;
 class CompareTasksByDueDate;
 class CompareTasksByPriority;
@@ -52,10 +53,12 @@ typedef struct {
 typedef struct {
     uint64_t purge_before_ts;
     uint64_t purge_before_seq;
-    uint8_t  drop_deletes;
     uint64_t max_purged_seq;
+    uint8_t  drop_deletes;
     uint32_t curr_time;
     std::list<expiredItemCtx> expiredItems;
+    // Callback required for Bloomfilter
+    BfilterCB *bfcb;
 } compaction_ctx;
 
 class GlobalTask : public RCValue {
@@ -295,6 +298,8 @@ public:
         desc = ss.str();
     }
 
+    ~CompactVBucketTask();
+
     bool run();
 
     std::string getDescription() {
@@ -350,6 +355,23 @@ private:
 };
 
 /**
+ * A task that performs the bucket flush operation.
+ */
+class FlushAllTask : public GlobalTask {
+public:
+    FlushAllTask(EventuallyPersistentEngine *e, double when) :
+        GlobalTask(e, Priority::FlushAllPriority, when, false) { }
+
+    bool run();
+
+    std::string getDescription() {
+        std::stringstream ss;
+        ss << "Performing flush_all operation.";
+        return ss.str();
+    }
+};
+
+/**
  * A task for performing disk fetches for "stats vkey".
  */
 class VKeyStatBGFetchTask : public GlobalTask {
@@ -383,10 +405,10 @@ private:
 class BGFetchTask : public GlobalTask {
 public:
     BGFetchTask(EventuallyPersistentEngine *e, const std::string &k,
-            uint16_t vbid, uint64_t s, const void *c, bool isMeta,
+            uint16_t vbid, const void *c, bool isMeta,
             const Priority &p, int sleeptime = 0, bool shutdown = false) :
         GlobalTask(e, p, sleeptime, shutdown), key(k), vbucket(vbid),
-        seqNum(s), cookie(c), metaFetch(isMeta), init(gethrtime()) { }
+        cookie(c), metaFetch(isMeta), init(gethrtime()) { }
 
     bool run();
 
@@ -399,7 +421,6 @@ public:
 private:
     const std::string          key;
     uint16_t                   vbucket;
-    uint64_t                   seqNum;
     const void                *cookie;
     bool                       metaFetch;
     hrtime_t                   init;

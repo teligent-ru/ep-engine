@@ -99,6 +99,15 @@ public:
         return !isDirty();
     }
 
+    void setConflictResMode(enum conflict_resolution_mode conflict_res_mode) {
+        conflictResMode = static_cast<uint8_t>(conflict_res_mode);
+    }
+
+
+    enum conflict_resolution_mode getConflictResMode(void) {
+        return static_cast<enum conflict_resolution_mode>(conflictResMode);
+    }
+
     bool eligibleForEviction(item_eviction_policy_t policy) {
         if (policy == VALUE_ONLY) {
             return isResident() && isClean() && !isDeleted();
@@ -355,7 +364,7 @@ public:
 
      }
 
-    size_t valuelen() {
+    size_t valuelen() const {
         if (isDeleted() || !isResident()) {
             return 0;
         }
@@ -462,6 +471,13 @@ public:
      */
     static void setMutationMemoryThreshold(double memThreshold);
 
+    /**
+     * Return the memory threshold for accepting a new mutation
+     */
+    static double getMutationMemThreshold() {
+        return mutation_mem_threshold;
+    }
+
     /*
      * Values of the bySeqno attribute used by temporarily created StoredValue
      * objects.
@@ -478,8 +494,14 @@ public:
     }
 
     size_t getObjectSize() const {
-        return sizeof(StoredValue) + keylen;
+        return (sizeof(StoredValue) - sizeof(keybytes)) + keylen;
     }
+
+    /**
+     * Reallocates the dynamic members of StoredValue. Used as part of
+     * defragmentation.
+     */
+    void reallocate();
 
 private:
 
@@ -495,6 +517,7 @@ private:
         lock_expiry = 0;
         keylen = itm.getNKey();
         revSeqno = itm.getRevSeqno();
+        conflictResMode = revision_seqno;
 
         if (setDirty) {
             markDirty();
@@ -522,6 +545,7 @@ private:
     bool               _isDirty  :  1; // 1 bit
     bool               deleted   :  1;
     bool               newCacheItem : 1;
+    uint8_t            conflictResMode : 2;
     uint8_t            nru       :  2; //!< True if referenced since last sweep
     uint8_t            keylen;
     char               keybytes[1];    //!< The key itself.
@@ -587,6 +611,8 @@ public:
      */
     virtual bool shouldContinue() { return true; }
 };
+
+class PauseResumeHashTableVisitor;
 
 /**
  * Hash table visitor that reports the depth of each hashtable bucket.
@@ -715,10 +741,13 @@ private:
 
     StoredValue* newStoredValue(const Item &itm, StoredValue *n, HashTable &ht,
                                 bool setDirty) {
-        size_t base = sizeof(StoredValue);
+        // Do not consider the size of the char pointer (keybytes)
+        // that is used to hold the key
+        size_t base = sizeof(StoredValue) - sizeof(char);
 
         const std::string &key = itm.getKey();
         cb_assert(key.length() < 256);
+
         size_t len = key.length() + base;
 
         StoredValue *t = new (::operator new(len))
@@ -735,6 +764,45 @@ private:
  */
 class HashTable {
 public:
+
+    /**
+     * Represents a position within the hashtable.
+     *
+     * Currently opaque (and constant), clients can pass them around but
+     * cannot reposition the iterator.
+     */
+    class Position {
+    public:
+        // Allow default construction positioned at the start,
+        // but nothing else.
+        Position() : ht_size(0), lock(0), hash_bucket(0) {}
+
+        bool operator==(const Position& other) const {
+            return (ht_size == other.ht_size) &&
+                   (lock == other.lock) &&
+                   (hash_bucket == other.hash_bucket);
+        }
+
+        bool operator!=(const Position& other) const {
+            return ! (*this == other);
+        }
+
+    private:
+        Position(size_t ht_size_, int lock_, int hash_bucket_)
+          : ht_size(ht_size_),
+            lock(lock_),
+            hash_bucket(hash_bucket_) {}
+
+        // Size of the hashtable when the position was created.
+        size_t ht_size;
+        // Lock ID we are up to.
+        size_t lock;
+        // hash bucket ID (under the given lock) we are up to.
+        size_t hash_bucket;
+
+        friend class HashTable;
+        friend std::ostream& operator<<(std::ostream& os, const Position& pos);
+    };
 
     /**
      * Create a HashTable.
@@ -809,6 +877,42 @@ public:
      */
     size_t getNumItems(void) {
         return numTotalItems;
+    }
+
+    void decrNumItems(void) {
+        size_t count;
+        do {
+            count = numItems.load();
+            if (count == 0) {
+                LOG(EXTENSION_LOG_DEBUG,
+                    "Cannot decrement numItems, value at 0 already");
+                break;
+            }
+        } while (!numItems.compare_exchange_strong(count, count - 1));
+    }
+
+    void decrNumTotalItems(void) {
+        size_t count;
+        do {
+            count = numTotalItems.load();
+            if (count == 0) {
+                LOG(EXTENSION_LOG_DEBUG,
+                    "Cannot decrement numTotalItems, value at 0 already");
+                break;
+            }
+        } while (!numTotalItems.compare_exchange_strong(count, count - 1));
+    }
+
+    void decrNumNonResidentItems(void) {
+        size_t count;
+        do {
+            count = numNonResidentItems.load();
+            if (count == 0) {
+                LOG(EXTENSION_LOG_DEBUG,
+                    "Cannot decrement numNonResidentItems, value at 0 already");
+                break;
+            }
+        } while (!numNonResidentItems.compare_exchange_strong(count, count - 1));
     }
 
     /**
@@ -900,9 +1004,8 @@ public:
      * @param isReplication true if issued by consumer (for replication)
      * @return a result indicating the status of the store
      */
-    mutation_type_t set(const Item &val, uint64_t cas,
-                        bool allowExisting, bool hasMetaData = true,
-                        item_eviction_policy_t policy = VALUE_ONLY,
+    mutation_type_t set(const Item &val, uint64_t cas, bool allowExisting,
+                        bool hasMetaData = true, item_eviction_policy_t policy = VALUE_ONLY,
                         uint8_t nru=0xff) {
         int bucket_num(0);
         LockHolder lh = getLockedBucket(val.getKey(), &bucket_num);
@@ -913,7 +1016,7 @@ public:
     mutation_type_t unlocked_set(StoredValue*& v, const Item &val, uint64_t cas,
                                  bool allowExisting, bool hasMetaData = true,
                                  item_eviction_policy_t policy = VALUE_ONLY,
-                                 uint8_t nru=0xff,
+                                 uint8_t nru=0xff, bool maybeKeyExists=true,
                                  bool isReplication = false) {
         cb_assert(isActive());
         Item &itm = const_cast<Item&>(val);
@@ -923,7 +1026,7 @@ public:
 
         mutation_type_t rv = NOT_FOUND;
 
-        if (cas && policy == FULL_EVICTION) {
+        if (cas && policy == FULL_EVICTION && maybeKeyExists) {
             if (!v || v->isTempInitialItem()) {
                 return NEED_BG_FETCH;
             }
@@ -967,12 +1070,9 @@ public:
                 return INVALID_CAS;
             }
 
-            if (!hasMetaData) {
-                itm.setCas();
-            }
             rv = v->isClean() ? WAS_CLEAN : WAS_DIRTY;
             if (!v->isResident() && !v->isDeleted() && !v->isTempItem()) {
-                --numNonResidentItems;
+                decrNumNonResidentItems();
             }
 
             if (v->isTempItem()) {
@@ -988,9 +1088,6 @@ public:
         } else if (cas != 0) {
             rv = NOT_FOUND;
         } else {
-            if (!hasMetaData) {
-                itm.setCas();
-            }
             int bucket_num = getBucketForHash(hash(itm.getKey()));
             v = valFact(itm, values[bucket_num], *this);
             values[bucket_num] = v;
@@ -1067,6 +1164,7 @@ public:
                             item_eviction_policy_t policy,
                             bool isDirty = true,
                             bool storeVal = true,
+                            bool maybeKeyExists = true,
                             bool isReplication = false);
 
     /**
@@ -1130,7 +1228,7 @@ public:
         if (v) {
             if (v->isExpired(ep_real_time()) && !use_meta) {
                 if (!v->isResident() && !v->isDeleted() && !v->isTempItem()) {
-                    --numNonResidentItems;
+                    decrNumNonResidentItems();
                 }
                 v->setRevSeqno(metadata.revSeqno);
                 v->del(*this, use_meta);
@@ -1150,7 +1248,7 @@ public:
             }
 
             if (!v->isResident() && !v->isDeleted() && !v->isTempItem()) {
-                --numNonResidentItems;
+                decrNumNonResidentItems();
             }
 
             if (v->isTempItem()) {
@@ -1318,8 +1416,8 @@ public:
             if (v->isTempItem()) {
                 --numTempItems;
             } else {
-                --numItems;
-                --numTotalItems;
+                decrNumItems();
+                decrNumTotalItems();
             }
             delete v;
             return true;
@@ -1338,8 +1436,8 @@ public:
                 if (tmp->isTempItem()) {
                     --numTempItems;
                 } else {
-                    --numItems;
-                    --numTotalItems;
+                    decrNumItems();
+                    decrNumTotalItems();
                 }
                 delete tmp;
                 return true;
@@ -1373,6 +1471,36 @@ public:
      * Visit all items within this call with a depth visitor.
      */
     void visitDepth(HashTableDepthVisitor &visitor);
+
+    /**
+     * Visit the items in this hashtable, starting the iteration from the
+     * given startPosition and allowing the visit to be paused at any point.
+     *
+     * During visitation, the visitor object can request that the visit
+     * is stopped after the current item. The position passed to the
+     * visitor can then be used to restart visiting at the *APPROXIMATE*
+     * same position as it paused.
+     * This is approximate as hashtable locks are released when the
+     * function returns, so any changes to the hashtable may cause the
+     * visiting to restart at the slightly different place.
+     *
+     * As a consequence, *DO NOT USE THIS METHOD* if you need to guarantee
+     * that all items are visited!
+     *
+     * @param visitor The visitor object to use.
+     * @param start_pos At what position to start in the hashtable.
+     * @return The final HashTable position visited; equal to
+     *         HashTable::end() if all items were visited otherwise the
+     *         position to resume from.
+     */
+    Position pauseResumeVisit(PauseResumeHashTableVisitor& visitor,
+                              Position& start_pos);
+
+    /**
+     * Return a position at the end of the hashtable. Has similar semantics
+     * as STL end() (i.e. one past the last element).
+     */
+    Position endPosition() const;
 
     /**
      * Get the number of buckets that should be used for initialization.
@@ -1444,7 +1572,7 @@ private:
     inline bool isActive() const { return activeState; }
     inline void setActiveState(bool newv) { activeState = newv; }
 
-    size_t               size;
+    AtomicValue<size_t> size;
     size_t               n_locks;
     StoredValue        **values;
     Mutex               *mutexes;
@@ -1476,5 +1604,20 @@ private:
 
     DISALLOW_COPY_AND_ASSIGN(HashTable);
 };
+
+/**
+ * Base class for visiting a hash table with pause/resume support.
+ */
+class PauseResumeHashTableVisitor {
+public:
+    /**
+     * Visit an individual item within a hash table.
+     *
+     * @param v a pointer to a value in the hash table.
+     * @return True if visiting should continue, otherwise false.
+     */
+    virtual bool visit(StoredValue& v) = 0;
+};
+
 
 #endif  // SRC_STORED_VALUE_H_

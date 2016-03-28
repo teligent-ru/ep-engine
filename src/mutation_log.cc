@@ -432,8 +432,8 @@ bool MutationLog::prepareWrites() {
         int64_t unaligned_bytes = seek_result % blockSize;
         if (unaligned_bytes != 0) {
             LOG(EXTENSION_LOG_WARNING,
-                    "WARNING: filesize %d not block aligned", seek_result,
-                    "'%s': %s", getLogFile().c_str(), strerror(errno));
+                "WARNING: filesize %" PRId64 " not block aligned '%s': %s",
+                seek_result, getLogFile().c_str(), strerror(errno));
             if (blockSize < (size_t)seek_result) {
                 if (SeekFile(file, getLogFile(),
                     seek_result - unaligned_bytes, false) < 0) {
@@ -902,8 +902,7 @@ void MutationLogHarvester::apply(void *arg, mlCallback mlc) {
                                                        committed[vb].begin();
              it2 != committed[vb].end(); ++it2) {
             const std::string key(it2->first);
-            uint64_t rowid(it2->second);
-            if (!mlc(arg, vb, key, rowid)) { // Stop loading from an access log
+            if (!mlc(arg, vb, key)) { // Stop loading from an access log
                 return;
             }
         }

@@ -94,10 +94,6 @@ public:
         forceShutdown(false),
         oom_errors(0),
         tmp_oom_errors(0),
-        io_num_read(0),
-        io_num_write(0),
-        io_read_bytes(0),
-        io_write_bytes(0),
         pendingOps(0),
         pendingOpsTotal(0),
         pendingOpsMax(0),
@@ -148,6 +144,8 @@ public:
         alogRuntime(0),
         isShutdown(false),
         rollbackCount(0),
+        defragNumVisited(0),
+        defragNumMoved(0),
         dirtyAgeHisto(GrowingWidthGenerator<hrtime_t>(0, ONE_SECOND, 1.4), 25),
         diskCommitHisto(GrowingWidthGenerator<hrtime_t>(0, ONE_SECOND, 1.4), 25),
         mlogCompactorHisto(GrowingWidthGenerator<hrtime_t>(0, ONE_SECOND, 1.4), 25),
@@ -298,15 +296,6 @@ public:
     //! Number of times temporary oom errors encountered while processing operations.
     AtomicValue<size_t> tmp_oom_errors;
 
-    //! Number of read related io operations
-    AtomicValue<size_t> io_num_read;
-    //! Number of write related io operations
-    AtomicValue<size_t> io_num_write;
-    //! Number of bytes read
-    AtomicValue<size_t> io_read_bytes;
-    //! Number of bytes written
-    AtomicValue<size_t> io_write_bytes;
-
     //! Number of ops blocked on all vbuckets in pending state
     AtomicValue<size_t> pendingOps;
     //! Total number of ops ever blocked on all vbuckets in pending state
@@ -446,6 +435,16 @@ public:
 
     AtomicValue<size_t> rollbackCount;
 
+    /** The number of items that have been visited (considered for
+     * defragmentation) by the defragmenter task.
+     */
+    AtomicValue<size_t> defragNumVisited;
+
+    /** The number of items that have been moved (defragmented) by the
+     * defragmenter task.
+     */
+    AtomicValue<size_t> defragNumMoved;
+
     //! Histogram of queue processing dirty age.
     Histogram<hrtime_t> dirtyAgeHisto;
 
@@ -538,10 +537,6 @@ public:
         numValueEjects.store(0);
         numFailedEjects.store(0);
         numNotMyVBuckets.store(0);
-        io_num_read.store(0);
-        io_num_write.store(0);
-        io_read_bytes.store(0);
-        io_write_bytes.store(0);
         bgNumOperations.store(0);
         bgWait.store(0);
         bgLoad.store(0);
@@ -557,6 +552,8 @@ public:
         tapBgMinLoad.store(999999999);
         tapBgMaxLoad.store(0);
         tapThrottled.store(0);
+        oom_errors.store(0);
+        tmp_oom_errors.store(0);
         pendingOps.store(0);
         pendingOpsTotal.store(0);
         pendingOpsMax.store(0);
@@ -567,6 +564,8 @@ public:
 
         mlogCompactorRuns.store(0);
         alogRuns.store(0);
+        defragNumVisited.store(0),
+        defragNumMoved.store(0);
 
         pendingOpsHisto.reset();
         bgWaitHisto.reset();

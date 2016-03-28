@@ -33,8 +33,8 @@ KVShard::KVShard(uint16_t id, EventuallyPersistentStore &store) :
 
     vbuckets = new RCPtr<VBucket>[maxVbuckets];
 
-    rwUnderlying = KVStoreFactory::create(stats, config, false);
-    roUnderlying = KVStoreFactory::create(stats, config, true);
+    rwUnderlying = KVStoreFactory::create(config, false);
+    roUnderlying = KVStoreFactory::create(config, true);
 
     flusher = new Flusher(&store, this);
     bgFetcher = new BgFetcher(&store, this, stats);
@@ -71,8 +71,16 @@ BgFetcher *KVShard::getBgFetcher() {
     return bgFetcher;
 }
 
+void KVShard::notifyFlusher() {
+    flusher->notifyFlushEvent();
+}
+
 RCPtr<VBucket> KVShard::getBucket(uint16_t id) const {
-    return vbuckets[id];
+    if (id < maxVbuckets) {
+        return vbuckets[id];
+    } else {
+        return NULL;
+    }
 }
 
 void KVShard::setBucket(const RCPtr<VBucket> &vb) {
@@ -116,6 +124,5 @@ bool KVShard::setHighPriorityVbSnapshotFlag(bool highPriority) {
 
 bool KVShard::setLowPriorityVbSnapshotFlag(bool lowPriority) {
     bool inverse = !lowPriority;
-    return lowPrioritySnapshot.compare_exchange_strong(inverse,
-                                                       lowPrioritySnapshot);
+    return lowPrioritySnapshot.compare_exchange_strong(inverse, lowPriority);
 }

@@ -59,6 +59,16 @@ struct index_entry {
     int64_t mutation_id;
 };
 
+typedef struct {
+    uint64_t start;
+    uint64_t end;
+} snapshot_range_t;
+
+typedef struct {
+    uint64_t start;
+    snapshot_range_t range;
+} snapshot_info_t;
+
 /**
  * The checkpoint index maps a key to a checkpoint index_entry.
  */
@@ -110,6 +120,10 @@ public:
         return *this;
     }
 
+    void decrOffset(size_t decr);
+
+    void decrPos();
+
 private:
     std::string                      name;
     std::list<Checkpoint*>::iterator currentCheckpoint;
@@ -148,14 +162,16 @@ typedef enum {
 } queue_dirty_t;
 
 /**
- * Representation of a checkpoint used in the unified queue for persistence and tap.
+ * Representation of a checkpoint used in the unified queue for persistence and
+ * replication.
  */
 class Checkpoint {
 public:
-    Checkpoint(EPStats &st, uint64_t id, uint16_t vbid,
-               checkpoint_state state = CHECKPOINT_OPEN) :
-        stats(st), checkpointId(id), vbucketId(vbid), creationTime(ep_real_time()),
-        checkpointState(state), numItems(0), memOverhead(0) {
+    Checkpoint(EPStats &st, uint64_t id, uint64_t snapStart, uint64_t snapEnd,
+               uint16_t vbid) :
+        stats(st), checkpointId(id), snapStartSeqno(snapStart),
+        snapEndSeqno(snapEnd), vbucketId(vbid), creationTime(ep_real_time()),
+        checkpointState(CHECKPOINT_OPEN), numItems(0), memOverhead(0) {
         stats.memOverhead.fetch_add(memorySize());
         cb_assert(stats.memOverhead.load() < GIGANTOR);
     }
@@ -262,6 +278,22 @@ public:
         return (*pos)->getBySeqno();
     }
 
+    uint64_t getSnapshotStartSeqno() {
+        return snapStartSeqno;
+    }
+
+    void setSnapshotStartSeqno(uint64_t seqno) {
+        snapStartSeqno = seqno;
+    }
+
+    uint64_t getSnapshotEndSeqno() {
+        return snapEndSeqno;
+    }
+
+    void setSnapshotEndSeqno(uint64_t seqno) {
+        snapEndSeqno = seqno;
+    }
+
     std::list<queued_item>::iterator begin() {
         return toWrite.begin();
     }
@@ -308,6 +340,8 @@ public:
 private:
     EPStats                       &stats;
     uint64_t                       checkpointId;
+    uint64_t                       snapStartSeqno;
+    uint64_t                       snapEndSeqno;
     uint16_t                       vbucketId;
     rel_time_t                     creationTime;
     checkpoint_state               checkpointState;
@@ -333,13 +367,18 @@ class CheckpointManager {
 public:
 
     CheckpointManager(EPStats &st, uint16_t vbucket, CheckpointConfig &config,
-                      int64_t lastSeqno, uint64_t checkpointId = 1) :
+                      int64_t lastSeqno, uint64_t lastSnapStart,
+                      uint64_t lastSnapEnd,
+                      shared_ptr<Callback<uint16_t> > cb,
+                      uint64_t checkpointId = 1) :
         stats(st), checkpointConfig(config), vbucketId(vbucket), numItems(0),
         lastBySeqno(lastSeqno), lastClosedChkBySeqno(lastSeqno),
-        persistenceCursor("persistence"), isCollapsedCheckpoint(false),
-        pCursorPreCheckpointId(0) {
-        addNewCheckpoint(checkpointId);
-        registerPersistenceCursor();
+        isCollapsedCheckpoint(false),
+        pCursorPreCheckpointId(0),
+        flusherCB(cb) {
+        LockHolder lh(queueLock);
+        addNewCheckpoint_UNLOCKED(checkpointId, lastSnapStart, lastSnapEnd);
+        registerCursor_UNLOCKED("persistence", checkpointId);
     }
 
     ~CheckpointManager();
@@ -376,38 +415,38 @@ public:
      * which the cursor can start and (2) flag indicating if the cursor starts
      * with the first item on a checkpoint.
      */
-    CursorRegResult registerTAPCursorBySeqno(const std::string &name,
-                                             uint64_t startBySeqno);
+    CursorRegResult registerCursorBySeqno(const std::string &name,
+                                          uint64_t startBySeqno);
 
     /**
-     * Register the new cursor for a given TAP connection
-     * @param name the name of a given TAP connection
+     * Register the new cursor for a given connection
+     * @param name the name of a given connection
      * @param checkpointId the checkpoint Id to start with.
      * @param alwaysFromBeginning the flag indicating if a cursor should be set to the beginning of
      * checkpoint to start with, even if the cursor is currently in that checkpoint.
      * @return true if the checkpoint to start with exists in the queue.
      */
-    bool registerTAPCursor(const std::string &name, uint64_t checkpointId = 1,
-                           bool alwaysFromBeginning = false);
+    bool registerCursor(const std::string &name, uint64_t checkpointId = 1,
+                        bool alwaysFromBeginning = false);
 
     /**
-     * Remove the cursor for a given TAP connection.
-     * @param name the name of a given TAP connection
-     * @return true if the TAP cursor is removed successfully.
+     * Remove the cursor for a given connection.
+     * @param name the name of a given connection
+     * @return true if the cursor is removed successfully.
      */
-    bool removeTAPCursor(const std::string &name);
+    bool removeCursor(const std::string &name);
 
     /**
-     * Get the Id of the checkpoint where the given TAP connection's cursor is currently located.
+     * Get the Id of the checkpoint where the given connections cursor is currently located.
      * If the cursor is not found, return 0 as a checkpoint Id.
-     * @param name the name of a given TAP connection
-     * @return the checkpoint Id for a given TAP connection's cursor.
+     * @param name the name of a given connection
+     * @return the checkpoint Id for a given connections cursor.
      */
-    uint64_t getCheckpointIdForTAPCursor(const std::string &name);
+    uint64_t getCheckpointIdForCursor(const std::string &name);
 
-    size_t getNumOfTAPCursors();
+    size_t getNumOfCursors();
 
-    std::list<std::string> getTAPCursorNames();
+    std::list<std::string> getCursorNames();
 
     /**
      * Queue an item to be written to persistent layer.
@@ -419,24 +458,16 @@ public:
     bool queueDirty(const RCPtr<VBucket> &vb, queued_item& qi, bool genSeqno);
 
     /**
-     * Return the next item to be sent to a given TAP connection
-     * @param name the name of a given TAP connection
-     * @param isLastMutationItem flag indicating if the item to be returned is the last mutation one
-     * in the closed checkpoint.
-     * @return the next item to be sent to a given TAP connection.
+     * Return the next item to be sent to a given connection
+     * @param name the name of a given connection
+     * @param isLastMutationItem flag indicating if the item to be returned is
+     * the last mutation one in the closed checkpoint.
+     * @return the next item to be sent to a given connection.
      */
-    queued_item nextItem(const std::string &name, bool &isLastMutationItem,
-                         uint64_t &highSeqno);
+    queued_item nextItem(const std::string &name, bool &isLastMutationItem);
 
-    /**
-     * Return the list of items, which needs to be persisted, to the flusher.
-     * @param items the array that will contain the list of items to be persisted and
-     * be pushed into the flusher's outgoing queue where the further IO optimization is performed.
-     */
-    void getAllItemsForPersistence(std::vector<queued_item> &items);
-
-    void getAllItemsForCursor(const std::string& name,
-                              std::list<queued_item> &items);
+    snapshot_range_t getAllItemsForCursor(const std::string& name,
+                                          std::vector<queued_item> &items);
 
     /**
      * Return the total number of items that belong to this checkpoint manager.
@@ -449,40 +480,27 @@ public:
 
     size_t getNumCheckpoints();
 
-    /**
-     * Return the total number of remaining items that should be visited by the persistence cursor.
-     */
-    size_t getNumItemsForPersistence_UNLOCKED();
+    size_t getNumItemsForCursor(const std::string &name);
 
-    size_t getNumItemsForPersistence() {
+    void clear(vbucket_state_t vbState) {
         LockHolder lh(queueLock);
-        return getNumItemsForPersistence_UNLOCKED();
+        clear_UNLOCKED(vbState, lastBySeqno);
     }
-
-    size_t getNumItemsForTAPConnection(const std::string &name);
-
-    /**
-     * Return true if a given key was already visited by all the cursors
-     * and is eligible for eviction.
-     */
-    bool eligibleForEviction(const std::string &key);
 
     /**
      * Clear all the checkpoints managed by this checkpoint manager.
      */
-    void clear(vbucket_state_t vbState);
+    void clear(RCPtr<VBucket> &vb, uint64_t seqno);
 
     /**
-     * If a given TAP cursor currently points to the checkpoint_end dummy item,
-     * decrease its current position by 1. This function is mainly used for checkpoint
-     * synchronization between the master and slave nodes.
-     * @param name the name of a given TAP connection
+     * If a given cursor currently points to the checkpoint_end dummy item,
+     * decrease its current position by 1. This function is mainly used for
+     * checkpoint synchronization between the master and slave nodes.
+     * @param name the name of a given connection
      */
-    void decrTapCursorFromCheckpointEnd(const std::string &name);
+    void decrCursorFromCheckpointEnd(const std::string &name);
 
     bool hasNext(const std::string &name);
-
-    bool hasNextForPersistence();
 
     const CheckpointConfig &getCheckpointConfig() const {
         return checkpointConfig;
@@ -496,7 +514,7 @@ public:
      */
     uint64_t createNewCheckpoint();
 
-    void resetTAPCursors(const std::list<std::string> &cursors);
+    void resetCursors(const std::list<std::string> &cursors);
 
     /**
      * Get id of the previous checkpoint that is followed by the checkpoint
@@ -514,21 +532,34 @@ public:
      * 1) Check if the checkpoint manager contains any checkpoints with IDs >= i1.
      * 2) If exists, collapse all checkpoints and set the open checkpoint id to a given ID.
      * 3) Otherwise, simply create a new open checkpoint with a given ID.
-     * This method is mainly for dealing with rollback events from a TAP producer.
+     * This method is mainly for dealing with rollback events from a producer.
      * @param id the id of a checkpoint to be created.
      * @param vbucket vbucket of the checkpoint.
      */
     void checkAndAddNewCheckpoint(uint64_t id, const RCPtr<VBucket> &vbucket);
 
-    /**
-     * Gets the mutation id for a given checkpoint item.
-     * @param The checkpoint to look for the key in
-     * @param The key to get the mutation id for
-     * @return The mutation id or 0 if not found
-     */
-    uint64_t getMutationIdForKey(uint64_t chk_id, std::string key);
+    bool closeOpenCheckpoint();
+
+    void setBackfillPhase(uint64_t start, uint64_t end);
+
+    void createSnapshot(uint64_t snapStartSeqno, uint64_t snapEndSeqno);
+
+    void resetSnapshotRange();
+
+    void updateCurrentSnapshotEnd(uint64_t snapEnd) {
+        LockHolder lh(queueLock);
+        checkpointList.back()->setSnapshotEndSeqno(snapEnd);
+    }
+
+    snapshot_info_t getSnapshotInfo();
 
     bool incrCursor(CheckpointCursor &cursor);
+
+    void notifyFlusher() {
+        if (flusherCB) {
+            flusherCB->callback(vbucketId);
+        }
+    }
 
     void setBySeqno(int64_t seqno) {
         LockHolder lh(queueLock);
@@ -550,15 +581,19 @@ public:
         return ++lastBySeqno;
     }
 
+    static const std::string pCursorName;
+
 private:
 
-    bool removeTAPCursor_UNLOCKED(const std::string &name);
+    bool removeCursor_UNLOCKED(const std::string &name);
 
-    bool registerTAPCursor_UNLOCKED(const std::string &name,
+    bool registerCursor_UNLOCKED(const std::string &name,
                                     uint64_t checkpointId = 1,
                                     bool alwaysFromBeginning = false);
 
-    void registerPersistenceCursor();
+    size_t getNumItemsForCursor_UNLOCKED(const std::string &name);
+
+    void clear_UNLOCKED(vbucket_state_t vbState, uint64_t seqno);
 
     /**
      * Create a new open checkpoint and add it to the checkpoint list.
@@ -567,13 +602,11 @@ private:
      */
     bool addNewCheckpoint_UNLOCKED(uint64_t id);
 
-    void removeInvalidCursorsOnCheckpoint(Checkpoint *pCheckpoint);
+    bool addNewCheckpoint_UNLOCKED(uint64_t id,
+                                   uint64_t snapStartSeqno,
+                                   uint64_t snapEndSeqno);
 
-    /**
-     * Create a new open checkpoint and add it to the checkpoint list.
-     * @param id the id of a checkpoint to be created.
-     */
-    bool addNewCheckpoint(uint64_t id);
+    void removeInvalidCursorsOnCheckpoint(Checkpoint *pCheckpoint);
 
     bool moveCursorToNextCheckpoint(CheckpointCursor &cursor);
 
@@ -593,12 +626,7 @@ private:
         return checkOpenCheckpoint_UNLOCKED(forceCreation, timeBound);
     }
 
-    bool closeOpenCheckpoint_UNLOCKED(uint64_t id);
-    bool closeOpenCheckpoint(uint64_t id);
-
-    void decrCursorOffset_UNLOCKED(CheckpointCursor &cursor, size_t decr);
-
-    void decrCursorPos_UNLOCKED(CheckpointCursor &cursor);
+    bool closeOpenCheckpoint_UNLOCKED();
 
     bool isLastMutationItemInCheckpoint(CheckpointCursor &cursor);
 
@@ -626,11 +654,12 @@ private:
     int64_t                  lastBySeqno;
     int64_t                  lastClosedChkBySeqno;
     std::list<Checkpoint*>   checkpointList;
-    CheckpointCursor         persistenceCursor;
     bool                     isCollapsedCheckpoint;
     uint64_t                 lastClosedCheckpointId;
     uint64_t                 pCursorPreCheckpointId;
     cursor_index             tapCursors;
+
+    shared_ptr<Callback<uint16_t> > flusherCB;
 };
 
 /**

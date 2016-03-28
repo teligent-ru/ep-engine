@@ -6,7 +6,14 @@ import math
 import itertools
 import mc_bin_client
 import re
-import json
+
+try:
+    import simplejson as json
+except ImportError:
+    try:
+        import json
+    except ImportError:
+        sys.exit("Error: could not import json module")
 
 MAGIC_CONVERT_RE=re.compile("(\d+)")
 

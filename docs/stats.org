@@ -16,8 +16,8 @@
 
 * Getting Started
 
-For introductory information on stats within membase, start with the
-[[http://wiki.membase.org/display/membase/Membase%2BStatistics][membase wiki stats page]].
+For introductory information on stats within Couchbase, start with the
+[[http://docs.couchbase.com/][Couchbase server documentations]].
 
 * Stats Definitions
 
@@ -159,10 +159,6 @@ For introductory information on stats within membase, start with the
 |                                    | exception happened during runtime      |
 | ep_tap_keepalive                   | Tap keepalive time                     |
 | ep_dbname                          | DB path                                |
-| ep_io_num_read                     | Number of io read operations           |
-| ep_io_num_write                    | Number of io write operations          |
-| ep_io_read_bytes                   | Number of bytes read (key + values)    |
-| ep_io_write_bytes                  | Number of bytes written (key + values) |
 | ep_pending_ops                     | Number of ops awaiting pending         |
 |                                    | vbuckets                               |
 | ep_pending_ops_total               | Total blocked pending ops since reset  |
@@ -171,7 +167,7 @@ For introductory information on stats within membase, start with the
 | ep_pending_ops_max_duration        | Max time (µs) used waiting on pending  |
 |                                    | vbuckets                               |
 | ep_bg_num_samples                  | The number of samples included in the  |
-|                                    | avgerage                               |
+|                                    | average                                |
 | ep_bg_min_wait                     | The shortest time (µs) in the wait     |
 |                                    | queue                                  |
 | ep_bg_max_wait                     | The longest time (µs) in the wait      |
@@ -203,6 +199,16 @@ For introductory information on stats within membase, start with the
 |                                    | it is made to back off.                |
 | ep_bg_fetch_delay                  | The amount of time to wait before      |
 |                                    | doing a background fetch               |
+| ep_bfilter_enabled                 | Bloom filter use: enabled or disabled  |
+| ep_bfilter_key_count               | Minimum key count that bloom filter    |
+|                                    | will accomodate                        |
+| ep_bfilter_fp_prob                 | Bloom filter's allowed false positive  |
+|                                    | probability                            |
+| ep_bfilter_residency_threshold     | Resident ratio threshold for full      |
+|                                    | eviction policy, after which bloom     |
+|                                    | switches modes from accounting just    |
+|                                    | non resident items and deletes to      |
+|                                    | accounting all items                   |
 | ep_chk_max_items                   | The number of items allowed in a       |
 |                                    | checkpoint before a new one is created |
 | ep_chk_period                      | The maximum lifetime of a checkpoint   |
@@ -309,6 +315,13 @@ For introductory information on stats within membase, start with the
 | ep_warmup_time                     | The amount of time warmup took         |
 | ep_workload_pattern                | Workload pattern (mixed, read_heavy,   |
 |                                    | write_heavy) monitored at runtime      |
+| ep_defragmenter_interval           | How often defragmenter task should be  |
+|                                    | run (in seconds).                      |
+| ep_defragmenter_num_moved          | Number of items moved by the           |
+|                                    | defragmentater task.                   |
+| ep_defragmenter_num_visited        | Number of items visited (considered    |
+|                                    | for defragmentation) by the            |
+|                                    | defragmenter task.                     |
 
 
 ** vBucket total stats
@@ -610,6 +623,7 @@ another colon.  For example, if your client is named, =slave1=, the
 | supports_ack       | True if the connection use flow control               |
 | total_acked_bytes  | The amount of bytes that the consumer has acked       |
 | type               | The connection type (producer, consumer, or notifier) |
+| max_buffer_bytes   | Size of flow control buffer                           |
 
 ****Per Stream Stats
 
@@ -618,6 +632,7 @@ another colon.  For example, if your client is named, =slave1=, the
 | end_seqno          | The seqno where this stream should end                |
 | flags              | The flags used to create this stream                  |
 | items_ready        | Whether the stream has messages ready to send         |
+| ready_queue_memory | Memory occupied by elements in the DCP readyQ         |
 | opaque             | The unique stream identifier                          |
 | snap_end_seqno     | The start seqno of the last snapshot received         |
 | snap_start_seqno   | The end seqno of the last snapshot received           |
@@ -627,47 +642,58 @@ another colon.  For example, if your client is named, =slave1=, the
 
 ***Producer/Notifier Connections
 
-| bytes_sent         | The amount of unacked bytes sent to the consumer       |
-| connected          | True if this client is connected                       |
-| created            | Creation time for the tap connection                   |
-| flow_control       | True if the connection use flow control                |
-| items_remaining    | The amount of items remaining to be sent               |
-| items_sent         | The amount of items already sent to the consumer       |
-| last_sent_time     | The last time this connection sent a message           |
-| max_buffer_bytes   | The maximum amount of bytes that can be sent without   |
-|                    | receiving an ack from the consumer                     |
-| noop_enabled       | Whether or not this connection sends noops             |
-| noop_wait          | Whether or not this connection is waiting for a        |
-|                    | noop response from the consumer                        |
-| pending_disconnect | True if we're hanging up on this client                |
-| reserved           | True if the dcp stream is reserved                     |
-| supports_ack       | True if the connection use flow control                |
-| total_acked_bytes  | The amount of bytes that have been acked by the        |
-|                    | consumer when flow control is enabled                  |
-| total_bytes_sent   | The amount of bytes already sent to the consumer       |
-| type               | The connection type (producer, consumer, or notifier)  |
-| unacked_bytes      | The amount of bytes the consumer has no acked          |
+| buf_backfill_bytes    | The amount of bytes backfilled but not sent            |
+| buf_backfill_items    | The amount of items backfilled but not sent            |
+| bytes_sent            | The amount of unacked bytes sent to the consumer       |
+| connected             | True if this client is connected                       |
+| created               | Creation time for the tap connection                   |
+| flow_control          | True if the connection use flow control                |
+| items_remaining       | The amount of items remaining to be sent               |
+| items_sent            | The amount of items already sent to the consumer       |
+| last_sent_time        | The last time this connection sent a message           |
+| max_buffer_bytes      | The maximum amount of bytes that can be sent without   |
+|                       | receiving an ack from the consumer                     |
+| noop_enabled          | Whether or not this connection sends noops             |
+| noop_wait             | Whether or not this connection is waiting for a        |
+|                       | noop response from the consumer                        |
+| pending_disconnect    | True if we're hanging up on this client                |
+| priority              | The connection priority for streaming data             |
+| reserved              | True if the dcp stream is reserved                     |
+| supports_ack          | True if the connection use flow control                |
+| total_acked_bytes     | The amount of bytes that have been acked by the        |
+|                       | consumer when flow control is enabled                  |
+| total_bytes_sent      | The amount of bytes already sent to the consumer       |
+| type                  | The connection type (producer, consumer, or notifier)  |
+| unacked_bytes         | The amount of bytes the consumer has no acked          |
+| backfill_num_active   | Number of active (running) backfills                   |
+| backfill_num_snoozing | Number of snoozing (running) backfills                 |
+| backfill_num_pending  | Number of pending (not running) backfills              |
 
 ****Per Stream Stats
 
-| backfilled         | The amount of items sent from disk                     |
-| end_seqno          | The seqno send mutations up to                         |
-| flags              | The flags supplied in the stream request               |
-| items_ready        | Whether the stream has items ready to send             |
-| last_sent_seqno    | The last seqno sent by this stream                     |
-| memory             | The amount of items sent from memory                   |
-| opaque             | The unique stream identifier                           |
-| snap_end_seqno     | The last snapshot end seqno (Used if a consumer is     |
-|                    | resuming a stream)                                     |
-| snap_start_seqno   | The last snapshot start seqno (Used if a consumer is   |
-|                    | resuming a stream)                                     |
-| start_seqno        | The seqno to start sending mutations from              |
-| state              | The stream state (pending, backfilling, in-memory,     |
-|                    | takeover-send, takeover-wait, or dead)                 |
-| vb_uuid            | The vb uuid used in the stream request                 |
-| cur_snapshot_type  | The type of the current snapshot being received        |
-| cur_snapshot_start | The start seqno of the current snapshot being received |
-| cur_snapshot_end   | The end seqno of the current snapshot being received   |
+| backfill_disk_items | The amount of items read during backfill from disk    |
+| backfill_mem_items  | The amount of items read during backfill from memory  |
+| backfill_sent       | The amount of items sent to the consumer during the   |
+| end_seqno           | The seqno send mutations up to                        |
+| flags               | The flags supplied in the stream request              |
+| items_ready         | Whether the stream has items ready to send            |
+| last_sent_seqno     | The last seqno sent by this stream                    |
+| last_read_seqno     | The last seqno read by this stream from disk or memory|
+| ready_queue_memory  | Memory occupied by elements in the DCP readyQ         |
+| memory_phase        | The amount of items sent during the memory phase      |
+| opaque              | The unique stream identifier                          |
+| snap_end_seqno      | The last snapshot end seqno (Used if a consumer is    |
+|                     | resuming a stream)                                    |
+| snap_start_seqno    | The last snapshot start seqno (Used if a consumer is  |
+|                     | resuming a stream)                                    |
+| start_seqno         | The seqno to start sending mutations from             |
+| state               | The stream state (pending, backfilling, in-memory,    |
+|                     | takeover-send, takeover-wait, or dead)                |
+| vb_uuid             | The vb uuid used in the stream request                |
+| cur_snapshot_type   | The type of the current snapshot being received       |
+| cur_snapshot_start  | The start seqno of the current snapshot being         |
+|                     | received                                              |
+| cur_snapshot_end    | The end seqno of the current snapshot being received  |
 
 ** Dcp Aggregated Stats
 
@@ -688,7 +714,11 @@ set for =replication=.
 |                             | prefix                                       |
 | [prefix]:total_bytes        | Total number of bytes sent with this prefix  |
 | [prefix]:total_backlog_size | Total backfill items remaining to be sent    |
-|                             | with this prefix
+|                             | with this prefix                             |
+| ep_dcp_num_running_backfills| Total number of running backfills across all |
+|                             | dcp connections                              |
+| ep_dcp_max_running_backfills| Max running backfills we can have across all |
+|                             | dcp connections                              |
 
 ** Timing Stats
 
@@ -1029,6 +1059,10 @@ The following stats are available for the CouchStore database engine:
 | failure_get       | Number of failed get operation                     |
 | failure_vbset     | Number of failed vbucket set operation             |
 | save_documents    | Time spent in CouchStore save documents operation  |
+| io_num_read       | Number of io read operations                       |
+| io_num_write      | Number of io write operations                      |
+| io_read_bytes     | Number of bytes read (key + values)                |
+| io_write_bytes    | Number of bytes written (key + values)             |
 
 ** KV Store Timing Stats
 

@@ -34,6 +34,21 @@ const std::string TaskQueue::getName() const {
     return (name+taskType2Str(queueType));
 }
 
+size_t TaskQueue::getReadyQueueSize() {
+    LockHolder lh(mutex);
+    return readyQueue.size();
+}
+
+size_t TaskQueue::getFutureQueueSize() {
+    LockHolder lh(mutex);
+    return futureQueue.size();
+}
+
+size_t TaskQueue::getPendingQueueSize() {
+    LockHolder lh(mutex);
+    return pendingQueue.size();
+}
+
 ExTask TaskQueue::_popReadyTask(void) {
     ExTask t = readyQueue.top();
     readyQueue.pop();
@@ -62,9 +77,11 @@ void TaskQueue::_doWake_UNLOCKED(size_t &numToWake) {
 bool TaskQueue::_doSleep(ExecutorThread &t) {
     gettimeofday(&t.now, NULL);
     if (less_tv(t.now, t.waketime) && manager->trySleep(queueType)) {
-        if (t.state == EXECUTOR_RUNNING) {
-            t.state = EXECUTOR_SLEEPING;
-        } else {
+        // Atomically switch from running to sleeping; iff we were previously
+        // running.
+        executor_state_t expected_state = EXECUTOR_RUNNING;
+        if (!t.state.compare_exchange_strong(expected_state,
+                                             EXECUTOR_SLEEPING)) {
             return false;
         }
         sleepers++;
@@ -80,9 +97,11 @@ bool TaskQueue::_doSleep(ExecutorThread &t) {
         sleepers--;
         manager->woke();
 
-        if (t.state == EXECUTOR_SLEEPING) {
-            t.state = EXECUTOR_RUNNING;
-        } else {
+        // Finished our sleep, atomically switch back to running iff we were
+        // previously sleeping.
+        expected_state = EXECUTOR_SLEEPING;
+        if (!t.state.compare_exchange_strong(expected_state,
+                                             EXECUTOR_RUNNING)) {
             return false;
         }
         gettimeofday(&t.now, NULL);

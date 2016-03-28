@@ -71,6 +71,10 @@ bool VBDeleteTask::run() {
     return !engine->getEpStore()->completeVBucketDeletion(vbucketId, cookie);
 }
 
+CompactVBucketTask::~CompactVBucketTask() {
+    delete compactCtx.bfcb;
+}
+
 bool CompactVBucketTask::run() {
     return engine->getEpStore()->compactVBucket(vbid, &compactCtx, cookie);
 }
@@ -88,6 +92,10 @@ bool BgFetcherTask::run() {
     return bgfetcher->run(this);
 }
 
+bool FlushAllTask::run() {
+    engine->getEpStore()->reset();
+    return false;
+}
 
 bool VKeyStatBGFetchTask::run() {
     engine->getEpStore()->completeStatsVKey(cookie, key, vbucket, bySeqNum);
@@ -96,7 +104,7 @@ bool VKeyStatBGFetchTask::run() {
 
 
 bool BGFetchTask::run() {
-    engine->getEpStore()->completeBGFetch(key, vbucket, seqNum, cookie, init,
+    engine->getEpStore()->completeBGFetch(key, vbucket, cookie, init,
                                           metaFetch);
     return false;
 }

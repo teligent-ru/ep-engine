@@ -79,12 +79,62 @@ DcpConsumer::DcpConsumer(EventuallyPersistentEngine &engine, const void *cookie,
     setReserved(true);
 
     flowControl.enabled = config.isDcpEnableFlowControl();
-    flowControl.bufferSize = config.getDcpConnBufferSize();
+
+    if (flowControl.enabled && config.isDcpEnableDynamicConnBufferSize()) {
+        double dcpConnBufferSizePerc = static_cast<double>
+                                       (config.getDcpConnBufferSizePerc())/100;
+        size_t bufferSize = dcpConnBufferSizePerc *
+                            engine.getEpStats().getMaxDataSize();
+
+        /* Make sure that the flow control buffer size is within a max and min
+           range */
+        if (bufferSize < config.getDcpConnBufferSize()) {
+            bufferSize = config.getDcpConnBufferSize();
+            LOG(EXTENSION_LOG_WARNING, "%s Conn flow control buffer is set to"
+                "minimum, as calculated sz is (%f) * (%zu)", logHeader(),
+                dcpConnBufferSizePerc, engine.getEpStats().getMaxDataSize());
+        } else if (bufferSize > config.getDcpConnBufferSizeMax()) {
+            bufferSize = config.getDcpConnBufferSizeMax();
+            LOG(EXTENSION_LOG_WARNING, "%s Conn flow control buffer is set to"
+                "maximum, as calculated sz is (%f) * (%zu)", logHeader(),
+                dcpConnBufferSizePerc, engine.getEpStats().getMaxDataSize());
+        }
+
+        /* If aggr memory used for flow control buffers across all consumers
+           exceeds the threshold, then we limit it to min size */
+        double dcpConnBufferSizeThreshold = static_cast<double>
+                            (config.getDcpConnBufferSizeAggrMemThreshold())/100;
+        if ((engine.getDcpConnMap().getAggrDcpConsumerBufferSize() + bufferSize)
+            > dcpConnBufferSizeThreshold * engine.getEpStats().getMaxDataSize())
+        {
+            /* Setting to default minimum size */
+            bufferSize = config.getDcpConnBufferSize();
+            LOG(EXTENSION_LOG_WARNING, "%s Conn flow control buffer is set to"
+                "minimum, as aggr memory used for flow control buffers across"
+                "all consumers is %zu and is above the threshold (%f) * (%zu)",
+                logHeader(),
+                engine.getDcpConnMap().getAggrDcpConsumerBufferSize(),
+                dcpConnBufferSizeThreshold,
+                engine.getEpStats().getMaxDataSize());
+        }
+        flowControl.bufferSize = bufferSize;
+    } else {
+        LOG(EXTENSION_LOG_WARNING, "%s Not using dynamic flow control",
+            logHeader());
+        flowControl.bufferSize = config.getDcpConnBufferSize();
+    }
+    engine.getDcpConnMap().incAggrDcpConsumerBufferSize(flowControl.bufferSize);
+    LOG(EXTENSION_LOG_WARNING, "%s Conn flow control buffer is %u", logHeader(),
+      flowControl.bufferSize);
+
     flowControl.maxUnackedBytes = config.getDcpMaxUnackedBytes();
 
     noopInterval = config.getDcpNoopInterval();
     enableNoop = config.isDcpEnableNoop();
     sendNoopInterval = config.isDcpEnableNoop();
+
+    setPriority = true;
+    enableExtMetaData = true;
 
     ExTask task = new Processer(&engine, this, Priority::PendingOpsPriority, 1);
     processTaskId = ExecutorPool::get()->schedule(task, NONIO_TASK_IDX);
@@ -93,6 +143,8 @@ DcpConsumer::DcpConsumer(EventuallyPersistentEngine &engine, const void *cookie,
 DcpConsumer::~DcpConsumer() {
     closeAllStreams();
     delete[] streams;
+    engine_.getDcpConnMap().decAggrDcpConsumerBufferSize
+                                (flowControl.bufferSize);
 }
 
 ENGINE_ERROR_CODE DcpConsumer::addStream(uint32_t opaque, uint16_t vbucket,
@@ -115,15 +167,18 @@ ENGINE_ERROR_CODE DcpConsumer::addStream(uint32_t opaque, uint16_t vbucket,
         return ENGINE_NOT_MY_VBUCKET;
     }
 
+    snapshot_info_t info = vb->checkpointManager.getSnapshotInfo();
+    if (info.range.end == info.start) {
+        info.range.start = info.start;
+    }
+
     uint32_t new_opaque = ++opaqueCounter;
     failover_entry_t entry = vb->failovers->getLatestEntry();
-    uint64_t start_seqno = vb->getHighSeqno();
+    uint64_t start_seqno = info.start;
     uint64_t end_seqno = std::numeric_limits<uint64_t>::max();
     uint64_t vbucket_uuid = entry.vb_uuid;
-    uint64_t snap_start_seqno;
-    uint64_t snap_end_seqno;
-
-    vb->getCurrentSnapshot(snap_start_seqno, snap_end_seqno);
+    uint64_t snap_start_seqno = info.range.start;
+    uint64_t snap_end_seqno = info.range.end;
 
     passive_stream_t stream = streams[vbucket];
     if (stream && stream->isActive()) {
@@ -211,12 +266,25 @@ ENGINE_ERROR_CODE DcpConsumer::mutation(uint32_t opaque, const void* key,
     ENGINE_ERROR_CODE err = ENGINE_KEY_ENOENT;
     passive_stream_t stream = streams[vbucket];
     if (stream && stream->getOpaque() == opaque && stream->isActive()) {
-        std::string key_str(static_cast<const char*>(key), nkey);
-        value_t vblob(Blob::New(static_cast<const char*>(value), nvalue,
-                      &(datatype), (uint8_t) EXT_META_LEN));
-        Item *item = new Item(key_str, flags, exptime, vblob, cas, bySeqno,
+        Item *item = new Item(key, nkey, flags, exptime, value, nvalue,
+                              &datatype, EXT_META_LEN, cas, bySeqno,
                               vbucket, revSeqno);
-        MutationResponse* response = new MutationResponse(item, opaque);
+
+        ExtendedMetaData *emd = NULL;
+        if (nmeta > 0) {
+            emd = new ExtendedMetaData(meta, nmeta);
+
+            if (emd == NULL) {
+                return ENGINE_ENOMEM;
+            }
+            if (emd->getStatus() == ENGINE_EINVAL) {
+                delete emd;
+                return ENGINE_EINVAL;
+            }
+        }
+
+        MutationResponse* response = new MutationResponse(item, opaque,
+                                                          emd);
         err = stream->messageReceived(response);
 
         bool disable = false;
@@ -250,7 +318,22 @@ ENGINE_ERROR_CODE DcpConsumer::deletion(uint32_t opaque, const void* key,
         Item* item = new Item(key, nkey, 0, 0, NULL, 0, NULL, 0, cas, bySeqno,
                               vbucket, revSeqno);
         item->setDeleted();
-        MutationResponse* response = new MutationResponse(item, opaque);
+
+        ExtendedMetaData *emd = NULL;
+        if (nmeta > 0) {
+            emd = new ExtendedMetaData(meta, nmeta);
+
+            if (emd == NULL) {
+                return ENGINE_ENOMEM;
+            }
+            if (emd->getStatus() == ENGINE_EINVAL) {
+                delete emd;
+                return ENGINE_EINVAL;
+            }
+        }
+
+        MutationResponse* response = new MutationResponse(item, opaque,
+                                                          emd);
         err = stream->messageReceived(response);
 
         bool disable = false;
@@ -364,6 +447,20 @@ ENGINE_ERROR_CODE DcpConsumer::step(struct dcp_message_producers* producers) {
     }
 
     if ((ret = handleNoop(producers)) != ENGINE_FAILED) {
+        if (ret == ENGINE_SUCCESS) {
+            ret = ENGINE_WANT_MORE;
+        }
+        return ret;
+    }
+
+    if ((ret = handlePriority(producers)) != ENGINE_FAILED) {
+        if (ret == ENGINE_SUCCESS) {
+            ret = ENGINE_WANT_MORE;
+        }
+        return ret;
+    }
+
+    if ((ret = handleExtMetaData(producers)) != ENGINE_FAILED) {
         if (ret == ENGINE_SUCCESS) {
             ret = ENGINE_WANT_MORE;
         }
@@ -537,6 +634,7 @@ void DcpConsumer::addStats(ADD_STAT add_stat, const void *c) {
     addStat("total_backoffs", backoffs, add_stat, c);
     if (flowControl.enabled) {
         addStat("total_acked_bytes", flowControl.ackedBytes, add_stat, c);
+        addStat("max_buffer_bytes", flowControl.bufferSize, add_stat, c);
     }
 }
 
@@ -704,7 +802,7 @@ ENGINE_ERROR_CODE DcpConsumer::handleNoop(struct dcp_message_producers* producer
 
     if ((ep_current_time() - lastNoopTime) > (noopInterval * 2)) {
         LOG(EXTENSION_LOG_WARNING, "%s Disconnecting because noop message has "
-            "no been received for %u seconds", logHeader(), (noopInterval * 2));
+            "not been received for %u seconds", logHeader(), (noopInterval * 2));
         return ENGINE_DISCONNECT;
     }
 
@@ -752,4 +850,42 @@ ENGINE_ERROR_CODE DcpConsumer::handleFlowCtl(struct dcp_message_producers* produ
         }
     }
     return ENGINE_FAILED;
+}
+
+ENGINE_ERROR_CODE DcpConsumer::handlePriority(struct dcp_message_producers* producers) {
+    if (setPriority) {
+        ENGINE_ERROR_CODE ret;
+        uint32_t opaque = ++opaqueCounter;
+        EventuallyPersistentEngine *epe = ObjectRegistry::onSwitchThread(NULL, true);
+        ret = producers->control(getCookie(), opaque, "set_priority", 12,
+                                 "high", 4);
+        ObjectRegistry::onSwitchThread(epe);
+        setPriority = false;
+        return ret;
+    }
+
+    return ENGINE_FAILED;
+}
+
+ENGINE_ERROR_CODE DcpConsumer::handleExtMetaData(struct dcp_message_producers* producers) {
+    if (enableExtMetaData) {
+        ENGINE_ERROR_CODE ret;
+        uint32_t opaque = ++opaqueCounter;
+        EventuallyPersistentEngine *epe = ObjectRegistry::onSwitchThread(NULL, true);
+        ret = producers->control(getCookie(), opaque, "enable_ext_metadata", 19,
+                                 "true", 4);
+        ObjectRegistry::onSwitchThread(epe);
+        enableExtMetaData = false;
+        return ret;
+    }
+
+    return ENGINE_FAILED;
+}
+
+bool DcpConsumer::isStreamPresent(uint16_t vbucket)
+{
+    if (streams[vbucket] && streams[vbucket]->isActive()) {
+        return true;
+    }
+    return false;
 }

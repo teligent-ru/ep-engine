@@ -74,6 +74,8 @@ public:
     Flusher *getFlusher();
     BgFetcher *getBgFetcher();
 
+    void notifyFlusher();
+
     RCPtr<VBucket> getBucket(uint16_t id) const;
     void setBucket(const RCPtr<VBucket> &b);
     void resetBucket(uint16_t id);
@@ -132,15 +134,6 @@ public:
     bool setLowPriorityVbSnapshotFlag(bool lowPrioritySnapshot);
     bool getLowPriorityVbSnapshotFlag(void) {
         return lowPrioritySnapshot;
-    }
-
-    /**
-     * Return the number of non-deleted items from a given vbucket database
-     * @param vbid vbucket from which the number of items is retrived
-     * @return the number of non-deleted items from a given vbucket database
-     */
-    size_t getNumItemsOnDisk(uint16_t vbid) {
-        return rwUnderlying->getNumItems(vbid);
     }
 
 private:

@@ -21,12 +21,12 @@
 #include "failover-table.h"
 #include "kvstore.h"
 #include "statwriter.h"
-#include "dcp-stream.h"
+#include "dcp-backfill-manager.h"
+#include "dcp-backfill.h"
 #include "dcp-consumer.h"
 #include "dcp-producer.h"
 #include "dcp-response.h"
-
-#define DCP_BACKFILL_SLEEP_TIME 2
+#include "dcp-stream.h"
 
 static const char* snapshotTypeToString(snapshot_type_t type) {
     static const char * const snapshotTypes[] = { "none", "disk", "memory" };
@@ -37,151 +37,6 @@ static const char* snapshotTypeToString(snapshot_type_t type) {
 const uint64_t Stream::dcpMaxSeqno = std::numeric_limits<uint64_t>::max();
 const size_t PassiveStream::batchSize = 10;
 
-class SnapshotMarkerCallback : public Callback<SeqnoRange> {
-public:
-    SnapshotMarkerCallback(stream_t s)
-        : stream(s) {
-        cb_assert(s->getType() == STREAM_ACTIVE);
-    }
-
-    void callback(SeqnoRange &range) {
-        uint64_t st = range.getStartSeqno();
-        uint64_t en = range.getEndSeqno();
-        static_cast<ActiveStream*>(stream.get())->markDiskSnapshot(st, en);
-    }
-
-private:
-    stream_t stream;
-};
-
-class CacheCallback : public Callback<CacheLookup> {
-public:
-    CacheCallback(EventuallyPersistentEngine* e, stream_t &s)
-        : engine_(e), stream_(s) {
-        Stream *str = stream_.get();
-        if (str) {
-            cb_assert(str->getType() == STREAM_ACTIVE);
-        }
-    }
-
-    void callback(CacheLookup &lookup);
-
-private:
-    EventuallyPersistentEngine* engine_;
-    stream_t stream_;
-};
-
-void CacheCallback::callback(CacheLookup &lookup) {
-    RCPtr<VBucket> vb = engine_->getEpStore()->getVBucket(lookup.getVBucketId());
-    if (!vb) {
-        setStatus(ENGINE_SUCCESS);
-        return;
-    }
-
-    int bucket_num(0);
-    LockHolder lh = vb->ht.getLockedBucket(lookup.getKey(), &bucket_num);
-    StoredValue *v = vb->ht.unlocked_find(lookup.getKey(), bucket_num, false, false);
-    if (v && v->isResident() && v->getBySeqno() == lookup.getBySeqno()) {
-        Item* it = v->toItem(false, lookup.getVBucketId());
-        lh.unlock();
-        static_cast<ActiveStream*>(stream_.get())->backfillReceived(it);
-        setStatus(ENGINE_KEY_EEXISTS);
-    } else {
-        setStatus(ENGINE_SUCCESS);
-    }
-}
-
-class DiskCallback : public Callback<GetValue> {
-public:
-    DiskCallback(stream_t &s)
-        : stream_(s) {
-        Stream *str = stream_.get();
-        if (str) {
-            cb_assert(str->getType() == STREAM_ACTIVE);
-        }
-    }
-
-    void callback(GetValue &val) {
-        cb_assert(val.getValue());
-        ActiveStream* active_stream = static_cast<ActiveStream*>(stream_.get());
-        active_stream->backfillReceived(val.getValue());
-    }
-
-private:
-    stream_t stream_;
-};
-
-class DCPBackfill : public GlobalTask {
-public:
-    DCPBackfill(EventuallyPersistentEngine* e, stream_t s,
-                uint64_t start_seqno, uint64_t end_seqno, const Priority &p,
-                double sleeptime = 0, bool shutdown = false)
-        : GlobalTask(e, p, sleeptime, shutdown), engine(e), stream(s),
-          startSeqno(start_seqno), endSeqno(end_seqno) {
-        cb_assert(stream->getType() == STREAM_ACTIVE);
-    }
-
-    bool run();
-
-    std::string getDescription();
-
-private:
-    EventuallyPersistentEngine *engine;
-    stream_t                    stream;
-    uint64_t                    startSeqno;
-    uint64_t                    endSeqno;
-};
-
-bool DCPBackfill::run() {
-    uint16_t vbid = stream->getVBucket();
-
-    if (engine->getEpStore()->isMemoryUsageTooHigh()) {
-        LOG(EXTENSION_LOG_INFO, "VBucket %d dcp backfill task temporarily "
-                "suspended  because the current memory usage is too high",
-                vbid);
-        snooze(DCP_BACKFILL_SLEEP_TIME);
-        return true;
-    }
-
-    uint64_t lastPersistedSeqno =
-        engine->getEpStore()->getLastPersistedSeqno(vbid);
-    uint64_t diskSeqno =
-        engine->getEpStore()->getRWUnderlying(vbid)->getLastPersistedSeqno(vbid);
-
-    if (lastPersistedSeqno < endSeqno) {
-        LOG(EXTENSION_LOG_WARNING, "Rescheduling backfill for vbucket %d "
-            "because backfill up to seqno %llu is needed but only up to "
-            "%llu is persisted (disk %llu)", vbid, endSeqno,
-            lastPersistedSeqno, diskSeqno);
-        snooze(DCP_BACKFILL_SLEEP_TIME);
-        return true;
-    }
-
-    KVStore* kvstore = engine->getEpStore()->getROUnderlying(vbid);
-    size_t numItems = kvstore->getNumItems(vbid, startSeqno,
-                                           std::numeric_limits<uint64_t>::max());
-    static_cast<ActiveStream*>(stream.get())->incrBackfillRemaining(numItems);
-
-    shared_ptr<Callback<GetValue> > cb(new DiskCallback(stream));
-    shared_ptr<Callback<CacheLookup> > cl(new CacheCallback(engine, stream));
-    shared_ptr<Callback<SeqnoRange> > sr(new SnapshotMarkerCallback(stream));
-    kvstore->dump(vbid, startSeqno, cb, cl, sr);
-
-    static_cast<ActiveStream*>(stream.get())->completeBackfill();
-
-    LOG(EXTENSION_LOG_WARNING, "Backfill task (%llu to %llu) finished for vb %d"
-        " disk seqno %llu memory seqno %llu", startSeqno, endSeqno,
-        stream->getVBucket(), diskSeqno, lastPersistedSeqno);
-
-    return false;
-}
-
-std::string DCPBackfill::getDescription() {
-    std::stringstream ss;
-    ss << "DCP backfill for vbucket " << stream->getVBucket();
-    return ss.str();
-}
-
 Stream::Stream(const std::string &name, uint32_t flags, uint32_t opaque,
                uint16_t vb, uint64_t start_seqno, uint64_t end_seqno,
                uint64_t vb_uuid, uint64_t snap_start_seqno,
@@ -190,15 +45,45 @@ Stream::Stream(const std::string &name, uint32_t flags, uint32_t opaque,
       start_seqno_(start_seqno), end_seqno_(end_seqno), vb_uuid_(vb_uuid),
       snap_start_seqno_(snap_start_seqno),
       snap_end_seqno_(snap_end_seqno),
-      state_(STREAM_PENDING), itemsReady(false) {
+      state_(STREAM_PENDING), itemsReady(false), readyQueueMemory(0) {
 }
 
 void Stream::clear_UNLOCKED() {
     while (!readyQ.empty()) {
         DcpResponse* resp = readyQ.front();
+        popFromReadyQ();
         delete resp;
-        readyQ.pop();
     }
+}
+
+void Stream::pushToReadyQ(DcpResponse* resp)
+{
+    if (resp) {
+        readyQ.push(resp);
+        readyQueueMemory += resp->getMessageSize();
+    }
+}
+
+void Stream::popFromReadyQ(void)
+{
+    if (!readyQ.empty()) {
+        uint32_t respSize = readyQ.front()->getMessageSize();
+        readyQ.pop();
+        /* Decrement the readyQ size */
+        if ((readyQueueMemory - respSize) <= readyQueueMemory) {
+            readyQueueMemory -= respSize;
+        } else {
+            LOG(EXTENSION_LOG_DEBUG, "readyQ size for stream %s (vb %d)"
+                "underflow, likely wrong stat calculation! curr size: %llu;"
+                "new size: %d", name_.c_str(), getVBucket(), readyQueueMemory,
+                respSize);
+            readyQueueMemory = 0;
+        }
+    }
+}
+
+uint64_t Stream::getReadyQueueMemory() {
+    return readyQueueMemory;
 }
 
 const char * Stream::stateName(stream_state_t st) const {
@@ -211,7 +96,7 @@ const char * Stream::stateName(stream_state_t st) const {
 }
 
 void Stream::addStats(ADD_STAT add_stat, const void *c) {
-    const int bsize = 128;
+    const int bsize = 1024;
     char buffer[bsize];
     snprintf(buffer, bsize, "%s:stream_%d_flags", name_.c_str(), vb_);
     add_casted_stat(buffer, flags_, add_stat, c);
@@ -240,9 +125,8 @@ ActiveStream::ActiveStream(EventuallyPersistentEngine* e, DcpProducer* p,
               snap_start_seqno, snap_end_seqno),
        lastReadSeqno(st_seqno), lastSentSeqno(st_seqno), curChkSeqno(st_seqno),
        takeoverState(vbucket_state_pending), backfillRemaining(0),
-       itemsFromBackfill(0), itemsFromMemory(0), firstMarkerSent(false),
-       waitForSnapshot(0), engine(e), producer(p),
-       isBackfillTaskRunning(false) {
+       itemsFromMemoryPhase(0), firstMarkerSent(false), waitForSnapshot(0),
+       engine(e), producer(p), isBackfillTaskRunning(false) {
 
     const char* type = "";
     if (flags_ & DCP_ADD_STREAM_FLAG_TAKEOVER) {
@@ -255,11 +139,27 @@ ActiveStream::ActiveStream(EventuallyPersistentEngine* e, DcpProducer* p,
         itemsReady = true;
     }
 
+    backfillItems.memory = 0;
+    backfillItems.disk = 0;
+    backfillItems.sent = 0;
+
     type_ = STREAM_ACTIVE;
+
+    bufferedBackfill.bytes = 0;
+    bufferedBackfill.items = 0;
 
     LOG(EXTENSION_LOG_WARNING, "%s (vb %d) %sstream created with start seqno "
         "%llu and end seqno %llu", producer->logHeader(), vb, type, st_seqno,
         en_seqno);
+}
+
+ActiveStream::~ActiveStream() {
+    LockHolder lh(streamMutex);
+    transitionState(STREAM_DEAD);
+    clear_UNLOCKED();
+    producer->getBackfillManager()->bytesSent(bufferedBackfill.bytes);
+    bufferedBackfill.bytes = 0;
+    bufferedBackfill.items = 0;
 }
 
 DcpResponse* ActiveStream::next() {
@@ -268,6 +168,7 @@ DcpResponse* ActiveStream::next() {
     stream_state_t initState = state_;
 
     DcpResponse* response = NULL;
+
     switch (state_) {
         case STREAM_PENDING:
             break;
@@ -313,7 +214,7 @@ void ActiveStream::markDiskSnapshot(uint64_t startSeqno, uint64_t endSeqno) {
     LOG(EXTENSION_LOG_WARNING, "%s (vb %d) Sending disk snapshot with start "
         "seqno %llu and end seqno %llu", producer->logHeader(), vb_, startSeqno,
         endSeqno);
-    readyQ.push(new SnapshotMarker(opaque_, vb_, startSeqno, endSeqno,
+    pushToReadyQ(new SnapshotMarker(opaque_, vb_, startSeqno, endSeqno,
                                    MARKER_FLAG_DISK));
     RCPtr<VBucket> vb = engine->getVBucket(vb_);
     if (!vb) {
@@ -324,7 +225,7 @@ void ActiveStream::markDiskSnapshot(uint64_t startSeqno, uint64_t endSeqno) {
         }
         // Only re-register the cursor if we still need to get memory snapshots
         CursorRegResult result =
-            vb->checkpointManager.registerTAPCursorBySeqno(name_, endSeqno);
+            vb->checkpointManager.registerCursorBySeqno(name_, endSeqno);
         curChkSeqno = result.first;
     }
 
@@ -335,10 +236,20 @@ void ActiveStream::markDiskSnapshot(uint64_t startSeqno, uint64_t endSeqno) {
     }
 }
 
-void ActiveStream::backfillReceived(Item* itm) {
+bool ActiveStream::backfillReceived(Item* itm, backfill_source_t backfill_source) {
     LockHolder lh(streamMutex);
     if (state_ == STREAM_BACKFILLING) {
-        readyQ.push(new MutationResponse(itm, opaque_));
+        if (!producer->getBackfillManager()->bytesRead(itm->size())) {
+            delete itm;
+            return false;
+        }
+
+        bufferedBackfill.bytes.fetch_add(itm->size());
+        bufferedBackfill.items++;
+
+        pushToReadyQ(new MutationResponse(itm, opaque_,
+                          prepareExtendedMetaData(itm->getVBucketId(),
+                                                  itm->getConflictResMode())));
         lastReadSeqno = itm->getBySeqno();
 
         if (!itemsReady) {
@@ -346,9 +257,17 @@ void ActiveStream::backfillReceived(Item* itm) {
             lh.unlock();
             producer->notifyStreamReady(vb_, false);
         }
+
+        if (backfill_source == BACKFILL_FROM_MEMORY) {
+            backfillItems.memory++;
+        } else {
+            backfillItems.disk++;
+        }
     } else {
         delete itm;
     }
+
+    return true;
 }
 
 void ActiveStream::completeBackfill() {
@@ -357,8 +276,9 @@ void ActiveStream::completeBackfill() {
     if (state_ == STREAM_BACKFILLING) {
         isBackfillTaskRunning = false;
         LOG(EXTENSION_LOG_WARNING, "%s (vb %d) Backfill complete, %d items read"
-            " from disk, last seqno read: %ld", producer->logHeader(), vb_,
-            itemsFromBackfill, lastReadSeqno);
+            " from disk %d from memory, last seqno read: %ld",
+            producer->logHeader(), vb_, backfillItems.disk.load(),
+            backfillItems.memory.load(), lastReadSeqno);
 
         if (!itemsReady) {
             itemsReady = true;
@@ -411,11 +331,16 @@ void ActiveStream::setVBucketStateAckRecieved() {
 DcpResponse* ActiveStream::backfillPhase() {
     DcpResponse* resp = nextQueuedItem();
 
-    if (resp && backfillRemaining > 0 &&
-        (resp->getEvent() == DCP_MUTATION ||
+    if (resp && (resp->getEvent() == DCP_MUTATION ||
          resp->getEvent() == DCP_DELETION ||
          resp->getEvent() == DCP_EXPIRATION)) {
-        backfillRemaining--;
+        MutationResponse* m = static_cast<MutationResponse*>(resp);
+        producer->getBackfillManager()->bytesSent(m->getItem()->size());
+        bufferedBackfill.bytes.fetch_sub(m->getItem()->size());
+        bufferedBackfill.items--;
+        if (backfillRemaining > 0) {
+            backfillRemaining--;
+        }
     }
 
     if (!isBackfillTaskRunning && readyQ.empty()) {
@@ -482,16 +407,30 @@ DcpResponse* ActiveStream::deadPhase() {
 void ActiveStream::addStats(ADD_STAT add_stat, const void *c) {
     Stream::addStats(add_stat, c);
 
-    const int bsize = 128;
+    const int bsize = 1024;
     char buffer[bsize];
-    snprintf(buffer, bsize, "%s:stream_%d_backfilled", name_.c_str(), vb_);
-    add_casted_stat(buffer, itemsFromBackfill, add_stat, c);
-    snprintf(buffer, bsize, "%s:stream_%d_memory", name_.c_str(), vb_);
-    add_casted_stat(buffer, itemsFromMemory, add_stat, c);
+    snprintf(buffer, bsize, "%s:stream_%d_backfill_disk_items",
+             name_.c_str(), vb_);
+    add_casted_stat(buffer, backfillItems.disk, add_stat, c);
+    snprintf(buffer, bsize, "%s:stream_%d_backfill_mem_items",
+             name_.c_str(), vb_);
+    add_casted_stat(buffer, backfillItems.memory, add_stat, c);
+    snprintf(buffer, bsize, "%s:stream_%d_backfill_sent", name_.c_str(), vb_);
+    add_casted_stat(buffer, backfillItems.sent, add_stat, c);
+    snprintf(buffer, bsize, "%s:stream_%d_memory_phase", name_.c_str(), vb_);
+    add_casted_stat(buffer, itemsFromMemoryPhase, add_stat, c);
     snprintf(buffer, bsize, "%s:stream_%d_last_sent_seqno", name_.c_str(), vb_);
     add_casted_stat(buffer, lastSentSeqno, add_stat, c);
+    snprintf(buffer, bsize, "%s:stream_%d_last_read_seqno", name_.c_str(), vb_);
+    add_casted_stat(buffer, lastReadSeqno, add_stat, c);
+    snprintf(buffer, bsize, "%s:stream_%d_ready_queue_memory", name_.c_str(), vb_);
+    add_casted_stat(buffer, getReadyQueueMemory(), add_stat, c);
     snprintf(buffer, bsize, "%s:stream_%d_items_ready", name_.c_str(), vb_);
     add_casted_stat(buffer, itemsReady ? "true" : "false", add_stat, c);
+    snprintf(buffer, bsize, "%s:stream_%d_backfill_buffer_bytes", name_.c_str(), vb_);
+    add_casted_stat(buffer, bufferedBackfill.bytes, add_stat, c);
+    snprintf(buffer, bsize, "%s:stream_%d_backfill_buffer_items", name_.c_str(), vb_);
+    add_casted_stat(buffer, bufferedBackfill.items, add_stat, c);
 }
 
 void ActiveStream::addTakeoverStats(ADD_STAT add_stat, const void *cookie) {
@@ -518,7 +457,7 @@ void ActiveStream::addTakeoverStats(ADD_STAT add_stat, const void *cookie) {
     item_eviction_policy_t iep = engine->getEpStore()->getItemEvictionPolicy();
     size_t vb_items = vb->getNumItems(iep);
     size_t chk_items = vb_items > 0 ?
-                vb->checkpointManager.getNumItemsForTAPConnection(name_) : 0;
+                vb->checkpointManager.getNumItemsForCursor(name_) : 0;
     size_t del_items = engine->getEpStore()->getRWUnderlying(vb_)->
                                                     getNumPersistedDeletes(vb_);
 
@@ -544,12 +483,12 @@ DcpResponse* ActiveStream::nextQueuedItem() {
             lastSentSeqno = dynamic_cast<MutationResponse*>(response)->getBySeqno();
 
             if (state_ == STREAM_BACKFILLING) {
-                itemsFromBackfill++;
+                backfillItems.sent++;
             } else {
-                itemsFromMemory++;
+                itemsFromMemoryPhase++;
             }
         }
-        readyQ.pop();
+        popFromReadyQ();
         return response;
     }
     return NULL;
@@ -557,9 +496,16 @@ DcpResponse* ActiveStream::nextQueuedItem() {
 
 void ActiveStream::nextCheckpointItem() {
     RCPtr<VBucket> vbucket = engine->getVBucket(vb_);
+    if (!vbucket) {
+        /* The entity deleting the vbucket must set stream to dead,
+           calling setDead(END_STREAM_STATE) will cause deadlock because
+           it will try to grab streamMutex which is already acquired at this
+           point here */
+        return;
+    }
 
     bool mark = false;
-    std::list<queued_item> items;
+    std::vector<queued_item> items;
     std::list<MutationResponse*> mutations;
     vbucket->checkpointManager.getAllItemsForCursor(name_, items);
     if (vbucket->checkpointManager.getNumCheckpoints() > 1) {
@@ -574,18 +520,20 @@ void ActiveStream::nextCheckpointItem() {
         mark = true;
     }
 
-    while (!items.empty()) {
-        queued_item qi = items.front();
-        items.pop_front();
+    std::vector<queued_item>::iterator itr = items.begin();
+    for (; itr != items.end(); ++itr) {
+        queued_item& qi = *itr;
 
         if (qi->getOperation() == queue_op_set ||
             qi->getOperation() == queue_op_del) {
             curChkSeqno = qi->getBySeqno();
             lastReadSeqno = qi->getBySeqno();
 
-            mutations.push_back(new MutationResponse(qi, opaque_));
+            mutations.push_back(new MutationResponse(qi, opaque_,
+                           prepareExtendedMetaData(qi->getVBucketId(),
+                                                   qi->getConflictResMode())));
         } else if (qi->getOperation() == queue_op_checkpoint_start) {
-            snapshot(mutations, mark);
+            cb_assert(mutations.empty());
             mark = true;
         }
     }
@@ -622,9 +570,9 @@ void ActiveStream::snapshot(std::list<MutationResponse*>& items, bool mark) {
         firstMarkerSent = true;
     }
 
-    readyQ.push(new SnapshotMarker(opaque_, vb_, snapStart, snapEnd, flags));
+    pushToReadyQ(new SnapshotMarker(opaque_, vb_, snapStart, snapEnd, flags));
     while(!items.empty()) {
-        readyQ.push(items.front());
+        pushToReadyQ(items.front());
         items.pop_front();
     }
 }
@@ -654,14 +602,25 @@ void ActiveStream::notifySeqnoAvailable(uint64_t seqno) {
 
 void ActiveStream::endStream(end_stream_status_t reason) {
     if (state_ != STREAM_DEAD) {
+        if (state_ == STREAM_BACKFILLING) {
+            // If Stream were in Backfilling state, clear out the
+            // backfilled items to clear up the backfill buffer.
+            clear_UNLOCKED();
+            producer->getBackfillManager()->bytesSent(bufferedBackfill.bytes);
+            bufferedBackfill.bytes = 0;
+            bufferedBackfill.items = 0;
+        }
         if (reason != END_STREAM_DISCONNECTED) {
-            readyQ.push(new StreamEndResponse(opaque_, reason, vb_));
+            pushToReadyQ(new StreamEndResponse(opaque_, reason, vb_));
         }
         transitionState(STREAM_DEAD);
-        LOG(EXTENSION_LOG_WARNING, "%s (vb %d) Stream closing, %llu items sent"
-            " from disk, %llu items sent from memory, %llu was last seqno sent",
-            producer->logHeader(), vb_, itemsFromBackfill, itemsFromMemory,
-            lastSentSeqno);
+        LOG(EXTENSION_LOG_WARNING, "%s (vb %" PRId16 ") Stream closing, "
+            "%" PRIu64 " items sent from backfill phase, %" PRIu64 " items "
+            "sent from memory phase, %" PRIu64 " was last seqno sent, "
+            "reason: %s", producer->logHeader(), vb_,
+            uint64_t(backfillItems.sent.load()),
+            uint64_t(itemsFromMemoryPhase), lastSentSeqno,
+            getEndStreamStatusStr(reason));
     }
 }
 
@@ -673,8 +632,8 @@ void ActiveStream::scheduleBackfill() {
         }
 
         CursorRegResult result =
-            vbucket->checkpointManager.registerTAPCursorBySeqno(name_,
-                                                                lastReadSeqno);
+            vbucket->checkpointManager.registerCursorBySeqno(name_,
+                                                             lastReadSeqno);
         curChkSeqno = result.first;
         bool isFirstItem = result.second;
 
@@ -702,9 +661,8 @@ void ActiveStream::scheduleBackfill() {
         bool tryBackfill = isFirstItem || flags_ & DCP_ADD_STREAM_FLAG_DISKONLY;
 
         if (backfillStart <= backfillEnd && tryBackfill) {
-            ExTask task = new DCPBackfill(engine, this, backfillStart, backfillEnd,
-                                          Priority::TapBgFetcherPriority, 0, false);
-            ExecutorPool::get()->schedule(task, AUXIO_TASK_IDX);
+            BackfillManager* backfillMgr = producer->getBackfillManager();
+            backfillMgr->schedule(this, backfillStart, backfillEnd);
             isBackfillTaskRunning = true;
         } else {
             if (flags_ & DCP_ADD_STREAM_FLAG_DISKONLY) {
@@ -717,6 +675,27 @@ void ActiveStream::scheduleBackfill() {
             itemsReady = true;
         }
     }
+}
+
+const char* ActiveStream::getEndStreamStatusStr(end_stream_status_t status)
+{
+    switch (status) {
+    case END_STREAM_OK:
+        return "The stream ended due to all items being streamed";
+        break;
+    case END_STREAM_CLOSED:
+        return "The stream closed early due to a close stream message";
+        break;
+    case END_STREAM_STATE:
+        return "The stream closed early because the vbucket state changed";
+        break;
+    case END_STREAM_DISCONNECTED:
+        return "The stream closed early because the conn was disconnected";
+        break;
+    default:
+        break;
+    }
+    return "Status unknown; this should not happen";
 }
 
 void ActiveStream::transitionState(stream_state_t newState) {
@@ -761,7 +740,7 @@ void ActiveStream::transitionState(stream_state_t newState) {
     } else if (newState == STREAM_DEAD) {
         RCPtr<VBucket> vb = engine->getVBucket(vb_);
         if (vb) {
-            vb->checkpointManager.removeTAPCursor(name_);
+            vb->checkpointManager.removeCursor(name_);
         }
     }
 }
@@ -788,6 +767,27 @@ size_t ActiveStream::getItemsRemaining() {
     return 0;
 }
 
+ExtendedMetaData* ActiveStream::prepareExtendedMetaData(uint16_t vBucketId,
+                                                        uint8_t conflictResMode)
+{
+    ExtendedMetaData *emd = NULL;
+    if (producer->isExtMetaDataEnabled()) {
+        RCPtr<VBucket> vb = engine->getVBucket(vBucketId);
+        if (vb && vb->isTimeSyncEnabled()) {
+            int64_t adjustedTime = gethrtime() + vb->getDriftCounter();
+            emd = new ExtendedMetaData(adjustedTime, conflictResMode);
+        } else {
+            emd = new ExtendedMetaData(conflictResMode);
+        }
+    }
+    return emd;
+}
+
+const char* ActiveStream::logHeader()
+{
+    return producer->logHeader();
+}
+
 NotifierStream::NotifierStream(EventuallyPersistentEngine* e, DcpProducer* p,
                                const std::string &name, uint32_t flags,
                                uint32_t opaque, uint16_t vb, uint64_t st_seqno,
@@ -800,7 +800,7 @@ NotifierStream::NotifierStream(EventuallyPersistentEngine* e, DcpProducer* p,
     LockHolder lh(streamMutex);
     RCPtr<VBucket> vbucket = e->getVBucket(vb_);
     if (vbucket && static_cast<uint64_t>(vbucket->getHighSeqno()) > st_seqno) {
-        readyQ.push(new StreamEndResponse(opaque_, END_STREAM_OK, vb_));
+        pushToReadyQ(new StreamEndResponse(opaque_, END_STREAM_OK, vb_));
         transitionState(STREAM_DEAD);
         itemsReady = true;
     }
@@ -817,7 +817,7 @@ uint32_t NotifierStream::setDead(end_stream_status_t status) {
     if (state_ != STREAM_DEAD) {
         transitionState(STREAM_DEAD);
         if (status != END_STREAM_DISCONNECTED) {
-            readyQ.push(new StreamEndResponse(opaque_, status, vb_));
+            pushToReadyQ(new StreamEndResponse(opaque_, status, vb_));
             if (!itemsReady) {
                 itemsReady = true;
                 lh.unlock();
@@ -831,7 +831,7 @@ uint32_t NotifierStream::setDead(end_stream_status_t status) {
 void NotifierStream::notifySeqnoAvailable(uint64_t seqno) {
     LockHolder lh(streamMutex);
     if (state_ != STREAM_DEAD && start_seqno_ < seqno) {
-        readyQ.push(new StreamEndResponse(opaque_, END_STREAM_OK, vb_));
+        pushToReadyQ(new StreamEndResponse(opaque_, END_STREAM_OK, vb_));
         transitionState(STREAM_DEAD);
         if (!itemsReady) {
             itemsReady = true;
@@ -850,7 +850,7 @@ DcpResponse* NotifierStream::next() {
     }
 
     DcpResponse* response = readyQ.front();
-    readyQ.pop();
+    popFromReadyQ();
 
     return response;
 }
@@ -885,10 +885,9 @@ PassiveStream::PassiveStream(EventuallyPersistentEngine* e, DcpConsumer* c,
     : Stream(name, flags, opaque, vb, st_seqno, en_seqno, vb_uuid,
              snap_start_seqno, snap_end_seqno),
       engine(e), consumer(c), last_seqno(st_seqno), cur_snapshot_start(0),
-      cur_snapshot_end(0), cur_snapshot_type(none), cur_snapshot_ack(false),
-      saveSnapshot(false) {
+      cur_snapshot_end(0), cur_snapshot_type(none), cur_snapshot_ack(false) {
     LockHolder lh(streamMutex);
-    readyQ.push(new StreamRequest(vb, opaque, flags, st_seqno, en_seqno,
+    pushToReadyQ(new StreamRequest(vb, opaque, flags, st_seqno, en_seqno,
                                   vb_uuid, snap_start_seqno, snap_end_seqno));
     itemsReady = true;
     type_ = STREAM_PASSIVE;
@@ -923,7 +922,7 @@ void PassiveStream::acceptStream(uint16_t status, uint32_t add_opaque) {
         } else {
             transitionState(STREAM_DEAD);
         }
-        readyQ.push(new AddStreamResponse(add_opaque, opaque_, status));
+        pushToReadyQ(new AddStreamResponse(add_opaque, opaque_, status));
         if (!itemsReady) {
             itemsReady = true;
             lh.unlock();
@@ -936,7 +935,15 @@ void PassiveStream::reconnectStream(RCPtr<VBucket> &vb,
                                     uint32_t new_opaque,
                                     uint64_t start_seqno) {
     vb_uuid_ = vb->failovers->getLatestEntry().vb_uuid;
-    vb->getCurrentSnapshot(snap_start_seqno_, snap_end_seqno_);
+
+    snapshot_info_t info = vb->checkpointManager.getSnapshotInfo();
+    if (info.range.end == info.start) {
+        info.range.start = info.start;
+    }
+
+    snap_start_seqno_ = info.range.start;
+    start_seqno_ = info.start;
+    snap_end_seqno_ = info.range.end;
 
     LOG(EXTENSION_LOG_WARNING, "%s (vb %d) Attempting to reconnect stream "
         "with opaque %ld, start seq no %llu, end seq no %llu, snap start seqno "
@@ -945,7 +952,7 @@ void PassiveStream::reconnectStream(RCPtr<VBucket> &vb,
 
     LockHolder lh(streamMutex);
     last_seqno = start_seqno;
-    readyQ.push(new StreamRequest(vb_, new_opaque, flags_, start_seqno,
+    pushToReadyQ(new StreamRequest(vb_, new_opaque, flags_, start_seqno,
                                   end_seqno_, vb_uuid_, snap_start_seqno_,
                                   snap_end_seqno_));
     if (!itemsReady) {
@@ -1052,14 +1059,17 @@ ENGINE_ERROR_CODE PassiveStream::processMutation(MutationResponse* mutation) {
     }
 
     ENGINE_ERROR_CODE ret;
-    if (saveSnapshot) {
-        LockHolder lh = vb->getSnapshotLock();
-        ret = commitMutation(mutation, vb->isBackfillPhase());
-        vb->setCurrentSnapshot_UNLOCKED(cur_snapshot_start, cur_snapshot_end);
-        saveSnapshot = false;
-        lh.unlock();
+    if (vb->isBackfillPhase()) {
+        ret = engine->getEpStore()->addTAPBackfillItem(*mutation->getItem(),
+                                                    INITIAL_NRU_VALUE,
+                                                    false,
+                                                    mutation->getExtMetaData());
     } else {
-        ret = commitMutation(mutation, vb->isBackfillPhase());
+        ret = engine->getEpStore()->setWithMeta(*mutation->getItem(), 0, NULL,
+                                                consumer->getCookie(), true,
+                                                true, INITIAL_NRU_VALUE, false,
+                                                mutation->getExtMetaData(),
+                                                true);
     }
 
     // We should probably handle these error codes in a better way, but since
@@ -1068,9 +1078,9 @@ ENGINE_ERROR_CODE PassiveStream::processMutation(MutationResponse* mutation) {
     if (ret != ENGINE_SUCCESS) {
         LOG(EXTENSION_LOG_WARNING, "%s Got an error code %d while trying to "
             "process  mutation", consumer->logHeader(), ret);
+    } else {
+        handleSnapshotEnd(vb, mutation->getBySeqno());
     }
-
-    handleSnapshotEnd(vb, mutation->getBySeqno());
 
     if (ret != ENGINE_TMPFAIL && ret != ENGINE_ENOMEM) {
         delete mutation;
@@ -1079,37 +1089,22 @@ ENGINE_ERROR_CODE PassiveStream::processMutation(MutationResponse* mutation) {
     return ret;
 }
 
-ENGINE_ERROR_CODE PassiveStream::commitMutation(MutationResponse* mutation,
-                                                bool backfillPhase) {
-    if (backfillPhase) {
-        return engine->getEpStore()->addTAPBackfillItem(*mutation->getItem(),
-                                                        INITIAL_NRU_VALUE,
-                                                        false);
-    } else {
-        return engine->getEpStore()->setWithMeta(*mutation->getItem(), 0,
-                                                 consumer->getCookie(), true,
-                                                 true, INITIAL_NRU_VALUE, false,
-                                                 true);
-    }
-}
-
 ENGINE_ERROR_CODE PassiveStream::processDeletion(MutationResponse* deletion) {
     RCPtr<VBucket> vb = engine->getVBucket(vb_);
     if (!vb) {
         return ENGINE_NOT_MY_VBUCKET;
     }
 
+    uint64_t delCas = 0;
     ENGINE_ERROR_CODE ret;
-    if (saveSnapshot) {
-        LockHolder lh = vb->getSnapshotLock();
-        ret = commitDeletion(deletion, vb->isBackfillPhase());
-        vb->setCurrentSnapshot_UNLOCKED(cur_snapshot_start, cur_snapshot_end);
-        saveSnapshot = false;
-        lh.unlock();
-    } else {
-        ret = commitDeletion(deletion, vb->isBackfillPhase());
-    }
-
+    ItemMetaData meta = deletion->getItem()->getMetaData();
+    ret = engine->getEpStore()->deleteWithMeta(deletion->getItem()->getKey(),
+                                               &delCas, NULL, deletion->getVBucket(),
+                                               consumer->getCookie(), true,
+                                               &meta, vb->isBackfillPhase(),
+                                               false, deletion->getBySeqno(),
+                                               deletion->getExtMetaData(),
+                                               true);
     if (ret == ENGINE_KEY_ENOENT) {
         ret = ENGINE_SUCCESS;
     }
@@ -1120,9 +1115,9 @@ ENGINE_ERROR_CODE PassiveStream::processDeletion(MutationResponse* deletion) {
     if (ret != ENGINE_SUCCESS) {
         LOG(EXTENSION_LOG_WARNING, "%s Got an error code %d while trying to "
             "process  deletion", consumer->logHeader(), ret);
+    } else {
+        handleSnapshotEnd(vb, deletion->getBySeqno());
     }
-
-    handleSnapshotEnd(vb, deletion->getBySeqno());
 
     if (ret != ENGINE_TMPFAIL && ret != ENGINE_ENOMEM) {
         delete deletion;
@@ -1131,34 +1126,25 @@ ENGINE_ERROR_CODE PassiveStream::processDeletion(MutationResponse* deletion) {
     return ret;
 }
 
-ENGINE_ERROR_CODE PassiveStream::commitDeletion(MutationResponse* deletion,
-                                                bool backfillPhase) {
-    uint64_t delCas = 0;
-    ItemMetaData meta = deletion->getItem()->getMetaData();
-    return engine->getEpStore()->deleteWithMeta(deletion->getItem()->getKey(),
-                                                &delCas, deletion->getVBucket(),
-                                                consumer->getCookie(), true,
-                                                &meta, backfillPhase, false,
-                                                deletion->getBySeqno(), true);
-}
-
 void PassiveStream::processMarker(SnapshotMarker* marker) {
     RCPtr<VBucket> vb = engine->getVBucket(vb_);
 
     cur_snapshot_start = marker->getStartSeqno();
     cur_snapshot_end = marker->getEndSeqno();
     cur_snapshot_type = (marker->getFlags() & MARKER_FLAG_DISK) ? disk : memory;
-    saveSnapshot = true;
 
     if (vb) {
         if (marker->getFlags() & MARKER_FLAG_DISK && vb->getHighSeqno() == 0) {
             vb->setBackfillPhase(true);
-            vb->checkpointManager.checkAndAddNewCheckpoint(0, vb);
+            vb->checkpointManager.setBackfillPhase(cur_snapshot_start,
+                                                   cur_snapshot_end);
         } else {
             if (marker->getFlags() & MARKER_FLAG_CHK ||
                 vb->checkpointManager.getOpenCheckpointId() == 0) {
-                uint64_t id = vb->checkpointManager.getOpenCheckpointId() + 1;
-                vb->checkpointManager.checkAndAddNewCheckpoint(id, vb);
+                vb->checkpointManager.createSnapshot(cur_snapshot_start,
+                                                     cur_snapshot_end);
+            } else {
+                vb->checkpointManager.updateCurrentSnapshotEnd(cur_snapshot_end);
             }
             vb->setBackfillPhase(false);
         }
@@ -1175,7 +1161,7 @@ void PassiveStream::processSetVBucketState(SetVBucketState* state) {
     delete state;
 
     LockHolder lh (streamMutex);
-    readyQ.push(new SetVBucketStateResponse(opaque_, ENGINE_SUCCESS));
+    pushToReadyQ(new SetVBucketStateResponse(opaque_, ENGINE_SUCCESS));
     if (!itemsReady) {
         itemsReady = true;
         lh.unlock();
@@ -1189,11 +1175,19 @@ void PassiveStream::handleSnapshotEnd(RCPtr<VBucket>& vb, uint64_t byseqno) {
             vb->setBackfillPhase(false);
             uint64_t id = vb->checkpointManager.getOpenCheckpointId() + 1;
             vb->checkpointManager.checkAndAddNewCheckpoint(id, vb);
+        } else {
+            double maxSize = static_cast<double>(engine->getEpStats().getMaxDataSize());
+            double mem_threshold = StoredValue::getMutationMemThreshold();
+            double mem_used = static_cast<double>(engine->getEpStats().getTotalMemoryUsed());
+            if (maxSize * mem_threshold < mem_used) {
+                uint64_t id = vb->checkpointManager.getOpenCheckpointId() + 1;
+                vb->checkpointManager.checkAndAddNewCheckpoint(id, vb);
+            }
         }
 
         if (cur_snapshot_ack) {
             LockHolder lh(streamMutex);
-            readyQ.push(new SnapshotMarkerResponse(opaque_, ENGINE_SUCCESS));
+            pushToReadyQ(new SnapshotMarkerResponse(opaque_, ENGINE_SUCCESS));
             if (!itemsReady) {
                 itemsReady = true;
                 lh.unlock();
@@ -1202,14 +1196,13 @@ void PassiveStream::handleSnapshotEnd(RCPtr<VBucket>& vb, uint64_t byseqno) {
             cur_snapshot_ack = false;
         }
         cur_snapshot_type = none;
-        vb->setCurrentSnapshot(byseqno, byseqno);
     }
 }
 
 void PassiveStream::addStats(ADD_STAT add_stat, const void *c) {
     Stream::addStats(add_stat, c);
 
-    const int bsize = 128;
+    const int bsize = 1024;
     char buf[bsize];
     snprintf(buf, bsize, "%s:stream_%d_buffer_items", name_.c_str(), vb_);
     add_casted_stat(buf, buffer.items, add_stat, c);
@@ -1219,6 +1212,8 @@ void PassiveStream::addStats(ADD_STAT add_stat, const void *c) {
     add_casted_stat(buf, itemsReady ? "true" : "false", add_stat, c);
     snprintf(buf, bsize, "%s:stream_%d_last_received_seqno", name_.c_str(), vb_);
     add_casted_stat(buf, last_seqno, add_stat, c);
+    snprintf(buf, bsize, "%s:stream_%d_ready_queue_memory", name_.c_str(), vb_);
+    add_casted_stat(buf, getReadyQueueMemory(), add_stat, c);
 
     snprintf(buf, bsize, "%s:stream_%d_cur_snapshot_type", name_.c_str(), vb_);
     add_casted_stat(buf, snapshotTypeToString(cur_snapshot_type), add_stat, c);
@@ -1240,7 +1235,7 @@ DcpResponse* PassiveStream::next() {
     }
 
     DcpResponse* response = readyQ.front();
-    readyQ.pop();
+    popFromReadyQ();
     return response;
 }
 

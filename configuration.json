@@ -34,7 +34,7 @@
             }
         },
         "alog_task_time": {
-            "default": "10",
+            "default": "2",
             "descr": "Hour in GMT time when access scanner task is scheduled to run",
             "type": "size_t",
             "validator": {
@@ -74,6 +74,26 @@
                     "min": 0
                 }
             }
+        },
+        "bfilter_enabled": {
+            "default": "true",
+            "desr": "Enable or disable the bloom filter",
+            "type": "bool"
+        },
+        "bfilter_key_count": {
+            "default": "10000",
+            "desr": "Bloomfilter: Estimated key count per vbucket",
+            "type": "size_t"
+        },
+        "bfilter_fp_prob": {
+            "default": "0.01",
+            "desr": "Bloomfilter: Allowed probability for false positives",
+            "type": "float"
+        },
+        "bfilter_residency_threshold": {
+            "default": "0.1",
+            "desr" : "If resident ratio (during full eviction) were found less than this threshold, compaction will include all items into bloomfilter",
+            "type" : "float"
         },
         "compaction_exp_mem_threshold": {
             "default": "85",
@@ -134,6 +154,26 @@
             "dynamic": false,
             "type": "std::string"
         },
+        "defragmenter_enabled": {
+            "default": "true",
+            "descr": "True if defragmenter task is enabled",
+            "type": "bool"
+        },
+        "defragmenter_interval": {
+            "default": "10",
+            "descr": "How often defragmenter task should be run (in seconds).",
+            "type": "size_t"
+        },
+        "defragmenter_age_threshold": {
+            "default": "10",
+            "descr": "How old (measured in number of defragmenter passes) must a document be to be considered for degragmentation.",
+            "type": "size_t"
+        },
+        "defragmenter_chunk_duration": {
+            "default": "20",
+            "descr": "Maximum time (in ms) defragmentation task will run for before being paused (and resumed at the next defragmenter_interval).",
+            "type": "size_t"
+        },
         "enable_chk_merge": {
             "default": "false",
             "descr": "True if merging closed checkpoints is enabled",
@@ -158,7 +198,7 @@
             "type": "bool"
         },
         "flushall_enabled": {
-            "default": "false",
+            "default": "true",
             "descr": "True if memcached flush API is enabled",
             "type": "bool"
         },
@@ -173,7 +213,7 @@
             "type": "size_t"
         },
         "ht_locks": {
-            "default": "0",
+            "default": "47",
             "type": "size_t"
         },
         "ht_size": {
@@ -419,11 +459,53 @@
             "dynamic" : false,
             "type": "std::string"
         },
+        "dcp_backfill_byte_limit": {
+            "default": "20971832",
+            "descr": "Max bytes a connection can backfill into memory",
+            "dynamic": false,
+            "type": "size_t"
+        },
         "dcp_conn_buffer_size": {
             "default": "10485760",
             "descr": "Size in bytes of an dcp consumer connection buffer",
             "dynamic": false,
             "type": "size_t"
+        },
+        "dcp_enable_dynamic_conn_buffer_size": {
+            "default": "true",
+            "descr": "Whether or not the buffer size in dcp flow control be decided dynamically",
+            "dynamic": false,
+            "type": "bool"
+        },
+        "dcp_conn_buffer_size_max": {
+            "default": "52428800",
+            "descr": "Max size in bytes of an dcp consumer connection buffer",
+            "dynamic": false,
+            "type": "size_t"
+        },
+        "dcp_conn_buffer_size_perc": {
+            "default": "1",
+            "descr": "Percentage of memQuota for a dcp consumer connection buffer",
+            "type": "size_t",
+            "dynamic": false,
+            "validator": {
+                "range": {
+                    "max": 10,
+                    "min": 1
+                }
+            }
+        },
+        "dcp_conn_buffer_size_aggr_mem_threshold": {
+            "default": "10",
+            "descr": "Aggr mem usage by all dcp conns (as percentage of memQuota) after which only dcp_conn_buffer_size is allocated",
+            "type": "size_t",
+            "dynamic": false,
+            "validator": {
+                "range": {
+                    "max": 20,
+                    "min": 1
+                }
+            }
         },
         "dcp_enable_flow_control": {
             "default": "true",
@@ -445,6 +527,18 @@
         "dcp_max_unacked_bytes": {
             "default": "524288",
             "descr": "Amount of processed bytes before an ack is required",
+            "dynamic": false,
+            "type": "size_t"
+        },
+        "dcp_scan_byte_limit": {
+            "default": "4194304",
+            "descr": "Max bytes that can be read in a single disk scan",
+            "dynamic": false,
+            "type": "size_t"
+        },
+        "dcp_scan_item_limit": {
+            "default": "4096",
+            "descr": "Max items that can be read in a single disk scan",
             "dynamic": false,
             "type": "size_t"
         },

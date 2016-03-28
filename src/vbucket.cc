@@ -22,6 +22,7 @@
 #include <set>
 #include <string>
 
+#include "atomic.h"
 #include "ep_engine.h"
 #include "failover-table.h"
 #define STATWRITER_NAMESPACE vbucket
@@ -138,6 +139,9 @@ VBucket::~VBucket() {
     pendingBGFetches.clear();
     delete failovers;
 
+    // Clear out the bloomfilter(s)
+    clearFilter();
+
     stats.memOverhead.fetch_sub(sizeof(VBucket) + ht.memorySize() + sizeof(CheckpointManager));
     cb_assert(stats.memOverhead.load() < GIGANTOR);
 
@@ -188,11 +192,6 @@ void VBucket::setState(vbucket_state_t to, SERVER_HANDLE_V1 *sapi) {
     if (to == vbucket_state_active &&
         checkpointManager.getOpenCheckpointId() < 2) {
         checkpointManager.setOpenCheckpointId(2);
-    }
-
-    if (oldstate == vbucket_state_active) {
-        uint64_t highSeqno = (uint64_t)checkpointManager.getHighSeqno();
-        setCurrentSnapshot(highSeqno, highSeqno);
     }
 
     LOG(EXTENSION_LOG_DEBUG, "transitioning vbucket %d from %s to %s",
@@ -414,6 +413,184 @@ size_t VBucket::getNumNonResidentItems(item_eviction_policy_t policy) {
     }
 }
 
+bool VBucket::isResidentRatioUnderThreshold(float threshold,
+                                            item_eviction_policy_t policy) {
+    cb_assert(policy == FULL_EVICTION);
+    size_t num_items = getNumItems(policy);
+    size_t num_non_resident_items = getNumNonResidentItems(policy);
+    if (threshold >= ((float)(num_items - num_non_resident_items) /
+                                                                num_items)) {
+        return true;
+    } else {
+        return false;
+    }
+}
+
+void VBucket::initTempFilter(size_t key_count, double probability) {
+    // Create a temp bloom filter with status as COMPACTING,
+    // if the main filter is found to exist, set its state to
+    // COMPACTING as well.
+    LockHolder lh(bfMutex);
+    if (tempFilter) {
+        delete tempFilter;
+    }
+    tempFilter = new BloomFilter(key_count, probability, BFILTER_COMPACTING);
+    if (bFilter) {
+        bFilter->setStatus(BFILTER_COMPACTING);
+    }
+}
+
+void VBucket::addToFilter(const std::string &key) {
+    LockHolder lh(bfMutex);
+    if (bFilter) {
+        bFilter->addKey(key.c_str(), key.length());
+    }
+
+    // If the temp bloom filter is not found to be NULL,
+    // it means that compaction is running on the particular
+    // vbucket. Therefore add the key to the temp filter as
+    // well, as once compaction completes the temp filter
+    // will replace the main bloom filter.
+    if (tempFilter) {
+        tempFilter->addKey(key.c_str(), key.length());
+    }
+}
+
+bool VBucket::maybeKeyExistsInFilter(const std::string &key) {
+    LockHolder lh(bfMutex);
+    if (bFilter) {
+        return bFilter->maybeKeyExists(key.c_str(), key.length());
+    } else {
+        // If filter doesn't exist, allow the BgFetch to go through.
+        return true;
+    }
+}
+
+bool VBucket::isTempFilterAvailable() {
+    LockHolder lh(bfMutex);
+    if (tempFilter &&
+        (tempFilter->getStatus() == BFILTER_COMPACTING ||
+         tempFilter->getStatus() == BFILTER_ENABLED)) {
+        return true;
+    } else {
+        return false;
+    }
+}
+
+void VBucket::addToTempFilter(const std::string &key) {
+    // Keys will be added to only the temp filter during
+    // compaction.
+    LockHolder lh(bfMutex);
+    if (tempFilter) {
+        tempFilter->addKey(key.c_str(), key.length());
+    }
+}
+
+void VBucket::swapFilter() {
+    // Delete the main bloom filter and replace it with
+    // the temp filter that was populated during compaction,
+    // only if the temp filter's state is found to be either at
+    // COMPACTING or ENABLED (if in the case the user enables
+    // bloomfilters for some reason while compaction was running).
+    // Otherwise, it indicates that the filter's state was
+    // possibly disabled during compaction, therefore clear out
+    // the temp filter. If it gets enabled at some point, a new
+    // bloom filter will be made available after the next
+    // compaction.
+
+    LockHolder lh(bfMutex);
+    if (bFilter) {
+        delete bFilter;
+        bFilter = NULL;
+    }
+    if (tempFilter &&
+        (tempFilter->getStatus() == BFILTER_COMPACTING ||
+         tempFilter->getStatus() == BFILTER_ENABLED)) {
+        bFilter = tempFilter;
+        tempFilter = NULL;
+        bFilter->setStatus(BFILTER_ENABLED);
+    } else if (tempFilter) {
+        delete tempFilter;
+        tempFilter = NULL;
+    }
+}
+
+void VBucket::clearFilter() {
+    LockHolder lh(bfMutex);
+    if (bFilter) {
+        delete bFilter;
+        bFilter = NULL;
+    }
+    if (tempFilter) {
+        delete tempFilter;
+        tempFilter = NULL;
+    }
+}
+
+void VBucket::setFilterStatus(bfilter_status_t to) {
+    LockHolder lh(bfMutex);
+    if (bFilter) {
+        bFilter->setStatus(to);
+    }
+    if (tempFilter) {
+        tempFilter->setStatus(to);
+    }
+}
+
+std::string VBucket::getFilterStatusString() {
+    LockHolder lh(bfMutex);
+    if (bFilter) {
+        return bFilter->getStatusString();
+    } else if (tempFilter) {
+        return tempFilter->getStatusString();
+    } else {
+        return "DOESN'T EXIST";
+    }
+}
+
+void VBucket::addPersistenceNotification(shared_ptr<Callback<uint64_t> > cb) {
+    LockHolder lh(persistedNotificationsMutex);
+    persistedNotifications.push_back(cb);
+}
+
+void VBucket::notifySeqnoPersisted(uint64_t highSeqno) {
+    LockHolder lh(persistedNotificationsMutex);
+    std::list<shared_ptr<Callback<uint64_t>> >::iterator itr =
+                                                persistedNotifications.begin();
+    for (; itr != persistedNotifications.end(); ++itr) {
+        shared_ptr<Callback<uint64_t> > cb = *itr;
+        cb->callback(highSeqno);
+        if (cb->getStatus() == ENGINE_SUCCESS) {
+            persistedNotifications.erase(itr);
+        }
+    }
+}
+
+uint64_t VBucket::nextHLCCas() {
+    int64_t adjusted_time = gethrtime();
+    uint64_t final_adjusted_time = 0;
+
+    if (time_sync_enabled) {
+        adjusted_time += drift_counter;
+    }
+
+    if (adjusted_time < 0) {
+        LOG(EXTENSION_LOG_WARNING,
+            "Adjusted time is negative: %" PRId64 "\n", adjusted_time);
+    }
+
+    final_adjusted_time = ((uint64_t)adjusted_time) & ~((1 << 16) - 1);
+    uint64_t local_max_cas = max_cas.load();
+
+    if (final_adjusted_time > local_max_cas) {
+        atomic_setIfBigger(max_cas, final_adjusted_time);
+        return final_adjusted_time;
+    }
+
+    atomic_setIfBigger(max_cas, local_max_cas + 1);
+    return local_max_cas + 1;
+}
+
 void VBucket::addStats(bool details, ADD_STAT add_stat, const void *c,
                        item_eviction_policy_t policy) {
     addStat(NULL, toString(state), add_stat, c);
@@ -443,5 +620,11 @@ void VBucket::addStats(bool details, ADD_STAT add_stat, const void *c,
         addStat("high_seqno", getHighSeqno(), add_stat, c);
         addStat("uuid", failovers->getLatestEntry().vb_uuid, add_stat, c);
         addStat("purge_seqno", getPurgeSeqno(), add_stat, c);
+        addStat("bloom_filter", getFilterStatusString().data(),
+                add_stat, c);
+        addStat("max_cas", getMaxCas(), add_stat, c);
+        addStat("drift_counter", getDriftCounter(), add_stat, c);
+        addStat("time_sync", time_sync_enabled ? "enabled" : "disabled",
+                add_stat, c);
     }
 }

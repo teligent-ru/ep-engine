@@ -142,8 +142,9 @@ void Flusher::schedule_UNLOCKED() {
 void Flusher::start() {
     LockHolder lh(taskMutex);
     if (taskId) {
-        LOG(EXTENSION_LOG_WARNING, "Double start in flusher task id %llu: %s",
-                taskId, stateName());
+        LOG(EXTENSION_LOG_WARNING,
+            "Double start in flusher task id %" PRIu64 ": %s",
+            uint64_t(taskId), stateName());
         return;
     }
     schedule_UNLOCKED();
@@ -157,7 +158,7 @@ void Flusher::wake(void) {
 
 bool Flusher::step(GlobalTask *task) {
     try {
-        switch (_state) {
+        switch (_state.load()) {
         case initializing:
             initialize(task->getId());
             return true;
@@ -242,11 +243,12 @@ void Flusher::flushVB(void) {
             doHighPriority = false;
         }
         bool inverse = true;
-        pendingMutation.compare_exchange_strong(inverse, false);
-        std::vector<int> vbs = shard->getVBucketsSortedByState();
-        std::vector<int>::iterator itr = vbs.begin();
-        for (; itr != vbs.end(); ++itr) {
-            lpVbs.push(static_cast<uint16_t>(*itr));
+        if (pendingMutation.compare_exchange_strong(inverse, false)) {
+            std::vector<int> vbs = shard->getVBucketsSortedByState();
+            std::vector<int>::iterator itr = vbs.begin();
+            for (; itr != vbs.end(); ++itr) {
+                lpVbs.push(static_cast<uint16_t>(*itr));
+            }
         }
     }
 

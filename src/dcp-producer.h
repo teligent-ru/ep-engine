@@ -20,9 +20,10 @@
 
 #include "config.h"
 
-#include "tapconnection.h"
 #include "dcp-stream.h"
+#include "tapconnection.h"
 
+class BackfillManager;
 class DcpResponse;
 
 class BufferLog {
@@ -132,6 +133,14 @@ public:
 
     void notifyStreamReady(uint16_t vbucket, bool schedule);
 
+    BackfillManager* getBackfillManager() {
+        return backfillMgr;
+    }
+
+    bool isExtMetaDataEnabled () {
+        return enableExtMetaData;
+    }
+
 private:
 
     DcpResponse* getNextItem();
@@ -148,11 +157,15 @@ private:
         bool enabled;
     } noopCtx;
 
+    std::string priority;
+
     DcpResponse *rejectResp; // stash response for retry if E2BIG was hit
 
     bool notifyOnly;
+    bool enableExtMetaData;
     rel_time_t lastSendTime;
     BufferLog* log;
+    BackfillManager* backfillMgr;
     std::list<uint16_t> ready;
     std::map<uint16_t, stream_t> streams;
     AtomicValue<size_t> itemsSent;

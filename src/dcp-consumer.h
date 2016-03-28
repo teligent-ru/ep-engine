@@ -90,6 +90,8 @@ public:
 
     process_items_error_t processBufferedItems();
 
+    bool isStreamPresent(uint16_t vbucket);
+
 private:
 
     DcpResponse* getNextItem();
@@ -111,6 +113,10 @@ private:
 
     ENGINE_ERROR_CODE handleFlowCtl(struct dcp_message_producers* producers);
 
+    ENGINE_ERROR_CODE handlePriority(struct dcp_message_producers* producers);
+
+    ENGINE_ERROR_CODE handleExtMetaData(struct dcp_message_producers* producers);
+
     uint64_t opaqueCounter;
     size_t processTaskId;
     AtomicValue<bool> itemsToProcess;
@@ -123,6 +129,8 @@ private:
     uint32_t noopInterval;
     bool enableNoop;
     bool sendNoopInterval;
+    bool setPriority;
+    bool enableExtMetaData;
 
     struct FlowControl {
         FlowControl() : enabled(true), pendingControl(true), bufferSize(0),

@@ -32,7 +32,6 @@ FailoverTable::FailoverTable(size_t capacity)
 FailoverTable::FailoverTable(const std::string& json, size_t capacity)
     : max_entries(capacity), provider(true) {
     loadFromJSON(json);
-    cb_assert(table.size() > 0);
 }
 
 FailoverTable::~FailoverTable() { }
@@ -40,6 +39,10 @@ FailoverTable::~FailoverTable() { }
 failover_entry_t FailoverTable::getLatestEntry() {
     LockHolder lh(lock);
     return table.front();
+}
+
+uint64_t FailoverTable::getLatestUUID() {
+    return latest_uuid;
 }
 
 void FailoverTable::createEntry(uint64_t high_seqno) {
@@ -57,12 +60,39 @@ void FailoverTable::createEntry(uint64_t high_seqno) {
     entry.vb_uuid = (provider.next() >> 16);
     entry.by_seqno = high_seqno;
     table.push_front(entry);
+    latest_uuid = entry.vb_uuid;
 
     // Cap the size of the table
     while (table.size() > max_entries) {
         table.pop_back();
     }
     cacheTableJSON();
+}
+
+bool FailoverTable::getLastSeqnoForUUID(uint64_t uuid,
+                                        uint64_t *seqno) {
+    LockHolder lh(lock);
+    table_t::iterator curr_itr = table.begin();
+    table_t::iterator prev_itr;
+
+    if (curr_itr->vb_uuid == uuid) {
+        return false;
+    }
+
+    prev_itr = curr_itr;
+
+    ++curr_itr;
+
+    for (; curr_itr != table.end(); ++curr_itr) {
+        if (curr_itr->vb_uuid == uuid) {
+            *seqno = prev_itr->by_seqno;
+            return true;
+        }
+
+        prev_itr = curr_itr;
+    }
+
+    return false;
 }
 
 bool FailoverTable::needsRollback(uint64_t start_seqno,
@@ -78,11 +108,19 @@ bool FailoverTable::needsRollback(uint64_t start_seqno,
     }
 
     *rollback_seqno = 0;
+
+    /* To be more efficient (avoid unnecessary rollback), see if the client has
+       already received all items in the requested snapshot */
+    if (start_seqno == snap_end_seqno) {
+        snap_start_seqno = start_seqno;
+    }
+
     /* There may be items that are purged during compaction. We need
      to rollback to seq no 0 in that case */
     if (snap_start_seqno < purge_seqno) {
         return true;
     }
+
     table_t::reverse_iterator itr;
     for (itr = table.rbegin(); itr != table.rend(); ++itr) {
         if (itr->vb_uuid == vb_uuid) {
@@ -126,6 +164,9 @@ void FailoverTable::pruneEntries(uint64_t seqno) {
             it = table.erase(it);
         }
     }
+
+    cb_assert(table.size() > 0);
+    latest_uuid = table.front().vb_uuid;
 
     cacheTableJSON();
 }
@@ -184,6 +225,7 @@ ENGINE_ERROR_CODE FailoverTable::addFailoverLog(const void* cookie,
         logentry->seqno = itr->by_seqno;
         logentry++;
     }
+
     EventuallyPersistentEngine *epe = ObjectRegistry::onSwitchThread(NULL, true);
     rv = callback(logentries, logsize, cookie);
     ObjectRegistry::onSwitchThread(epe);
@@ -218,6 +260,9 @@ bool FailoverTable::loadFromJSON(cJSON *json) {
         table.push_back(entry);
     }
 
+    cb_assert(table.size() > 0);
+    latest_uuid = table.front().vb_uuid;
+
     return true;
 }
 
@@ -247,5 +292,8 @@ void FailoverTable::replaceFailoverLog(uint8_t* bytes, uint32_t length) {
         entry.vb_uuid = ntohll(entry.vb_uuid);
         table.push_front(entry);
     }
+
+    latest_uuid = table.front().vb_uuid;
+
     cacheTableJSON();
 }

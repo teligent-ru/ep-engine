@@ -30,12 +30,14 @@
 
 #include "atomic.h"
 #include "bgfetcher.h"
+#include "bloomfilter.h"
 #include "checkpoint.h"
 #include "common.h"
 #include "stored-value.h"
 
 const size_t MIN_CHK_FLUSH_TIMEOUT = 10; // 10 sec.
 const size_t MAX_CHK_FLUSH_TIMEOUT = 30; // 30 sec.
+static const int64_t INITIAL_DRIFT = -140737488355328; //lowest possible 48-bit integer
 
 struct HighPriorityVBEntry {
     HighPriorityVBEntry() :
@@ -158,10 +160,13 @@ public:
             CheckpointConfig &chkConfig, KVShard *kvshard,
             int64_t lastSeqno, uint64_t lastSnapStart,
             uint64_t lastSnapEnd, FailoverTable *table,
+            shared_ptr<Callback<uint16_t> > cb,
             vbucket_state_t initState = vbucket_state_dead,
-            uint64_t chkId = 1, uint64_t purgeSeqno = 0) :
+            uint64_t chkId = 1, uint64_t purgeSeqno = 0,
+            uint64_t maxCas = 0, int64_t driftCounter = INITIAL_DRIFT):
         ht(st),
-        checkpointManager(st, i, chkConfig, lastSeqno, chkId),
+        checkpointManager(st, i, chkConfig, lastSeqno, lastSnapStart,
+                          lastSnapEnd, cb, chkId),
         failovers(table),
         opsCreate(0),
         opsUpdate(0),
@@ -182,10 +187,15 @@ public:
         initialState(initState),
         stats(st),
         purge_seqno(purgeSeqno),
-        cur_snapshot_start(lastSnapStart),
-        cur_snapshot_end(lastSnapEnd),
+        max_cas(maxCas),
+        drift_counter(driftCounter),
+        time_sync_enabled(false),
+        persisted_snapshot_start(lastSnapStart),
+        persisted_snapshot_end(lastSnapEnd),
         numHpChks(0),
-        shard(kvshard)
+        shard(kvshard),
+        bFilter(NULL),
+        tempFilter(NULL)
     {
         backfill.isBackfillPhase = false;
         pendingOpsStart = 0;
@@ -208,39 +218,56 @@ public:
         purge_seqno = to;
     }
 
-    LockHolder getSnapshotLock() {
+    void setPersistedSnapshot(uint64_t start, uint64_t end) {
         LockHolder lh(snapshotMutex);
-        return lh;
+        persisted_snapshot_start = start;
+        persisted_snapshot_end = end;
     }
 
-    void setCurrentSnapshot(uint64_t start, uint64_t end) {
+    void getPersistedSnapshot(snapshot_range_t& range) {
         LockHolder lh(snapshotMutex);
-        setCurrentSnapshot_UNLOCKED(start, end);
+        range.start = persisted_snapshot_start;
+        range.end = persisted_snapshot_end;
     }
 
-    void setCurrentSnapshot_UNLOCKED(uint64_t start, uint64_t end) {
-        cb_assert(start <= end);
+    uint64_t getMaxCas() {
+        return max_cas;
+    }
 
-        if (state == vbucket_state_replica) {
-            cb_assert(end >= (uint64_t)checkpointManager.getHighSeqno());
+    bool isTimeSyncEnabled() {
+        return time_sync_enabled.load();
+    }
+
+    void setMaxCas(uint64_t cas) {
+        atomic_setIfBigger(max_cas, cas);
+    }
+
+    /**
+     * To set drift counter's initial value
+     * and to toggle the timeSync between ON/OFF.
+     */
+    void setDriftCounterState(int64_t initial_drift, uint8_t time_sync) {
+        drift_counter = initial_drift;
+        time_sync_enabled = time_sync;
+    }
+
+    int64_t getDriftCounter() {
+        return drift_counter;
+    }
+
+    void setDriftCounter(int64_t adjustedTime) {
+        // Update drift counter only if timeSync is enabled for
+        // the vbucket.
+        if (time_sync_enabled) {
+            int64_t wallTime = gethrtime();
+            if ((wallTime + getDriftCounter()) < adjustedTime) {
+                drift_counter = (adjustedTime - wallTime);
+            }
         }
-
-        cur_snapshot_start = start;
-        cur_snapshot_end = end;
-    }
-
-    void getCurrentSnapshot(uint64_t& start, uint64_t& end) {
-        LockHolder lh(snapshotMutex);
-        getCurrentSnapshot_UNLOCKED(start, end);
-    }
-
-    void getCurrentSnapshot_UNLOCKED(uint64_t& start, uint64_t& end) {
-        start = cur_snapshot_start;
-        end = cur_snapshot_end;
     }
 
     int getId(void) const { return id; }
-    vbucket_state_t getState(void) const { return state; }
+    vbucket_state_t getState(void) const { return state.load(); }
     void setState(vbucket_state_t to, SERVER_HANDLE_V1 *sapi);
 
     vbucket_state_t getInitialState(void) { return initialState; }
@@ -358,11 +385,32 @@ public:
         }
     }
 
-    void addHighPriorityVBEntry(uint64_t id, const void *cookie, bool isBySeqno);
-    void notifyCheckpointPersisted(EventuallyPersistentEngine &e, uint64_t id, bool isBySeqno);
+    void addHighPriorityVBEntry(uint64_t id, const void *cookie,
+                                bool isBySeqno);
+    void notifyCheckpointPersisted(EventuallyPersistentEngine &e,
+                                   uint64_t id, bool isBySeqno);
     void notifyAllPendingConnsFailed(EventuallyPersistentEngine &e);
     size_t getHighPriorityChkSize();
     static size_t getCheckpointFlushTimeout();
+
+    /**
+     * BloomFilter operations for vbucket
+     */
+    void initTempFilter(size_t key_count, double probability);
+    void addToFilter(const std::string &key);
+    bool maybeKeyExistsInFilter(const std::string &key);
+    bool isTempFilterAvailable();
+    void addToTempFilter(const std::string &key);
+    void swapFilter();
+    void clearFilter();
+    void setFilterStatus(bfilter_status_t to);
+    std::string getFilterStatusString();
+
+    uint64_t nextHLCCas();
+
+    // Applicable only for FULL EVICTION POLICY
+    bool isResidentRatioUnderThreshold(float threshold,
+                                       item_eviction_policy_t policy);
 
     void addStats(bool details, ADD_STAT add_stat, const void *c,
                   item_eviction_policy_t policy);
@@ -388,6 +436,9 @@ public:
         } while (!dirtyQueueSize.compare_exchange_strong(oldVal, oldVal - decrementBy));
         return true;
     }
+
+    void addPersistenceNotification(shared_ptr<Callback<uint64_t> > cb);
+    void notifySeqnoPersisted(uint64_t highseqno);
 
     static const vbucket_state_t ACTIVE;
     static const vbucket_state_t REPLICA;
@@ -423,8 +474,8 @@ public:
     AtomicValue<size_t>  metaDataDisk;
 
     AtomicValue<size_t>  numExpiredItems;
-    volatile size_t  fileSpaceUsed;
-    volatile size_t  fileSize;
+    AtomicValue<size_t>  fileSpaceUsed;
+    AtomicValue<size_t>  fileSize;
 
 private:
     template <typename T>
@@ -442,18 +493,33 @@ private:
     hrtime_t                 pendingOpsStart;
     EPStats                 &stats;
     uint64_t                 purge_seqno;
+    AtomicValue<uint64_t>    max_cas;
+    AtomicValue<int64_t>     drift_counter;
+    AtomicValue<bool>        time_sync_enabled;
 
     Mutex pendingBGFetchesLock;
     vb_bgfetch_queue_t pendingBGFetches;
 
     Mutex snapshotMutex;
-    uint64_t cur_snapshot_start;
-    uint64_t cur_snapshot_end;
+    uint64_t persisted_snapshot_start;
+    uint64_t persisted_snapshot_end;
 
     Mutex hpChksMutex;
     std::list<HighPriorityVBEntry> hpChks;
     volatile size_t numHpChks; // size of list hpChks (to avoid MB-9434)
     KVShard *shard;
+
+    Mutex bfMutex;
+    BloomFilter *bFilter;
+    BloomFilter *tempFilter;    // Used during compaction.
+
+    /**
+     * The following list is to contain pending notifications
+     * that need to be alerted whenever the desired sequence
+     * numbers have been persisted.
+     */
+    Mutex persistedNotificationsMutex;
+    std::list<shared_ptr<Callback<uint64_t>> > persistedNotifications;
 
     static size_t chkFlushTimeout;
 

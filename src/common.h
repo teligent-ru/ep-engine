@@ -76,6 +76,9 @@ using std::tr1::unordered_map;
     TypeName(const TypeName&);                  \
     void operator=(const TypeName&)
 
+#define DISALLOW_ASSIGN(TypeName)               \
+    void operator=(const TypeName&)
+
 // Utility functions implemented in various modules.
 
 extern void LOG(EXTENSION_LOG_LEVEL severity, const char *fmt, ...);
@@ -159,6 +162,25 @@ inline bool parseUint32(const char *str, uint32_t *out) {
             }
         }
         *out = l;
+        return true;
+    }
+
+    return false;
+}
+
+inline bool parseInt64(const char *str, int64_t *out) {
+    cb_assert(out != NULL);
+    errno = 0;
+    *out = 0;
+    char *endptr;
+
+    int64_t ll = strtoll(str, &endptr, 10);
+    if (errno == ERANGE) {
+        return false;
+    }
+
+    if (isspace(*endptr) || (*endptr == '\0' && endptr != str)) {
+        *out = static_cast<int64_t>(ll);
         return true;
     }
 

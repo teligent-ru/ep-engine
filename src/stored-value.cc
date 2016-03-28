@@ -86,7 +86,7 @@ bool StoredValue::unlocked_restoreValue(Item *itm, HashTable &ht) {
                               // by setting it to true when bg fetch is
                               // scheduled (full eviction mode).
     } else {
-        --ht.numNonResidentItems;
+        ht.decrNumNonResidentItems();
     }
 
     if (isTempInitialItem()) {
@@ -98,6 +98,7 @@ bool StoredValue::unlocked_restoreValue(Item *itm, HashTable &ht) {
         nru = INITIAL_NRU_VALUE;
     }
     deleted = false;
+    conflictResMode = itm->getConflictResMode();
     value = itm->getValue();
     increaseCacheSize(ht, value->length());
     return true;
@@ -129,6 +130,7 @@ bool StoredValue::unlocked_restoreMeta(Item *itm, ENGINE_ERROR_CODE status,
         if (nru == MAX_NRU_VALUE) {
             nru = INITIAL_NRU_VALUE;
         }
+        conflictResMode = itm->getConflictResMode();
         return true;
     case ENGINE_KEY_ENOENT:
         setStoredValueState(state_non_existent_key);
@@ -181,10 +183,10 @@ bool HashTable::unlocked_ejectItem(StoredValue*& vptr,
                 ++stats.numValueEjects;
             }
             if (!vptr->isResident() && !v->isTempItem()) {
-                --numNonResidentItems; // Decrement because the item is
-                                       // fully evicted.
+                decrNumNonResidentItems(); // Decrement because the item is
+                                           // fully evicted.
             }
-            --numItems; // Decrement because the item is fully evicted.
+            decrNumItems(); // Decrement because the item is fully evicted.
             ++numEjects;
             updateMaxDeletedRevSeqno(vptr->getRevSeqno());
 
@@ -203,14 +205,6 @@ mutation_type_t HashTable::insert(Item &itm, item_eviction_policy_t policy,
     cb_assert(isActive());
     if (!StoredValue::hasAvailableSpace(stats, itm)) {
         return NOMEM;
-    }
-
-    if (itm.getCas() == static_cast<uint64_t>(-1)) {
-        if (partial) {
-            itm.setCas(0);
-        } else {
-            itm.setCas(Item::nextCas());
-        }
     }
 
     int bucket_num(0);
@@ -246,7 +240,7 @@ mutation_type_t HashTable::insert(Item &itm, item_eviction_policy_t policy,
         }
 
         if (!v->isResident() && !v->isDeleted() && !v->isTempItem()) {
-            --numNonResidentItems;
+            decrNumNonResidentItems();
         }
 
         if (v->isTempItem()) {
@@ -265,7 +259,6 @@ mutation_type_t HashTable::insert(Item &itm, item_eviction_policy_t policy,
     }
 
     return NOT_FOUND;
-
 }
 
 static inline size_t getDefault(size_t x, size_t d) {
@@ -367,8 +360,7 @@ void HashTable::resize(size_t newSize) {
 
     // Set the new size so all the hashy stuff works.
     size_t oldSize = size;
-    size = newSize;
-    ep_sync_synchronize();
+    size.store(newSize);
 
     // Move existing records into the new space.
     for (size_t i = 0; i < oldSize; i++) {
@@ -489,12 +481,87 @@ void HashTable::visitDepth(HashTableDepthVisitor &visitor) {
     cb_assert(visited == size);
 }
 
+HashTable::Position
+HashTable::pauseResumeVisit(PauseResumeHashTableVisitor& visitor,
+                            Position& start_pos) {
+    if ((numItems.load() + numTempItems.load()) == 0 || !isActive()) {
+        // Nothing to visit
+        return endPosition();
+    }
+
+    bool paused = false;
+
+    // To attempt to minimize the impact the visitor has on normal frontend
+    // operations, we deliberately acquire (and release) the mutex between
+    // each hash_bucket - see `lh` in the inner for() loop below. This means we
+    // hold a given mutex for a large number of short durations, instead of just
+    // one single, long duration.
+    // *However*, there is a potential race with this approach - the {size} of
+    // the HashTable may be changed (by the Resizer task) between us first
+    // reading it to calculate the starting hash_bucket, and then reading it
+    // inside the inner for() loop. To prevent this race, we explicitly acquire
+    // (any) mutex, increment {visitors} and then release the mutex. This
+    //avoids the race as if visitors >0 then Resizer will not attempt to resize.
+    LockHolder lh(mutexes[0]);
+    VisitorTracker vt(&visitors);
+    lh.unlock();
+
+    // Start from the requested lock number if in range.
+    size_t lock = (start_pos.lock < n_locks) ? start_pos.lock : 0;
+    size_t hash_bucket = 0;
+
+    for (; isActive() && !paused && lock < n_locks; lock++) {
+
+        // If the bucket position is *this* lock, then start from the
+        // recorded bucket (as long as we haven't resized).
+        hash_bucket = lock;
+        if (start_pos.lock == lock &&
+            start_pos.ht_size == size &&
+            start_pos.hash_bucket < size) {
+            hash_bucket = start_pos.hash_bucket;
+        }
+
+        // Iterate across all values in the hash buckets owned by this lock.
+        // Note: we don't record how far into the bucket linked-list we
+        // pause at; so any restart will begin from the next bucket.
+        for (; !paused && hash_bucket < size; hash_bucket += n_locks) {
+            LockHolder lh(mutexes[lock]);
+
+            StoredValue *v = values[hash_bucket];
+            while (!paused && v) {
+                StoredValue *tmp = v->next;
+                paused = !visitor.visit(*v);
+                v = tmp;
+            }
+        }
+
+        // If the visitor paused us before we visited all hash buckets owned
+        // by this lock, we don't want to skip the remaining hash buckets, so
+        // stop the outer for loop from advancing to the next lock.
+        if (paused && hash_bucket < size) {
+            break;
+        }
+
+        // Finished all buckets owned by this lock. Set hash_bucket to 'size'
+        // to give a consistent marker for "end of lock".
+        hash_bucket = size;
+    }
+
+    // Return the *next* location that should be visited.
+    return HashTable::Position(size, lock, hash_bucket);
+}
+
+HashTable::Position HashTable::endPosition() const  {
+    return HashTable::Position(size, n_locks, size);
+}
+
 add_type_t HashTable::unlocked_add(int &bucket_num,
                                    StoredValue*& v,
                                    const Item &val,
                                    item_eviction_policy_t policy,
                                    bool isDirty,
                                    bool storeVal,
+                                   bool maybeKeyExists,
                                    bool isReplication) {
     add_type_t rv = ADD_SUCCESS;
     if (v && !v->isDeleted() && !v->isExpired(ep_real_time()) &&
@@ -512,7 +579,7 @@ add_type_t HashTable::unlocked_add(int &bucket_num,
                 // Need to figure out if an item exists on disk
                 return ADD_BG_FETCH;
             }
-            itm.setCas();
+
             rv = (v->isDeleted() || v->isExpired(ep_real_time())) ?
                                    ADD_UNDEL : ADD_SUCCESS;
             if (v->isTempItem()) {
@@ -533,10 +600,9 @@ add_type_t HashTable::unlocked_add(int &bucket_num,
             }
         } else {
             if (val.getBySeqno() != StoredValue::state_temp_init) {
-                if (policy == FULL_EVICTION) {
+                if (policy == FULL_EVICTION && maybeKeyExists) {
                     return ADD_TMP_AND_BG_FETCH;
                 }
-                itm.setCas();
             }
             v = valFact(itm, values[bucket_num], *this, isDirty);
             values[bucket_num] = v;
@@ -584,8 +650,8 @@ add_type_t HashTable::unlocked_addTempItem(int &bucket_num,
     uint8_t ext_meta[1];
     uint8_t ext_len = EXT_META_LEN;
     *(ext_meta) = PROTOCOL_BINARY_RAW_BYTES;
-    Item itm(key.c_str(), key.length(), (size_t)0, (uint32_t)0, (time_t)0,
-             ext_meta, ext_len, 0, StoredValue::state_temp_init);
+    Item itm(key.c_str(), key.length(), /*flags*/0, /*exp*/0, /*data*/NULL,
+             /*size*/0, ext_meta, ext_len, 0, StoredValue::state_temp_init);
 
     // if a temp item for a possibly deleted, set it non-resident by resetting
     // the value cuz normally a new item added is considered resident which
@@ -594,6 +660,7 @@ add_type_t HashTable::unlocked_addTempItem(int &bucket_num,
     return unlocked_add(bucket_num, v, itm, policy,
                         false,  // isDirty
                         true,   // storeVal
+                        true,
                         isReplication);
 }
 
@@ -656,7 +723,18 @@ Item* StoredValue::toItem(bool lck, uint16_t vbucket) const {
     if (deleted) {
         itm->setDeleted();
     }
+
+    itm->setConflictResMode(
+          static_cast<enum conflict_resolution_mode>(conflictResMode));
+
     return itm;
+}
+
+void StoredValue::reallocate() {
+    // Allocate a new Blob for this stored value; copy the existing Blob to
+    // the new one and free the old.
+    value_t new_val(Blob::Copy(*value));
+    value.reset(new_val);
 }
 
 Item *HashTable::getRandomKeyFromSlot(int slot) {
@@ -687,4 +765,9 @@ Item* HashTable::getRandomKey(long rnd) {
     } while (ret == NULL && curr != start);
 
     return ret;
+}
+
+std::ostream& operator<<(std::ostream& os, const HashTable::Position& pos) {
+    os << "{lock:" << pos.lock << " bucket:" << pos.hash_bucket << "/" << pos.ht_size << "}";
+    return os;
 }

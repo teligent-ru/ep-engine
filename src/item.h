@@ -63,7 +63,7 @@ public:
      * @param start the beginning of the data to copy into this blob
      * @param len the amount of data to copy in
      * @param ext_meta pointer to the extended meta section to be added
-     * @param ext_len length of the exteneded meta section
+     * @param ext_len length of the extended meta section
      *
      * @return the new Blob instance
      */
@@ -77,42 +77,29 @@ public:
     }
 
     /**
-     * Create a new Blob holding the contents of the given string.
-     *
-     * @param s the string whose contents go into the blob
-     * @param ext_meta pointer to the extended meta section to be added
-     * @param ext_len length of the exteneded meta section
-     *
-     * @return the new Blob instance
-     */
-    static Blob* New(const std::string& s, uint8_t* ext_meta,
-                     uint8_t ext_len) {
-        return New(s.data(), s.length(), ext_meta, ext_len);
-    }
-
-    /**
-     * Create a new Blob pre-filled with the given character.
+     * Create a new Blob of the given size, with ext_meta set to the specified
+     * extended metadata
      *
      * @param len the size of the blob
-     * @param ext_meta pointer to the extended meta section to be added
-     * @param ext_len length of the exteneded meta section
+     * @param ext_meta pointer to the extended meta section to be copied in.
+     * @param ext_len length of the extended meta section
      *
      * @return the new Blob instance
      */
     static Blob* New(const size_t len, uint8_t *ext_meta, uint8_t ext_len) {
         size_t total_len = len + sizeof(Blob) + FLEX_DATA_OFFSET + ext_len;
-        Blob *t = new (::operator new(total_len)) Blob(len, ext_meta,
+        Blob *t = new (::operator new(total_len)) Blob(NULL, len, ext_meta,
                                                        ext_len);
         cb_assert(t->vlength() == len);
         return t;
     }
 
     /**
-     * Create a new Blob pre-filled with the given character.
+     * Create a new Blob of the given size.
      * (Used for appends/prepends)
      *
      * @param len the size of the blob
-     * @param ext_len length of the exteneded meta section
+     * @param ext_len length of the extended meta section
      *
      * @return the new Blob instance
      */
@@ -123,6 +110,13 @@ public:
         return t;
     }
 
+    /**
+     * Creates an exact copy of the specified Blob.
+     */
+    static Blob* Copy(const Blob& other) {
+        Blob *t = new (::operator new(other.getSize())) Blob(other);
+        return t;
+    }
 
     // Actual accessorish things.
 
@@ -193,6 +187,25 @@ public:
     }
 
     /**
+     * Returns how old this Blob is (how many epochs have passed since it was
+     * created).
+     */
+    uint8_t getAge() const {
+        return age;
+    }
+
+    /**
+     * Increment the age of the Blob. Saturates at 255.
+     */
+    void incrementAge() {
+        age++;
+        // Saturate the result at 255 if we wrapped.
+        if (age == 0) {
+            age = 255;
+        }
+    }
+
+    /**
      * Get a std::string representation of this blob.
      */
     const std::string to_s() const {
@@ -211,32 +224,37 @@ public:
 
 private:
 
+    /* Constructor.
+     * @param start If non-NULL, pointer to array which will be copied into
+     *              the newly-created Blob.
+     * @param len   Size of the data the Blob object will hold, and size of
+     *              the data at {start}.
+     * @param ext_meta Pointer to any extended metadata, which will be copied
+     *                 into the newly created Blob.
+     * @param ext_len Size of the data pointed to by {ext_meta}
+     */
     explicit Blob(const char *start, const size_t len, uint8_t* ext_meta,
                   uint8_t ext_len) :
         size(static_cast<uint32_t>(len + FLEX_DATA_OFFSET + ext_len)),
-        extMetaLen(static_cast<uint8_t>(ext_len))
+        extMetaLen(static_cast<uint8_t>(ext_len)),
+        age(0)
     {
         *(data) = FLEX_META_CODE;
         std::memcpy(data + FLEX_DATA_OFFSET, ext_meta, ext_len);
-        std::memcpy(data + FLEX_DATA_OFFSET + ext_len, start, len);
-        ObjectRegistry::onCreateBlob(this);
-    }
-
-    explicit Blob(const size_t len, uint8_t* ext_meta, uint8_t ext_len) :
-        size(static_cast<uint32_t>(len + FLEX_DATA_OFFSET + ext_len)),
-        extMetaLen(static_cast<uint8_t>(ext_len))
-    {
-        *(data) = FLEX_META_CODE;
-        std::memcpy(data + FLEX_DATA_OFFSET, ext_meta, ext_len);;
+        if (start != NULL) {
+            std::memcpy(data + FLEX_DATA_OFFSET + ext_len, start, len);
 #ifdef VALGRIND
-        memset(data + FLEX_DATA_OFFSET + ext_len, 0, len);
+        } else {
+            memset(data + FLEX_DATA_OFFSET + ext_len, 0, len);
 #endif
+        }
         ObjectRegistry::onCreateBlob(this);
     }
 
     explicit Blob(const size_t len, uint8_t ext_len) :
         size(static_cast<uint32_t>(len + FLEX_DATA_OFFSET + ext_len)),
-        extMetaLen(static_cast<uint8_t>(ext_len))
+        extMetaLen(static_cast<uint8_t>(ext_len)),
+        age(0)
     {
 #ifdef VALGRIND
         memset(data, 0, len);
@@ -244,11 +262,24 @@ private:
         ObjectRegistry::onCreateBlob(this);
     }
 
+    explicit Blob(const Blob& other)
+      : size(other.size),
+        extMetaLen(other.extMetaLen),
+        // While this is a copy, it is a new allocation therefore reset age.
+        age(0)
+    {
+        std::memcpy(data, other.data, size);
+        ObjectRegistry::onCreateBlob(this);
+    }
+
     const uint32_t size;
     const uint8_t extMetaLen;
+
+    // The age of this Blob, in terms of some unspecified units of time.
+    uint8_t age;
     char data[1];
 
-    DISALLOW_COPY_AND_ASSIGN(Blob);
+    DISALLOW_ASSIGN(Blob);
 };
 
 typedef SingleThreadedRCPtr<Blob> value_t;
@@ -256,7 +287,7 @@ typedef SingleThreadedRCPtr<Blob> value_t;
 const uint64_t DEFAULT_REV_SEQ_NUM = 1;
 
 /**
- * The ItemMetaData structure is used to pass meata data information of
+ * The ItemMetaData structure is used to pass meta data information of
  * an Item.
  */
 class ItemMetaData {
@@ -277,6 +308,14 @@ public:
 };
 
 /**
+ * Conflict Resolution Modes
+ */
+enum conflict_resolution_mode {
+    revision_seqno = 0,
+    last_write_wins
+};
+
+/**
  * The Item structure we use to pass information between the memcached
  * core and the backend. Please note that the kvstore don't store these
  * objects, so we do have an extra layer of memory copying :(
@@ -284,68 +323,89 @@ public:
 class Item : public RCValue {
 public:
 
-    Item(const void* k, const size_t nk, const size_t nb,
-         const uint32_t fl, const time_t exp, uint8_t* ext_meta = NULL,
-         uint8_t ext_len = 0, uint64_t theCas = 0, int64_t i = -1,
-         uint16_t vbid = 0, uint8_t nru_value = INITIAL_NRU_VALUE) :
-        metaData(theCas, 1, fl, exp), bySeqno(i), queuedTime(ep_current_time()),
-        vbucketId(vbid), op(queue_op_set), nru(nru_value)
-    {
-        key.assign(static_cast<const char*>(k), nk);
-        cb_assert(bySeqno != 0);
-        setData(NULL, nb, ext_meta, ext_len);
-        ObjectRegistry::onCreateItem(this);
-    }
-
-    Item(const std::string &k, const uint32_t fl, const time_t exp,
-         const void *dta, const size_t nb, uint8_t* ext_meta = NULL,
-         uint8_t ext_len = 0, uint64_t theCas = 0, int64_t i = -1,
-         uint16_t vbid = 0, uint8_t nru_value = INITIAL_NRU_VALUE) :
-        metaData(theCas, 1, fl, exp), bySeqno(i), queuedTime(ep_current_time()),
-        vbucketId(vbid), op(queue_op_set), nru(nru_value)
-    {
-        key.assign(k);
-        cb_assert(bySeqno != 0);
-        setData(static_cast<const char*>(dta), nb, ext_meta, ext_len);
-        ObjectRegistry::onCreateItem(this);
-    }
-
+    /* Constructor (existing value_t).
+     * Used when a value already exists, and the Item should refer to that
+     * value.
+     */
     Item(const std::string &k, const uint32_t fl, const time_t exp,
          const value_t &val, uint64_t theCas = 0,  int64_t i = -1,
-         uint16_t vbid = 0, uint64_t sno = 1, uint8_t nru_value = INITIAL_NRU_VALUE) :
-        metaData(theCas, sno, fl, exp), value(val), bySeqno(i),
-        queuedTime(ep_current_time()), vbucketId(vbid), op(queue_op_set),
-        nru(nru_value)
+         uint16_t vbid = 0, uint64_t sno = 1, uint8_t nru_value = INITIAL_NRU_VALUE,
+         uint8_t conflict_res_value = revision_seqno) :
+        metaData(theCas, sno, fl, exp),
+        value(val),
+        key(k),
+        bySeqno(i),
+        queuedTime(ep_current_time()),
+        vbucketId(vbid),
+        op(queue_op_set),
+        nru(nru_value),
+        conflictResMode(conflict_res_value)
     {
         cb_assert(bySeqno != 0);
-        key.assign(k);
         ObjectRegistry::onCreateItem(this);
     }
 
+    /* Constructor (new value).
+     * {k, nk}   specify the item's key, k must be non-null and point to an
+     *           array of bytes of length nk, where nk must be >0.
+     * fl        Item flags.
+     * exp       Item expiry.
+     * {dta, nb} specify the item's value. nb specifies how much memory will be
+     *           allocated for the value. If dta is non-NULL then the value
+     *           is set from the memory pointed to by dta. If dta is NULL,
+     *           then no data is copied in.
+     *  The remaining arguments specify various optional attributes.
+     */
     Item(const void *k, uint16_t nk, const uint32_t fl, const time_t exp,
          const void *dta, const size_t nb, uint8_t* ext_meta = NULL,
          uint8_t ext_len = 0, uint64_t theCas = 0, int64_t i = -1,
-         uint16_t vbid = 0, uint64_t sno = 1, uint8_t nru_value = INITIAL_NRU_VALUE) :
-        metaData(theCas, sno, fl, exp), bySeqno(i),
-        queuedTime(ep_current_time()), vbucketId(vbid), op(queue_op_set),
-        nru(nru_value)
+         uint16_t vbid = 0, uint64_t sno = 1, uint8_t nru_value = INITIAL_NRU_VALUE,
+         uint8_t conflict_res_value = revision_seqno) :
+        metaData(theCas, sno, fl, exp),
+        key(static_cast<const char*>(k), nk),
+        bySeqno(i),
+        queuedTime(ep_current_time()),
+        vbucketId(vbid),
+        op(queue_op_set),
+        nru(nru_value),
+        conflictResMode(conflict_res_value)
     {
         cb_assert(bySeqno != 0);
-        key.assign(static_cast<const char*>(k), nk);
         setData(static_cast<const char*>(dta), nb, ext_meta, ext_len);
         ObjectRegistry::onCreateItem(this);
     }
 
    Item(const std::string &k, const uint16_t vb,
         enum queue_operation o, const uint64_t revSeq,
-        const int64_t bySeq, uint8_t nru_value = INITIAL_NRU_VALUE) :
-       metaData(), key(k), bySeqno(bySeq),
-       queuedTime(ep_current_time()), vbucketId(vb),
-       op(static_cast<uint16_t>(o)), nru(nru_value)
+        const int64_t bySeq, uint8_t nru_value = INITIAL_NRU_VALUE,
+        uint8_t conflict_res_value = revision_seqno) :
+       metaData(),
+       key(k),
+       bySeqno(bySeq),
+       queuedTime(ep_current_time()),
+       vbucketId(vb),
+       op(static_cast<uint16_t>(o)),
+       nru(nru_value),
+       conflictResMode(conflict_res_value)
     {
        cb_assert(bySeqno >= 0);
        metaData.revSeqno = revSeq;
        ObjectRegistry::onCreateItem(this);
+    }
+
+    /* Copy constructor */
+    Item(const Item& other) :
+        metaData(other.metaData),
+        value(other.value),
+        key(other.key),
+        bySeqno(other.bySeqno),
+        queuedTime(other.queuedTime),
+        vbucketId(other.vbucketId),
+        op(other.op),
+        nru(other.nru),
+        conflictResMode(other.conflictResMode)
+    {
+        ObjectRegistry::onCreateItem(this);
     }
 
     ~Item() {
@@ -533,6 +593,14 @@ public:
         return gethrtime() + (++casCounter);
     }
 
+    void setConflictResMode(enum conflict_resolution_mode conf_res_value) {
+        conflictResMode = static_cast<uint8_t>(conf_res_value);
+    }
+
+    enum conflict_resolution_mode getConflictResMode(void) const {
+        return static_cast<enum conflict_resolution_mode>(conflictResMode);
+    }
+
 private:
     /**
      * Set the item's data. This is only used by constructors, so we
@@ -557,11 +625,12 @@ private:
     uint32_t queuedTime;
     uint16_t vbucketId;
     uint8_t op;
-    uint8_t nru;
+    uint8_t nru  : 2;
+    uint8_t conflictResMode : 2;
 
     static AtomicValue<uint64_t> casCounter;
     static const uint32_t metaDataSize;
-    DISALLOW_COPY_AND_ASSIGN(Item);
+    DISALLOW_ASSIGN(Item);
 };
 
 typedef SingleThreadedRCPtr<Item> queued_item;

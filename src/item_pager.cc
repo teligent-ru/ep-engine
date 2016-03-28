@@ -56,10 +56,10 @@ public:
                   bool *sfin, bool pause = false,
                   double bias = 1, item_pager_phase *phase = NULL)
       : store(s), stats(st), percent(pcnt),
-        activeBias(bias), ejected(0), totalEjected(0),
-        totalEjectionAttempts(0),
+        activeBias(bias), ejected(0),
         startTime(ep_real_time()), stateFinalizer(sfin), canPause(pause),
-        completePhase(true), pager_phase(phase) {}
+        completePhase(true), wasHighMemoryUsage(s.isMemoryUsageTooHigh()),
+        pager_phase(phase) {}
 
     void visit(StoredValue *v) {
         // Delete expired items for an active vbucket.
@@ -146,7 +146,6 @@ public:
             LOG(EXTENSION_LOG_INFO, "Purged %ld expired items", num_expired);
         }
 
-        totalEjected += (ejected + num_expired);
         ejected = 0;
         expired.clear();
     }
@@ -169,23 +168,18 @@ public:
                 *pager_phase = PAGING_UNREFERENCED;
             }
         }
+
+        // Wake up any sleeping backfill tasks if the memory usage is lowered
+        // below the high watermark as a result of checkpoint removal.
+        if (wasHighMemoryUsage && !store.isMemoryUsageTooHigh()) {
+            store.getEPEngine().getDcpConnMap().notifyBackfillManagerTasks();
+        }
     }
 
     /**
      * Get the number of items ejected during the visit.
      */
     size_t numEjected() { return ejected; }
-
-    /**
-     * Get the total number of items whose values are ejected or removed due to
-     * the expiry time.
-     */
-    size_t getTotalEjected() { return totalEjected; }
-
-    /**
-     * Get the total number of ejection attempts.
-     */
-    size_t getTotalEjectionAttempts() { return totalEjectionAttempts; }
 
 private:
     void adjustPercent(double prob, vbucket_state_t state) {
@@ -202,10 +196,19 @@ private:
     }
 
     void doEviction(StoredValue *v) {
-        ++totalEjectionAttempts;
         item_eviction_policy_t policy = store.getItemEvictionPolicy();
+        std::string key = v->getKey();
+
         if (currentBucket->ht.unlocked_ejectItem(v, policy)) {
             ++ejected;
+
+            /**
+             * For FULL EVICTION MODE, add all items that are being
+             * evicted to the corresponding bloomfilter.
+             */
+            if (policy == FULL_EVICTION) {
+                currentBucket->addToFilter(key);
+            }
         }
     }
 
@@ -216,12 +219,11 @@ private:
     double percent;
     double activeBias;
     size_t ejected;
-    size_t totalEjected;
-    size_t totalEjectionAttempts;
     time_t startTime;
     bool *stateFinalizer;
     bool canPause;
     bool completePhase;
+    bool wasHighMemoryUsage;
     item_pager_phase *pager_phase;
 };
 

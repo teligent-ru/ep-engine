@@ -28,11 +28,15 @@
 #include "executorthread.h"
 #include "tapconnection.h"
 #include "connmap.h"
+#include "dcp-backfill-manager.h"
 #include "dcp-consumer.h"
 #include "dcp-producer.h"
 
 size_t ConnMap::vbConnLockNum = 32;
 const double ConnNotifier::DEFAULT_MIN_STIME = 1.0;
+const uint32_t DcpConnMap::dbFileMem = 10 * 1024;
+const uint16_t DcpConnMap::numBackfillsThreshold = 4096;
+const uint8_t DcpConnMap::numBackfillsMemThreshold = 1;
 
 /**
  * NonIO task to free the resource of a tap connection.
@@ -877,7 +881,7 @@ void TapConnMap::removeTapCursors_UNLOCKED(TapProducer *tp) {
                 LOG(EXTENSION_LOG_INFO,
                     "%s Remove the TAP cursor from vbucket %d",
                     tp->logHeader(), vbid);
-                vb->checkpointManager.removeTAPCursor(tp->getName());
+                vb->checkpointManager.removeCursor(tp->getName());
             }
         }
     }
@@ -928,8 +932,9 @@ void TAPSessionStats::clearStats(const std::string &name) {
 }
 
 DcpConnMap::DcpConnMap(EventuallyPersistentEngine &e)
-    : ConnMap(e) {
-
+    : ConnMap(e), aggrDcpConsumerBufferSize(0) {
+    numActiveSnoozingBackfills = 0;
+    updateMaxActiveSnoozingBackfills(engine.getEpStats().getMaxDataSize());
 }
 
 
@@ -959,6 +964,30 @@ DcpConsumer *DcpConnMap::newConsumer(const void* cookie,
 
 }
 
+ENGINE_ERROR_CODE DcpConnMap::addPassiveStream(ConnHandler* conn,
+                                               uint32_t opaque,
+                                               uint16_t vbucket,
+                                               uint32_t flags)
+{
+    cb_assert(conn);
+    LockHolder lh(connsLock);
+
+    /* Check if a stream (passive) for the vbucket is already present */
+    std::list<connection_t>::iterator it;
+    for(it = all.begin(); it != all.end(); it++) {
+        DcpConsumer* dcpConsumer = dynamic_cast<DcpConsumer*>(it->get());
+        if (dcpConsumer) {
+            if (dcpConsumer->isStreamPresent(vbucket)) {
+                LOG(EXTENSION_LOG_WARNING, "%s (vb %d) Passive stream add "
+                    "failed, stream already exists in connection %s",
+                    conn->logHeader(), vbucket, dcpConsumer->logHeader());
+                return ENGINE_KEY_EEXISTS;
+            }
+        }
+    }
+
+    return conn->addStream(opaque, vbucket, flags);
+}
 
 DcpProducer *DcpConnMap::newProducer(const void* cookie,
                                      const std::string &name,
@@ -1151,4 +1180,49 @@ void DcpConnMap::notifyVBConnections(uint16_t vbid, uint64_t bySeqno)
         DcpProducer *conn = static_cast<DcpProducer*>((*it).get());
         conn->notifySeqnoAvailable(vbid, bySeqno);
     }
+}
+
+void DcpConnMap::notifyBackfillManagerTasks() {
+    LockHolder lh(connsLock);
+    std::map<const void*, connection_t>::iterator itr = map_.begin();
+    for (; itr != map_.end(); ++itr) {
+        DcpProducer* producer = dynamic_cast<DcpProducer*> (itr->second.get());
+        if (producer) {
+            producer->getBackfillManager()->wakeUpTask();
+        }
+    }
+}
+
+bool DcpConnMap::canAddBackfillToActiveQ()
+{
+    SpinLockHolder lh(&numBackfillsLock);
+    if (numActiveSnoozingBackfills < maxActiveSnoozingBackfills) {
+        ++numActiveSnoozingBackfills;
+        return true;
+    }
+    return false;
+}
+
+void DcpConnMap::decrNumActiveSnoozingBackfills()
+{
+    SpinLockHolder lh(&numBackfillsLock);
+    if (numActiveSnoozingBackfills > 0) {
+        --numActiveSnoozingBackfills;
+    } else {
+        LOG(EXTENSION_LOG_WARNING, "ActiveSnoozingBackfills already zero!!!");
+    }
+}
+
+void DcpConnMap::updateMaxActiveSnoozingBackfills(size_t maxDataSize)
+{
+    double numBackfillsMemThresholdPercent =
+                         static_cast<double>(numBackfillsMemThreshold)/100;
+    size_t max = maxDataSize * numBackfillsMemThresholdPercent / dbFileMem;
+    /* We must have atleast one active/snoozing backfill */
+    SpinLockHolder lh(&numBackfillsLock);
+    maxActiveSnoozingBackfills =
+        std::max(static_cast<size_t>(1),
+                 std::min(max, static_cast<size_t>(numBackfillsThreshold)));
+    LOG(EXTENSION_LOG_DEBUG, "Max active snoozing backfills set to %d",
+        maxActiveSnoozingBackfills);
 }

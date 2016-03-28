@@ -33,12 +33,14 @@
 #include "configuration.h"
 #include "ep.h"
 #include "ep-engine/command_ids.h"
+#include "ext_meta_parser.h"
 #include "item_pager.h"
 #include "kvstore.h"
 #include "locks.h"
 #include "tapconnection.h"
 #include "workload.h"
 
+#include <JSON_checker.h>
 
 class DcpConnMap;
 class TapConnMap;
@@ -58,7 +60,6 @@ extern "C" {
  */
 typedef void (*NOTIFY_IO_COMPLETE_T)(const void *cookie,
                                      ENGINE_ERROR_CODE status);
-
 
 // Forward decl
 class EventuallyPersistentEngine;
@@ -194,12 +195,16 @@ public:
             return ENGINE_E2BIG;
         }
 
+        if(!hasAvailableSpace(sizeof(Item) + sizeof(Blob) + nkey + nbytes)) {
+            return memoryCondition();
+        }
+
         time_t expiretime = (exptime == 0) ? 0 : ep_abs_time(ep_reltime(exptime));
 
         uint8_t ext_meta[1];
         uint8_t ext_len = EXT_META_LEN;
         *(ext_meta) = datatype;
-        *itm = new Item(key, nkey, nbytes, flags, expiretime, ext_meta,
+        *itm = new Item(key, nkey, flags, expiretime, NULL, nbytes, ext_meta,
                         ext_len);
         if (*itm == NULL) {
             return memoryCondition();
@@ -213,21 +218,23 @@ public:
                                  const void* key,
                                  const size_t nkey,
                                  uint64_t* cas,
-                                 uint16_t vbucket)
+                                 uint16_t vbucket,
+                                 mutation_descr_t *mut_info)
     {
         std::string k(static_cast<const char*>(key), nkey);
-        return itemDelete(cookie, k, cas, vbucket);
+        return itemDelete(cookie, k, cas, vbucket, mut_info);
     }
 
     ENGINE_ERROR_CODE itemDelete(const void* cookie,
                                  const std::string &key,
                                  uint64_t* cas,
-                                 uint16_t vbucket)
+                                 uint16_t vbucket,
+                                 mutation_descr_t *mut_info)
     {
         ENGINE_ERROR_CODE ret = epstore->deleteItem(key, cas,
                                                     vbucket, cookie,
                                                     false, // not force
-                                                    NULL);
+                                                    NULL, mut_info);
 
         if (ret == ENGINE_KEY_ENOENT || ret == ENGINE_NOT_MY_VBUCKET) {
             if (isDegradedMode()) {
@@ -303,16 +310,20 @@ public:
                                  const uint64_t delta,
                                  const uint64_t initial,
                                  const rel_time_t exptime,
-                                 uint64_t *cas,
+                                 item **ret_itm,
                                  uint8_t datatype,
                                  uint64_t *result,
                                  uint16_t vbucket)
     {
         BlockTimer timer(&stats.arithCmdHisto);
         item *it = NULL;
+        Item *nit = NULL;
+        uint64_t cas = 0;
+
         uint8_t ext_meta[1];
         uint8_t ext_len = EXT_META_LEN;
-        *(ext_meta) = datatype;
+        //Datatype of arithmetic values is always JSON
+        *(ext_meta) = PROTOCOL_BINARY_DATATYPE_JSON;
 
         rel_time_t expiretime = (exptime == 0 ||
                                  exptime == 0xffffffff) ?
@@ -333,6 +344,7 @@ public:
                 delete itm;
                 return ENGINE_TMPFAIL;
             }
+            cb_assert(itm->getCas());
             if ((errno != ERANGE) && (isspace(*endptr)
                                       || (*endptr == '\0' && endptr != data))) {
                 if (increment) {
@@ -349,12 +361,12 @@ public:
                 vals << val;
                 size_t nb = vals.str().length();
                 *result = val;
-                Item *nit = new Item(key, (uint16_t)nkey, itm->getFlags(),
+
+                nit = new Item(key, (uint16_t)nkey, itm->getFlags(),
                                      itm->getExptime(), vals.str().c_str(), nb,
                                      ext_meta, ext_len);
                 nit->setCas(itm->getCas());
-                ret = store(cookie, nit, cas, OPERATION_CAS, vbucket);
-                delete nit;
+                ret = store(cookie, nit, &cas, OPERATION_CAS, vbucket);
             } else {
                 ret = ENGINE_EINVAL;
             }
@@ -371,25 +383,28 @@ public:
                 vals << initial;
                 size_t nb = vals.str().length();
                 *result = initial;
-                Item *itm = new Item(key, (uint16_t)nkey, 0, expiretime,
+
+                nit = new Item(key, (uint16_t)nkey, 0, expiretime,
                                      vals.str().c_str(), nb, ext_meta, ext_len);
-                ret = store(cookie, itm, cas, OPERATION_ADD, vbucket);
-                delete itm;
+                ret = store(cookie, nit, &cas, OPERATION_ADD, vbucket);
             }
         }
 
         /* We had a race condition.. just call ourself recursively to retry */
-        if (ret == ENGINE_KEY_EEXISTS) {
+        if ((ret == ENGINE_KEY_EEXISTS) || (ret == ENGINE_NOT_STORED)) {
+            delete nit;
             return arithmetic(cookie, key, nkey, increment, create, delta,
-                              initial, expiretime, cas, datatype, result,
+                              initial, expiretime, ret_itm, datatype, result,
                               vbucket);
         } else if (ret == ENGINE_SUCCESS) {
+            *ret_itm = nit;
             ++stats.numOpsStore;
+        } else {
+            delete nit;
         }
 
         return ret;
     }
-
 
 
     ENGINE_ERROR_CODE flush(const void *cookie, time_t when);
@@ -428,6 +443,11 @@ public:
                               void *stream_name,
                               uint16_t nname);
 
+    ENGINE_ERROR_CODE dcpAddStream(const void* cookie,
+                                   uint32_t opaque,
+                                   uint16_t vbucket,
+                                   uint32_t flags);
+
     ENGINE_ERROR_CODE ConnHandlerCheckPoint(TapConsumer *consumer,
                                             uint8_t event,
                                             uint16_t vbucket,
@@ -440,28 +460,38 @@ public:
     ENGINE_ERROR_CODE getMeta(const void* cookie,
                               protocol_binary_request_get_meta *request,
                               ADD_RESPONSE response);
+
     ENGINE_ERROR_CODE setWithMeta(const void* cookie,
-                                  protocol_binary_request_set_with_meta *request,
-                                  ADD_RESPONSE response);
+                                 protocol_binary_request_set_with_meta *request,
+                                 ADD_RESPONSE response);
+
     ENGINE_ERROR_CODE deleteWithMeta(const void* cookie,
-                                     protocol_binary_request_delete_with_meta *request,
-                                     ADD_RESPONSE response);
+                              protocol_binary_request_delete_with_meta *request,
+                              ADD_RESPONSE response);
 
     ENGINE_ERROR_CODE returnMeta(const void* cookie,
                                  protocol_binary_request_return_meta *request,
                                  ADD_RESPONSE response);
 
     ENGINE_ERROR_CODE setClusterConfig(const void* cookie,
-                                protocol_binary_request_set_cluster_config *request,
-                                ADD_RESPONSE response);
+                            protocol_binary_request_set_cluster_config *request,
+                            ADD_RESPONSE response);
 
     ENGINE_ERROR_CODE getClusterConfig(const void* cookie,
-                                protocol_binary_request_get_cluster_config *request,
-                                ADD_RESPONSE response);
+                            protocol_binary_request_get_cluster_config *request,
+                            ADD_RESPONSE response);
 
     ENGINE_ERROR_CODE getAllKeys(const void* cookie,
                                 protocol_binary_request_get_keys *request,
                                 ADD_RESPONSE response);
+
+    ENGINE_ERROR_CODE getAdjustedTime(const void* cookie,
+                             protocol_binary_request_get_adjusted_time *request,
+                             ADD_RESPONSE response);
+
+    ENGINE_ERROR_CODE setDriftCounterState(const void* cookie,
+                       protocol_binary_request_set_drift_counter_state *request,
+                       ADD_RESPONSE response);
 
     /**
      * Visit the objects and add them to the tap/dcp connecitons queue.
@@ -505,6 +535,13 @@ public:
     bool isDatatypeSupported(const void *cookie) {
         EventuallyPersistentEngine *epe = ObjectRegistry::onSwitchThread(NULL, true);
         bool isSupported = serverApi->cookie->is_datatype_supported(cookie);
+        ObjectRegistry::onSwitchThread(epe);
+        return isSupported;
+    }
+
+    bool isMutationExtrasSupported(const void *cookie) {
+        EventuallyPersistentEngine *epe = ObjectRegistry::onSwitchThread(NULL, true);
+        bool isSupported = serverApi->cookie->is_mutation_extras_supported(cookie);
         ObjectRegistry::onSwitchThread(epe);
         return isSupported;
     }
@@ -615,6 +652,10 @@ public:
                               protocol_binary_request_header *request,
                               ADD_RESPONSE response);
 
+    ENGINE_ERROR_CODE observe_seqno(const void* cookie,
+                                    protocol_binary_request_header *request,
+                                    ADD_RESPONSE response);
+
     RCPtr<VBucket> getVBucket(uint16_t vbucket) {
         return epstore->getVBucket(vbucket);
     }
@@ -712,6 +753,33 @@ public:
 
     void addLookupAllKeys(const void *cookie, ENGINE_ERROR_CODE err);
 
+    /*
+     * Explicitly trigger the defragmenter task. Provided to facilitate
+     * testing.
+     */
+    void runDefragmenterTask(void);
+
+    /**
+     * Get a (sloppy) list of the sequence numbers for all of the vbuckets
+     * on this server. It is not to be treated as a consistent set of seqence,
+     * but rather a list of "at least" numbers. The way the list is generated
+     * is that we're starting for vbucket 0 and record the current number,
+     * then look at the next vbucket and record its number. That means that
+     * at the time we get the number for vbucket X all of the previous
+     * numbers could have been incremented. If the client just needs a list
+     * of where we are for each vbucket this method may be more optimal than
+     * requesting one by one.
+     *
+     * @param cookie The cookie representing the connection to requesting
+     *               list
+     * @param add_response The method used to format the output buffer
+     * @return ENGINE_SUCCESS upon success
+     */
+    ENGINE_ERROR_CODE getAllVBucketSequenceNumbers(
+                                        const void *cookie,
+                                        protocol_binary_request_header *request,
+                                        ADD_RESPONSE response);
+
 protected:
     friend class EpEngineValueChangeListener;
 
@@ -774,6 +842,14 @@ private:
             ++stats.oom_errors;
             return ENGINE_ENOMEM;
         }
+    }
+
+    /**
+     * Check if there is any available memory space to allocate an Item
+     * instance with a given size.
+     */
+    bool hasAvailableSpace(uint32_t nBytes) {
+        return (stats.getTotalMemoryUsed() + nBytes) <= stats.getMaxDataSize();
     }
 
     friend class BGFetchCallback;

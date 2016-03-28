@@ -20,6 +20,7 @@
 #include "backfill.h"
 #include "ep_engine.h"
 #include "failover-table.h"
+#include "dcp-backfill-manager.h"
 #include "dcp-producer.h"
 #include "dcp-response.h"
 #include "dcp-stream.h"
@@ -54,13 +55,8 @@ DcpProducer::DcpProducer(EventuallyPersistentEngine &e, const void *cookie,
         setLogHeader("DCP (Producer) " + getName() + " -");
     }
 
-    if (getName().find("replication") != std::string::npos) {
-        engine_.setDCPPriority(getCookie(), CONN_PRIORITY_HIGH);
-    } else if (getName().find("xdcr") != std::string::npos) {
-        engine_.setDCPPriority(getCookie(), CONN_PRIORITY_MED);
-    } else if (getName().find("views") != std::string::npos) {
-        engine_.setDCPPriority(getCookie(), CONN_PRIORITY_MED);
-    }
+    engine_.setDCPPriority(getCookie(), CONN_PRIORITY_MED);
+    priority.assign("medium");
 
     // The consumer assigns opaques starting at 0 so lets have the producer
     //start using opaques at 10M to prevent any opaque conflicts.
@@ -78,12 +74,19 @@ DcpProducer::DcpProducer(EventuallyPersistentEngine &e, const void *cookie,
     noopCtx.noopInterval = defaultNoopInerval;
     noopCtx.pendingRecv = false;
     noopCtx.enabled = false;
+
+    enableExtMetaData = false;
+
+    backfillMgr = new BackfillManager(&engine_, this);
 }
 
 DcpProducer::~DcpProducer() {
     if (log) {
         delete log;
     }
+
+    delete rejectResp;
+    delete backfillMgr;
 }
 
 ENGINE_ERROR_CODE DcpProducer::streamRequest(uint32_t flags,
@@ -265,21 +268,43 @@ ENGINE_ERROR_CODE DcpProducer::step(struct dcp_message_producers* producers) {
         case DCP_MUTATION:
         {
             MutationResponse *m = dynamic_cast<MutationResponse*> (resp);
-            ret = producers->mutation(getCookie(), m->getOpaque(), itmCpy,
-                                      m->getVBucket(), m->getBySeqno(),
-                                      m->getRevSeqno(), 0, NULL, 0,
-                                      m->getItem()->getNRUValue());
+            if (m->getExtMetaData()) {
+                std::pair<const char*, uint16_t> meta = m->getExtMetaData()->getExtMeta();
+                ret = producers->mutation(getCookie(), m->getOpaque(), itmCpy,
+                                          m->getVBucket(), m->getBySeqno(),
+                                          m->getRevSeqno(), 0,
+                                          meta.first, meta.second,
+                                          m->getItem()->getNRUValue());
+            } else {
+                ret = producers->mutation(getCookie(), m->getOpaque(), itmCpy,
+                                          m->getVBucket(), m->getBySeqno(),
+                                          m->getRevSeqno(), 0,
+                                          NULL, 0,
+                                          m->getItem()->getNRUValue());
+            }
             break;
         }
         case DCP_DELETION:
         {
             MutationResponse *m = static_cast<MutationResponse*>(resp);
-            ret = producers->deletion(getCookie(), m->getOpaque(),
-                                      m->getItem()->getKey().c_str(),
-                                      m->getItem()->getNKey(),
-                                      m->getItem()->getCas(),
-                                      m->getVBucket(), m->getBySeqno(),
-                                      m->getRevSeqno(), NULL, 0);
+            if (m->getExtMetaData()) {
+                std::pair<const char*, uint16_t> meta = m->getExtMetaData()->getExtMeta();
+                ret = producers->deletion(getCookie(), m->getOpaque(),
+                                          m->getItem()->getKey().c_str(),
+                                          m->getItem()->getNKey(),
+                                          m->getItem()->getCas(),
+                                          m->getVBucket(), m->getBySeqno(),
+                                          m->getRevSeqno(),
+                                          meta.first, meta.second);
+            } else {
+                ret = producers->deletion(getCookie(), m->getOpaque(),
+                                          m->getItem()->getKey().c_str(),
+                                          m->getItem()->getNKey(),
+                                          m->getItem()->getCas(),
+                                          m->getVBucket(), m->getBySeqno(),
+                                          m->getRevSeqno(),
+                                          NULL, 0);
+            }
             break;
         }
         case DCP_SNAPSHOT_MARKER:
@@ -353,10 +378,17 @@ ENGINE_ERROR_CODE DcpProducer::control(uint32_t opaque, const void* key,
     if (strncmp(param, "connection_buffer_size", nkey) == 0) {
         uint32_t size;
         if (parseUint32(valueStr.c_str(), &size)) {
-            if (!log) {
+            /* Size 0 implies the client (DCP consumer) does not support
+               flow control */
+            if (!log && size) {
                 log = new BufferLog(size);
-            } else if (log->getBufferSize() != size) {
-                log->setBufferSize(size);
+            } else if (log && log->getBufferSize() != size) {
+                if (size) {
+                    log->setBufferSize(size);
+                } else {
+                    delete log;
+                    log = NULL;
+                }
             }
             return ENGINE_SUCCESS;
         }
@@ -371,8 +403,29 @@ ENGINE_ERROR_CODE DcpProducer::control(uint32_t opaque, const void* key,
             noopCtx.enabled = false;
         }
         return ENGINE_SUCCESS;
+    } else if (strncmp(param, "enable_ext_metadata", nkey) == 0) {
+        if (valueStr.compare("true") == 0) {
+            enableExtMetaData = true;
+        } else {
+            enableExtMetaData = false;
+        }
+        return ENGINE_SUCCESS;
     } else if (strncmp(param, "set_noop_interval", nkey) == 0) {
         if (parseUint32(valueStr.c_str(), &noopCtx.noopInterval)) {
+            return ENGINE_SUCCESS;
+        }
+    } else if(strncmp(param, "set_priority", nkey) == 0) {
+        if (valueStr.compare("high") == 0) {
+            engine_.setDCPPriority(getCookie(), CONN_PRIORITY_HIGH);
+            priority.assign("high");
+            return ENGINE_SUCCESS;
+        } else if (valueStr.compare("medium") == 0) {
+            engine_.setDCPPriority(getCookie(), CONN_PRIORITY_MED);
+            priority.assign("medium");
+            return ENGINE_SUCCESS;
+        } else if (valueStr.compare("low") == 0) {
+            engine_.setDCPPriority(getCookie(), CONN_PRIORITY_LOW);
+            priority.assign("low");
             return ENGINE_SUCCESS;
         }
     }
@@ -484,6 +537,13 @@ void DcpProducer::addStats(ADD_STAT add_stat, const void *c) {
     addStat("last_sent_time", lastSendTime, add_stat, c);
     addStat("noop_enabled", noopCtx.enabled, add_stat, c);
     addStat("noop_wait", noopCtx.pendingRecv, add_stat, c);
+    addStat("priority", priority.c_str(), add_stat, c);
+    addStat("enable_ext_metadata", enableExtMetaData ? "enabled" : "disabled",
+            add_stat, c);
+
+    if (backfillMgr) {
+        backfillMgr->addStats(this, add_stat, c);
+    }
 
     if (log) {
         addStat("max_buffer_bytes", log->getBufferSize(), add_stat, c);
@@ -644,6 +704,7 @@ void DcpProducer::setDisconnect(bool disconnect) {
 
 void DcpProducer::notifyStreamReady(uint16_t vbucket, bool schedule) {
     LockHolder lh(queueLock);
+    bool notifyPausedConnection = false;
 
     std::list<uint16_t>::iterator iter =
         std::find(ready.begin(), ready.end(), vbucket);
@@ -652,9 +713,13 @@ void DcpProducer::notifyStreamReady(uint16_t vbucket, bool schedule) {
     }
 
     ready.push_back(vbucket);
-    lh.unlock();
 
     if (!log || (log && !log->isFull())) {
+        notifyPausedConnection = true;
+    }
+    lh.unlock();
+
+    if (notifyPausedConnection) {
         engine_.getDcpConnMap().notifyPausedConnection(this, schedule);
     }
 }

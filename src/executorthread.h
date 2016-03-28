@@ -64,6 +64,7 @@ public:
           state(EXECUTOR_CREATING), taskStart(0),
           currentTask(NULL), curTaskType(NO_TASK_TYPE),
           tasklog(TASK_LOG_SIZE), slowjobs(TASK_LOG_SIZE) {
+              gettimeofday(&now, NULL);
               set_max_tv(waketime);
     }
 
@@ -123,7 +124,7 @@ private:
     ExecutorPool *manager;
     int startIndex;
     const std::string name;
-    volatile executor_state_t state;
+    AtomicValue<executor_state_t> state;
 
     struct  timeval    now;  // record of current time
     struct timeval waketime; // set to the earliest

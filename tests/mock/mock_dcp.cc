@@ -39,7 +39,7 @@ uint64_t dcp_last_snap_start_seqno;
 uint64_t dcp_last_snap_end_seqno;
 uint64_t dcp_last_byseqno;
 uint64_t dcp_last_revseqno;
-const void *dcp_last_meta;
+void* dcp_last_meta;
 uint16_t dcp_last_nmeta;
 std::string dcp_last_key;
 vbucket_state_t dcp_last_vbucket_state;
@@ -180,10 +180,12 @@ static ENGINE_ERROR_CODE mock_mutation(const void* cookie,
     dcp_last_byseqno = by_seqno;
     dcp_last_revseqno = rev_seqno;
     dcp_last_locktime = lock_time;
-    dcp_last_meta = meta;
+    dcp_last_meta = malloc(sizeof(uint8_t) * nmeta);
+    memcpy(dcp_last_meta, meta, nmeta);
     dcp_last_nmeta = nmeta;
     dcp_last_nru = nru;
-    dcp_last_packet_size = 55 + dcp_last_key.length() + item->getValMemSize();
+    dcp_last_packet_size = 55 + dcp_last_key.length() +
+                           item->getNBytes() + nmeta;
     return ENGINE_SUCCESS;
 }
 
@@ -206,9 +208,10 @@ static ENGINE_ERROR_CODE mock_deletion(const void* cookie,
     dcp_last_vbucket = vbucket;
     dcp_last_byseqno = by_seqno;
     dcp_last_revseqno = rev_seqno;
-    dcp_last_meta = meta;
+    dcp_last_meta = malloc(sizeof(uint8_t) * nmeta);
+    memcpy(dcp_last_meta, meta, nmeta);
     dcp_last_nmeta = nmeta;
-    dcp_last_packet_size = 42 + nkey;
+    dcp_last_packet_size = 42 + nkey + nmeta;
     return ENGINE_SUCCESS;
 }
 
@@ -230,8 +233,8 @@ static ENGINE_ERROR_CODE mock_expiration(const void* cookie,
     (void) vbucket;
     (void) by_seqno;
     (void) rev_seqno;
-    (void)meta;
-    (void)nmeta;
+    (void) meta;
+    (void) nmeta;
     clear_dcp_data();
     return ENGINE_ENOTSUP;
 }
@@ -312,6 +315,7 @@ void clear_dcp_data() {
     dcp_last_vbucket_uuid = 0;
     dcp_last_snap_start_seqno = 0;
     dcp_last_snap_end_seqno = 0;
+    free(dcp_last_meta);
     dcp_last_meta = NULL;
     dcp_last_nmeta = 0;
     dcp_last_key.clear();

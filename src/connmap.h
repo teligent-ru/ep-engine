@@ -230,7 +230,8 @@ protected:
 class ConnNotifier {
 public:
     ConnNotifier(conn_notifier_type ntype, ConnMap &cm)
-        : notifier_type(ntype), connMap(cm), pendingNotification(false)  { }
+        : notifier_type(ntype), connMap(cm), task(0),
+          pendingNotification(false)  { }
 
     void start();
 
@@ -251,7 +252,7 @@ private:
 
     conn_notifier_type notifier_type;
     ConnMap &connMap;
-    size_t task;
+    AtomicValue<size_t> task;
     AtomicValue<bool> pendingNotification;
 };
 
@@ -445,6 +446,8 @@ public:
 
     void notifyVBConnections(uint16_t vbid, uint64_t bySeqno);
 
+    void notifyBackfillManagerTasks();
+
     void removeVBConnections(connection_t &conn);
 
     void vbucketStateChanged(uint16_t vbucket, vbucket_state_t state);
@@ -455,6 +458,35 @@ public:
 
     void manageConnections();
 
+    bool canAddBackfillToActiveQ();
+
+    void decrNumActiveSnoozingBackfills();
+
+    void updateMaxActiveSnoozingBackfills(size_t maxDataSize);
+
+    uint16_t getNumActiveSnoozingBackfills () const {
+        return numActiveSnoozingBackfills;
+    }
+
+    uint16_t getMaxActiveSnoozingBackfills () const {
+        return maxActiveSnoozingBackfills;
+    }
+
+    size_t getAggrDcpConsumerBufferSize () const {
+        return aggrDcpConsumerBufferSize.load();
+    }
+
+    void incAggrDcpConsumerBufferSize (size_t bufSize) {
+        aggrDcpConsumerBufferSize.fetch_add(bufSize);
+    }
+
+    void decAggrDcpConsumerBufferSize (size_t bufSize) {
+        aggrDcpConsumerBufferSize.fetch_sub(bufSize);
+    }
+
+    ENGINE_ERROR_CODE addPassiveStream(ConnHandler* conn, uint32_t opaque,
+                                       uint16_t vbucket, uint32_t flags);
+
 private:
 
     void disconnect_UNLOCKED(const void *cookie);
@@ -462,6 +494,18 @@ private:
     void closeAllStreams_UNLOCKED();
 
     std::list<connection_t> deadConnections;
+
+    SpinLock numBackfillsLock;
+    /* Db file memory */
+    static const uint32_t dbFileMem;
+    uint16_t numActiveSnoozingBackfills;
+    uint16_t maxActiveSnoozingBackfills;
+    /* Max num of backfills we want to have irrespective of memory */
+    static const uint16_t numBackfillsThreshold;
+    /* Max percentage of memory we want backfills to occupy */
+    static const uint8_t numBackfillsMemThreshold;
+    /* Total memory used by all DCP consumer buffers */
+    AtomicValue<size_t> aggrDcpConsumerBufferSize;
 };
 
 

@@ -20,6 +20,10 @@
 
 #include "config.h"
 
+#include "atomic.h"
+#include "vbucket.h"
+#include "ext_meta_parser.h"
+
 #include <queue>
 
 class EventuallyPersistentEngine;
@@ -68,6 +72,11 @@ typedef enum {
     more_to_process,
     cannot_process
 } process_items_error_t;
+
+typedef enum {
+    BACKFILL_FROM_MEMORY,
+    BACKFILL_FROM_DISK
+} backfill_source_t;
 
 class Stream : public RCValue {
 public:
@@ -121,6 +130,14 @@ protected:
 
     void clear_UNLOCKED();
 
+    /* To be called after getting streamMutex lock */
+    void pushToReadyQ(DcpResponse* resp);
+
+    /* To be called after getting streamMutex lock */
+    void popFromReadyQ(void);
+
+    uint64_t getReadyQueueMemory(void);
+
     const std::string &name_;
     uint32_t flags_;
     uint32_t opaque_;
@@ -133,11 +150,15 @@ protected:
     stream_state_t state_;
     stream_type_t type_;
 
-    bool itemsReady;
+    AtomicValue<bool> itemsReady;
     Mutex streamMutex;
     std::queue<DcpResponse*> readyQ;
 
     const static uint64_t dcpMaxSeqno;
+
+private:
+    /* This tracks the memory occupied by elements in the readyQ */
+    uint64_t readyQueueMemory;
 };
 
 class ActiveStream : public Stream {
@@ -148,11 +169,7 @@ public:
                  uint64_t vb_uuid, uint64_t snap_start_seqno,
                  uint64_t snap_end_seqno);
 
-    ~ActiveStream() {
-        LockHolder lh(streamMutex);
-        transitionState(STREAM_DEAD);
-        clear_UNLOCKED();
-    }
+    ~ActiveStream();
 
     DcpResponse* next();
 
@@ -177,7 +194,7 @@ public:
 
     void markDiskSnapshot(uint64_t startSeqno, uint64_t endSeqno);
 
-    void backfillReceived(Item* itm);
+    bool backfillReceived(Item* itm, backfill_source_t backfill_source);
 
     void completeBackfill();
 
@@ -186,6 +203,8 @@ public:
     void addTakeoverStats(ADD_STAT add_stat, const void *c);
 
     size_t getItemsRemaining();
+
+    const char* logHeader();
 
 private:
 
@@ -211,6 +230,11 @@ private:
 
     void scheduleBackfill();
 
+    const char* getEndStreamStatusStr(end_stream_status_t status);
+
+    ExtendedMetaData* prepareExtendedMetaData(uint16_t vBucketId,
+                                              uint8_t conflictResMode);
+
     //! The last sequence number queued from disk or memory
     uint64_t lastReadSeqno;
     //! The last sequence number sent to the network layer
@@ -221,11 +245,14 @@ private:
     vbucket_state_t takeoverState;
     //! The amount of items remaining to be read from disk
     size_t backfillRemaining;
-
-    //! The amount of items that have been read from disk
-    size_t itemsFromBackfill;
-    //! The amount of items that have been read from memory
-    size_t itemsFromMemory;
+    //! Stats to track items read and sent from the backfill phase
+    struct {
+        AtomicValue<size_t> memory;
+        AtomicValue<size_t> disk;
+        AtomicValue<size_t> sent;
+    } backfillItems;
+    //! The amount of items that have been sent during the memory phase
+    size_t itemsFromMemoryPhase;
     //! Whether ot not this is the first snapshot marker sent
     bool firstMarkerSent;
 
@@ -234,6 +261,11 @@ private:
     EventuallyPersistentEngine* engine;
     DcpProducer* producer;
     bool isBackfillTaskRunning;
+
+    struct {
+        AtomicValue<uint32_t> bytes;
+        AtomicValue<uint32_t> items;
+    } bufferedBackfill;
 };
 
 class NotifierStream : public Stream {
@@ -294,13 +326,7 @@ private:
 
     ENGINE_ERROR_CODE processMutation(MutationResponse* mutation);
 
-    ENGINE_ERROR_CODE commitMutation(MutationResponse* mutation,
-                                     bool backfillPhase);
-
     ENGINE_ERROR_CODE processDeletion(MutationResponse* deletion);
-
-    ENGINE_ERROR_CODE commitDeletion(MutationResponse* deletion,
-                                     bool backfillPhase);
 
     void handleSnapshotEnd(RCPtr<VBucket>& vb, uint64_t byseqno);
 
@@ -320,7 +346,6 @@ private:
     uint64_t cur_snapshot_end;
     snapshot_type_t cur_snapshot_type;
     bool cur_snapshot_ack;
-    bool saveSnapshot;
 
     struct Buffer {
         Buffer() : bytes(0), items(0) {}

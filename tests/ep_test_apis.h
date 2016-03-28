@@ -27,6 +27,7 @@
 #include <string>
 
 #include "ep-engine/command_ids.h"
+#include "ext_meta_parser.h"
 #include "item.h"
 
 #ifdef __cplusplus
@@ -56,7 +57,10 @@ extern std::map<std::string, std::string> vals;
 extern uint32_t last_bodylen;
 extern uint64_t last_cas;
 extern uint8_t last_datatype;
+extern uint64_t last_uuid;
+extern uint64_t last_seqno;
 extern bool last_deleted_flag;
+extern uint8_t last_conflict_resolution_mode;
 extern ItemMetaData last_meta;
 
 extern uint8_t dcp_last_op;
@@ -77,6 +81,8 @@ extern uint64_t dcp_last_byseqno;
 extern uint64_t dcp_last_revseqno;
 extern uint64_t dcp_last_snap_start_seqno;
 extern uint64_t dcp_last_snap_end_seqno;
+extern uint16_t dcp_last_nmeta;
+extern void *dcp_last_meta;
 extern std::string dcp_last_key;
 extern vbucket_state_t dcp_last_vbucket_state;
 
@@ -93,7 +99,9 @@ protocol_binary_request_header* createPacket(uint8_t opcode,
                                              uint32_t keylen = 0,
                                              const char *val = NULL,
                                              uint32_t vallen = 0,
-                                             uint8_t datatype = 0x00);
+                                             uint8_t datatype = 0x00,
+                                             const char *meta = NULL,
+                                             uint16_t nmeta = 0);
 
 // Basic Operations
 ENGINE_ERROR_CODE del(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1, const char *key,
@@ -117,6 +125,8 @@ void get_replica(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1, const char* key,
                  uint16_t vb);
 void observe(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1,
              std::map<std::string, uint16_t> obskeys);
+void observe_seqno(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1, uint16_t vb_id ,
+                   uint64_t uuid);
 protocol_binary_request_header* prepare_get_replica(ENGINE_HANDLE *h,
                                                     ENGINE_HANDLE_V1 *h1,
                                                     vbucket_state_t state,
@@ -125,6 +135,10 @@ bool set_param(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1, protocol_binary_engine_pa
                const char *param, const char *val);
 bool set_vbucket_state(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1,
                        uint16_t vb, vbucket_state_t state);
+bool get_all_vb_seqnos(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1,
+                       vbucket_state_t state, const void *cookie);
+void verify_all_vb_seqnos(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1,
+                          int vb_start, int vb_end);
 void start_persistence(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1);
 void stop_persistence(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1);
 ENGINE_ERROR_CODE store(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1,
@@ -165,20 +179,29 @@ ENGINE_ERROR_CODE seqnoPersistence(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1,
 // Stats Operations
 int get_int_stat(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1, const char *statname,
                  const char *statkey = NULL);
+float get_float_stat(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1, const char *statname,
+                     const char *statkey = NULL);
 uint64_t get_ull_stat(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1, const char *statname,
-                      const char *statkey);
+                      const char *statkey = NULL);
 std::string get_str_stat(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1,
                          const char *statname, const char *statkey = NULL);
 void verify_curr_items(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1, int exp,
                        const char *msg);
 void wait_for_stat_change(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1,
                           const char *stat, int initial,
-                          const char *statkey = NULL);
+                          const char *statkey = NULL,
+                          const time_t wait_time = 60);
 void wait_for_stat_to_be(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1, const char *stat,
-                         int final, const char* stat_key = NULL);
+                         int final, const char* stat_key = NULL,
+                         const time_t wait_time = 60);
+void wait_for_stat_to_be_gte(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1,
+                             const char *stat, int final,
+                             const char* stat_key = NULL,
+                             const time_t wait_time = 60);
 void wait_for_str_stat_to_be(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1,
                              const char *stat, const char* final,
-                             const char* stat_key);
+                             const char* stat_key,
+                             const time_t wait_time = 60);
 bool wait_for_warmup_complete(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1);
 void wait_for_flusher_to_settle(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1);
 void wait_for_persisted_value(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1,
@@ -186,7 +209,7 @@ void wait_for_persisted_value(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1,
                               uint16_t vbucketId = 0);
 
 void wait_for_memory_usage_below(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1,
-                                 int mem_threshold);
+                                 int mem_threshold, const time_t wait_time = 60);
 
 // Tap Operations
 void changeVBFilter(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1, std::string name,
@@ -203,40 +226,55 @@ void compact_db(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1,
                 const uint8_t  drop_deletes);
 
 // XDCR Operations
+void set_drift_counter_state(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1,
+                             int64_t initialDrift, uint8_t timeSync);
 void add_with_meta(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1, const char *key,
                    const size_t keylen, const char *val, const size_t vallen,
                    const uint32_t vb, ItemMetaData *itemMeta,
-                   bool skipConflictResolution = false);
-bool get_meta(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1, const char* key);
+                   bool skipConflictResolution = false,
+                   uint8_t datatype = 0x00, bool includeExtMeta = false,
+                   int64_t adjusted_time = 0);
+bool get_meta(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1, const char* key,
+              bool reqExtMeta = false);
 void del_with_meta(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1, const char *key,
                    const size_t keylen, const uint32_t vb,
                    ItemMetaData *itemMeta, uint64_t cas_for_delete = 0,
-                   bool skipConflictResolution = false);
+                   bool skipConflictResolution = false,
+                   bool includeExtMeta = false,
+                   int64_t adjustedTime = 0, uint8_t conflictResMode = 0,
+                   const void *cookie = NULL);
 void set_with_meta(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1, const char *key,
                    const size_t keylen, const char *val, const size_t vallen,
                    const uint32_t vb, ItemMetaData *itemMeta,
                    uint64_t cas_for_set, bool skipConflictResolution = false,
-                   uint8_t datatype = 0x00);
+                   uint8_t datatype = 0x00, bool includeExtMeta = false,
+                   int64_t adjustedTime = 0, uint8_t conflictResMode = 0,
+                   const void *cookie = NULL);
 void return_meta(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1, const char *key,
                  const size_t keylen, const char *val, const size_t vallen,
                  const uint32_t vb, const uint64_t cas, const uint32_t flags,
                  const uint32_t exp, const uint32_t type,
-                 uint8_t datatype = 0x00);
+                 uint8_t datatype = 0x00, const void *cookie = NULL);
 void set_ret_meta(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1, const char *key,
                   const size_t keylen, const char *val, const size_t vallen,
                   const uint32_t vb, const uint64_t cas = 0,
                   const uint32_t flags = 0, const uint32_t exp = 0,
-                  uint8_t datatype = 0x00);
+                  uint8_t datatype = 0x00, const void *cookie = NULL);
 void add_ret_meta(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1, const char *key,
                   const size_t keylen, const char *val, const size_t vallen,
                   const uint32_t vb, const uint64_t cas = 0,
                   const uint32_t flags = 0, const uint32_t exp = 0,
-                  uint8_t datatype = 0x00);
+                  uint8_t datatype = 0x00, const void *cookie = NULL);
 void del_ret_meta(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1, const char *key,
                   const size_t keylen, const uint32_t vb,
-                  const uint64_t cas = 0);
+                  const uint64_t cas = 0, const void *cookie = NULL);
 
 // DCP Operations
 void dcp_step(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1, const void* cookie);
+
+void set_degraded_mode(ENGINE_HANDLE *h,
+                       ENGINE_HANDLE_V1 *h1,
+                       const void* cookie,
+                       bool enable);
 
 #endif  // TESTS_EP_TEST_APIS_H_

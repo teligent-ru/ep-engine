@@ -4,6 +4,7 @@ import time
 import sys
 
 import clitool
+import exceptions
 import mc_bin_client
 import memcacheConstants
 import sys
@@ -71,6 +72,8 @@ def set_param(mc, type, key, val):
         print 'set %s to %s' %(key, val)
     except mc_bin_client.MemcachedError, error:
         print 'Error: %s' % error.msg
+    except mc_bin_client.TimeoutError, error:
+        print error
     except Exception, e:
         print 'Generic error (%s)' % e
 
@@ -96,6 +99,8 @@ def stop(mc):
         print 'Persistence stopped'
     except mc_bin_client.MemcachedError, error:
         print 'Error: %s' % error.msg
+    except mc_bin_client.TimeoutError, error:
+        print error
     except Exception, e:
         print 'Generic error (%s)' % e
 
@@ -106,6 +111,8 @@ def start(mc):
         print 'Persistence started'
     except mc_bin_client.MemcachedError, error:
         print 'Error: %s' % error.msg
+    except mc_bin_client.TimeoutError, error:
+        print error
     except Exception, e:
         print 'Generic error (%s)' % e
 
@@ -123,6 +130,8 @@ def drain(mc):
         print 'Write queues drained'
     except mc_bin_client.MemcachedError, error:
         print 'Error: %s' % error.msg
+    except mc_bin_client.TimeoutError, error:
+        print error
     except Exception, e:
         print 'Generic error (%s)' % e
 
@@ -159,6 +168,10 @@ Available params for "set":
                                    before backfill task is made to back off.
     bg_fetch_delay               - Delay before executing a bg fetch (test
                                    feature).
+    bfilter_enabled              - Enable or disable bloom filters (true/false)
+    bfilter_residency_threshold  - Resident ratio threshold below which all items
+                                   will be considered in the bloom filters in full
+                                   eviction policy (0.0 - 1.0)
     compaction_exp_mem_threshold - Memory threshold (%) on the current bucket quota
                                    after which compaction will not queue expired
                                    items for deletion.
@@ -168,12 +181,26 @@ Available params for "set":
     exp_pager_stime              - Expiry Pager Sleeptime.
     expiry_host                  - Expiration UDP messages are sent to
     expiry_port                  - expiry_host:expiry_port, if both are defined.
+    defragmenter_enabled         - Enable or disable the defragmenter
+                                   (true/false).
+    defragmenter_interval        - How often defragmenter task should be run
+                                   (in seconds).
+    defragmenter_age_threshold   - How old (measured in number of defragmenter
+                                   passes) must a document be to be considered
+                                   for degragmentation.
+    defragmenter_chunk_duration  - Maximum time (in ms) defragmentation task
+                                   will run for before being paused (and
+                                   resumed at the next defragmenter_interval).
+    exp_pager_stime              - Expiry Pager Sleeptime (if value is 0, expiry_pager
+                                   will be disabled)
     flushall_enabled             - Enable flush operation.
     pager_active_vb_pcnt         - Percentage of active vbuckets items among
                                    all ejected items by item pager.
     max_size                     - Max memory used by the server.
-    mem_high_wat                 - High water mark.
-    mem_low_wat                  - Low water mark.
+    mem_high_wat                 - High water mark (suffix with '%' to make it a
+                                   percentage of the RAM quota)
+    mem_low_wat                  - Low water mark. (suffix with '%' to make it a
+                                   percentage of the RAM quota)
     mutation_mem_threshold       - Memory threshold (%) on the current bucket quota
                                    for accepting a new mutation.
     timing_log                   - path to log detailed timing stats.
