@@ -64,18 +64,18 @@ yum install cmake snappy-devel.x86_64 libicu-devel.x86_64  openssl-devel.x86_64 
 
 ~~~
 
-установить couchbase-server-4.0.0 
+установить couchbase-server-4.1.0 
 ---------------------------------
 
 (из него возьмутся libv8.so и libcouchstore.so, которые собирать заморочно, а без них не собирается ep.so)
 
 RHEL6
 -----
-http://autobuild.teligent.ru/kickstarts/3RD_PARTY/couchbase/RHEL6/x86_64/couchbase-server-community-3.0.1-centos6.x86_64.rpm
+http://autobuild.teligent.ru/kickstarts/3RD_PARTY/couchbase/RHEL6/x86_64/couchbase-server-community-4.1.0-centos6.x86_64.rpm
 
 RHEL7
 ----
-http://autobuild.teligent.ru/kickstarts/3RD_PARTY/couchbase/RHEL7/x86_64/couchbase-server-community-4.0.0-centos7.x86_64.rpm
+http://autobuild.teligent.ru/kickstarts/3RD_PARTY/couchbase/RHEL7/x86_64/couchbase-server-community-4.1.0-centos7.x86_64.rpm
 
 выкачать исходники
 -------------------------------
@@ -105,7 +105,7 @@ g ssh://git@github.com/teligent-ru ep-engine 4.1.0.teligent.7
 g ssh://git@github.com/teligent-ru platform 4.1.0.teligent.7
 g ssh://git@github.com/teligent-ru tlm 4.1.0.teligent.7
 \cp -p tlm/{GNUmakefile,Makefile,CMakeLists.txt} .
-g git://github.com/couchbase v8 05120013843918f7e3712159c03b509d3e328cf7 #нет в manifest 4.1.0, TODO понять
+g git://github.com/couchbase v8 05120013843918f7e3712159c03b509d3e328cf7 #нет в manifest 4.1.0, пока оставил, неясно, как так
 g git://github.com/couchbase memcached 7d88d0bba08f07c667ef167f79d3a81dc5f5a825
 g git://github.com/couchbase couchstore 7d6bc22a15b80f1da6dd169a3e538e985db1b91a
 ~~~
@@ -152,6 +152,7 @@ INCLUDE_DIRECTORIES(BEFORE ${CMAKE_INSTALL_PREFIX}/include
 --------------------------------------------------------------------------
 
 ~~~
+#(было лень переименовывать папку, не обращайте внимания)
 [root@rualpe-vm1 couchbase.4.0.0.RHEL7]#  make PREFIX=/opt/couchbase CMAKE_PREFIX_PATH=/opt/couchbase EXTRA_CMAKE_OPTIONS='-D CMAKE_BUILD_TYPE=RelWithDebInfo'
 ...
 Install the project...
@@ -174,8 +175,8 @@ Install the project...
 
 ~~~
 os=7
-tar -czvf ~/couchbase-4.0.0-patch-to-4.1.0.teligent.7-centos$os.x86_64.tgz /opt/couchbase/lib/{memcached/ep.so,libcJSON*}
-scp ~/couchbase-4.0.0-patch-to-4.1.0.teligent.7-centos$os.x86_64.tgz  alexander.petrossian@gigant:/var/www/kickstarts/3RD_PARTY/couchbase/RHEL$os/x86_64/
+tar -czvf ~/couchbase-4.1.0-patch-to-4.1.0.teligent.7-centos$os.x86_64.tgz /opt/couchbase/lib/{memcached/ep.so,libcJSON*}
+scp ~/couchbase-4.1.0-patch-to-4.1.0.teligent.7-centos$os.x86_64.tgz  alexander.petrossian@gigant:/var/www/kickstarts/3RD_PARTY/couchbase/RHEL$os/x86_64/
 ~~~
 
 ссылка для скачивания
@@ -184,4 +185,4 @@ http://gigant.teligent.ru/kickstarts/3RD_PARTY/couchbase/RHEL7/x86_64/couchbase-
 
 установка патча
 ---------------
-tar vxzf ~/couchbase-4.0.0-patch-to-4.1.0.teligent.7-centos7.x86_64.tgz -C /
+tar vxzf ~/couchbase-4.1.0-patch-to-4.1.0.teligent.7-centos7.x86_64.tgz -C /
