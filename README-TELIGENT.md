@@ -181,7 +181,7 @@ scp ~/couchbase-4.1.0-patch-to-4.1.0.teligent.7-centos$os.x86_64.tgz  alexander.
 
 ссылка для скачивания
 ---------------------
-http://gigant.teligent.ru/kickstarts/3RD_PARTY/couchbase/RHEL7/x86_64/couchbase-4.0.0-patch-to-4.1.0.teligent.7-centos7.x86_64.tgz
+http://gigant.teligent.ru/kickstarts/3RD_PARTY/couchbase/RHEL7/x86_64/couchbase-4.1.0-patch-to-4.1.0.teligent.7-centos7.x86_64.tgz
 
 установка патча
 ---------------
