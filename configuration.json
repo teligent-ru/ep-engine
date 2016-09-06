@@ -202,6 +202,10 @@
             "descr": "True if memcached flush API is enabled",
             "type": "bool"
         },
+	"flusher_min_sleep_time": {
+	    "default": "0.00",
+	    "type": "float"
+	},
         "getl_default_timeout": {
             "default": "15",
             "descr": "The default timeout for a getl lock in (s)",

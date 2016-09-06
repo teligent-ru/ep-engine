@@ -194,6 +194,7 @@ Available params for "set":
     exp_pager_stime              - Expiry Pager Sleeptime (if value is 0, expiry_pager
                                    will be disabled)
     flushall_enabled             - Enable flush operation.
+    flusher_min_sleep_time       - Changes from dirty queue are flushed no faster than this
     pager_active_vb_pcnt         - Percentage of active vbuckets items among
                                    all ejected items by item pager.
     max_size                     - Max memory used by the server.

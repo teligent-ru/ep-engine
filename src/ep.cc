@@ -145,6 +145,9 @@ public:
         if (key.compare("bfilter_residency_threshold") == 0) {
             store.setBfiltersResidencyThreshold(value);
         }
+        if (key.compare("flusher_min_sleep_time") == 0) {
+            store.setFlusherMinSleepTime(value);
+        }
     }
 
     virtual void stringValueChanged(const std::string &key, const char* value) {
@@ -378,6 +381,12 @@ bool EventuallyPersistentStore::initialize() {
     size_t expiryPort = config.getExpiryPort();
     setExpiryPort(expiryPort);
     config.addValueChangedListener("expiry_port",
+                                   new EPStoreValueChangeListener(*this));
+
+
+    float flusherMinSleepTime = config.getFlusherMinSleepTime();
+    setFlusherMinSleepTime(flusherMinSleepTime);
+    config.addValueChangedListener("flusher_min_sleep_time",
                                    new EPStoreValueChangeListener(*this));
 
     ExTask htrTask = new HashtableResizerTask(this, 10);
@@ -3421,6 +3430,13 @@ void EventuallyPersistentStore::setExpiryPort(size_t val) {
 
     expiryPager.port = static_cast<int>(val);
     expiryPager.channel.open(expiryPager.host, expiryPager.port);
+}
+
+void EventuallyPersistentStore::setFlusherMinSleepTime(float val) {
+    for (uint16_t i = 0; i < vbMap.numShards; ++i) {
+        Flusher *flusher = vbMap.shards[i]->getFlusher();
+        flusher->setMinSleepTime(val);
+    }
 }
 
 void EventuallyPersistentStore::enableAccessScannerTask() {

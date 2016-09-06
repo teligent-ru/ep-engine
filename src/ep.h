@@ -717,6 +717,8 @@ public:
     void setExpiryPagerSleeptime(size_t val);
     void setExpiryHost(std::string val);
     void setExpiryPort(size_t val);
+    void setFlusherMinSleepTime(float val);
+
 
     void enableAccessScannerTask();
     void disableAccessScannerTask();

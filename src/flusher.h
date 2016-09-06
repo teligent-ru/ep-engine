@@ -44,9 +44,6 @@ enum flusher_state {
 
 class Flusher;
 
-const double DEFAULT_MIN_SLEEP_TIME = MIN_SLEEP_TIME;
-const double DEFAULT_MAX_SLEEP_TIME = 10.0;
-
 class KVShard;
 
 /**
@@ -90,13 +87,14 @@ public:
         }
     }
     void setTaskId(size_t newId) { taskId = newId; }
+    void setMinSleepTime(double val);
 
 private:
     bool transition_state(enum flusher_state to);
     void flushVB();
     void completeFlush();
     void schedule_UNLOCKED();
-    double computeMinSleepTime();
+    double getMinSleepTime();
 
     const char * stateName(enum flusher_state st) const;
 

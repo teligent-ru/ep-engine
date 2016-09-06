@@ -174,7 +174,7 @@ bool Flusher::step(GlobalTask *task) {
             {
                 flushVB();
                 if (_state == running) {
-                    double tosleep = computeMinSleepTime();
+                    double tosleep = getMinSleepTime();
                     if (tosleep > 0) {
                         task->snooze(tosleep);
                     }
@@ -221,13 +221,12 @@ void Flusher::completeFlush() {
     }
 }
 
-double Flusher::computeMinSleepTime() {
-    if (!canSnooze() || shard->highPriorityCount.load() > 0) {
-        minSleepTime = DEFAULT_MIN_SLEEP_TIME;
-        return 0;
-    }
-    minSleepTime *= 2;
-    return std::min(minSleepTime, DEFAULT_MAX_SLEEP_TIME);
+void Flusher::setMinSleepTime(double val) {
+    minSleepTime = val;
+}
+
+double Flusher::getMinSleepTime() {
+    return minSleepTime;
 }
 
 void Flusher::flushVB(void) {

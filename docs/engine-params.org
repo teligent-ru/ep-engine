@@ -110,6 +110,8 @@ memcached like this:
 |                             |        | throttle queue cap.                        |
 | flushall_enabled            | bool   | True if we enable flush_all command; The   |
 |                             |        | default value is False.                    |
+| flusher_min_sleep_time      | float  | Changes from dirty queue are flushed no    |
+|                             |        | faster than this                           |
 | data_traffic_enabled        | bool   | True if we want to enable data traffic     |
 |                             |        | immediately after warmup completion        |
 | access_scanner_enabled      | bool   | True if access scanner task is enabled     |
