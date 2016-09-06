@@ -110,7 +110,7 @@ g git://github.com/couchbase couchstore dfab1c7a10c469a1bd09e01317ad49d90ac030a9
 ~~~
 
 Уберите механизмы сборки memcached и couchstore, сами по себе эти модули не нужны. Нужны только их заголовочные файлы:
-
+~~~
 [root@rualpe-vm1 couchbase.4.0.0.RHEL7]# cat memcached/CMakeLists.txt
 PROJECT(Memcached)
 CMAKE_MINIMUM_REQUIRED(VERSION 2.8)
@@ -145,7 +145,7 @@ INCLUDE_DIRECTORIES(BEFORE ${CMAKE_INSTALL_PREFIX}/include
                            ${Platform_SOURCE_DIR}/include)
 
 [root@rualpe-vm1 couchbase.4.0.0.RHEL7]#
-
+~~~
 
 запустить общую сборку, среди прочего получится ep.so, libcJSON
 --------------------------------------------------------------------------
@@ -173,14 +173,14 @@ Install the project...
 
 ~~~
 os=7
-tar -czvf ~/couchbase-4.0.0-patch-to-4.0.0.teligent.5-centos$os.x86_64.tgz /opt/couchbase/lib/{memcached/ep.so,libcJSON*}
-scp ~/couchbase-4.0.0-patch-to-4.0.0.teligent.5-centos$os.x86_64.tgz  alexander.petrossian@gigant:/var/www/kickstarts/3RD_PARTY/couchbase/RHEL$os/x86_64/
+tar -czvf ~/couchbase-4.0.0-patch-to-4.0.0.teligent.6-centos$os.x86_64.tgz /opt/couchbase/lib/{memcached/ep.so,libcJSON*}
+scp ~/couchbase-4.0.0-patch-to-4.0.0.teligent.6-centos$os.x86_64.tgz  alexander.petrossian@gigant:/var/www/kickstarts/3RD_PARTY/couchbase/RHEL$os/x86_64/
 ~~~
 
 ссылка для скачивания
 ---------------------
-http://gigant.teligent.ru/kickstarts/3RD_PARTY/couchbase/RHEL7/x86_64/couchbase-4.0.0-patch-to-4.0.0.teligent.5-centos7.x86_64.tgz
+http://gigant.teligent.ru/kickstarts/3RD_PARTY/couchbase/RHEL7/x86_64/couchbase-4.0.0-patch-to-4.0.0.teligent.6-centos7.x86_64.tgz
 
 установка патча
 ---------------
-tar vxzf ~/couchbase-4.0.0-patch-to-4.0.0.teligent.5-centos7.x86_64.tgz -C /
+tar vxzf ~/couchbase-4.0.0-patch-to-4.0.0.teligent.6-centos7.x86_64.tgz -C /
