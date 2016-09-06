@@ -24,10 +24,10 @@
 #include <set>
 #include <string>
 
-#include "common.h"
 #include "item.h"
 #include "kvstore.h"
 #include "stats.h"
+#include "vbucket.h"
 
 // Forward declarations.
 class EventuallyPersistentStore;
@@ -42,10 +42,11 @@ class BgFetcher {
 public:
     static const double sleepInterval;
     /**
-     * Construct a BgFetcher task.
+     * Construct a BgFetcher
      *
-     * @param s the store
-     * @param d the dispatcher
+     * @param s  The store
+     * @param k  The shard to which this background fetcher belongs
+     * @param st reference to statistics
      */
     BgFetcher(EventuallyPersistentStore *s, KVShard *k, EPStats &st) :
         store(s), shard(k), taskId(0), stats(st), pendingFetch(false) {}
@@ -53,7 +54,7 @@ public:
         LockHolder lh(queueMutex);
         if (!pendingVbs.empty()) {
             LOG(EXTENSION_LOG_DEBUG,
-                    "Warning: terminating database reader without completing "
+                    "Terminating database reader without completing "
                     "background fetches for %ld vbuckets.\n", pendingVbs.size());
             pendingVbs.clear();
         }
@@ -62,27 +63,26 @@ public:
     void start(void);
     void stop(void);
     bool run(GlobalTask *task);
-    bool pendingJob(void);
+    bool pendingJob(void) const;
     void notifyBGEvent(void);
     void setTaskId(size_t newId) { taskId = newId; }
-    void addPendingVB(uint16_t vbId) {
+    void addPendingVB(VBucket::id_type vbId) {
         LockHolder lh(queueMutex);
         pendingVbs.insert(vbId);
     }
 
 private:
-    size_t doFetch(uint16_t vbId);
-    void clearItems(uint16_t vbId);
+    size_t doFetch(VBucket::id_type vbId, vb_bgfetch_queue_t& items);
+    void clearItems(VBucket::id_type vbId, const vb_bgfetch_queue_t& items);
 
     EventuallyPersistentStore *store;
     KVShard *shard;
-    vb_bgfetch_queue_t items2fetch;
     size_t taskId;
-    Mutex queueMutex;
+    std::mutex queueMutex;
     EPStats &stats;
 
-    AtomicValue<bool> pendingFetch;
-    std::set<uint16_t> pendingVbs;
+    std::atomic<bool> pendingFetch;
+    std::set<VBucket::id_type> pendingVbs;
 };
 
 #endif  // SRC_BGFETCHER_H_

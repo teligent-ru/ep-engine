@@ -1,6 +1,6 @@
 /* -*- Mode: C++; tab-width: 4; c-basic-offset: 4; indent-tabs-mode: nil -*- */
 /*
- *     Copyright 2010 Couchbase, Inc
+ *     Copyright 2016 Couchbase, Inc
  *
  *   Licensed under the Apache License, Version 2.0 (the "License");
  *   you may not use this file except in compliance with the License.
@@ -15,20 +15,14 @@
  *   limitations under the License.
  */
 
-#include "config.h"
+#include "string_utils.h"
 
-#include "priority.h"
-#undef NDEBUG
-
-int main(int argc, char **argv) {
-   (void)argc; (void)argv;
-
-   cb_assert(Priority::BgFetcherPriority > Priority::TapBgFetcherPriority);
-   cb_assert(Priority::TapBgFetcherPriority == Priority::VBucketDeletionPriority);
-   cb_assert(Priority::VBucketPersistHighPriority > Priority::VKeyStatBgFetcherPriority);
-   cb_assert(Priority::VKeyStatBgFetcherPriority > Priority::FlusherPriority);
-   cb_assert(Priority::FlusherPriority > Priority::ItemPagerPriority);
-   cb_assert(Priority::ItemPagerPriority > Priority::BackfillTaskPriority);
-
-   return 0;
+bool cb_stob(const std::string& s) {
+    if (s == "true") {
+        return true;
+    } else if (s == "false") {
+        return false;
+    } else {
+        throw invalid_argument_bool("Argument was not `true` or `false`");
+    }
 }

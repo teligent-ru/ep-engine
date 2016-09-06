@@ -1,6 +1,6 @@
 /* -*- Mode: C++; tab-width: 4; c-basic-offset: 4; indent-tabs-mode: nil -*- */
 /*
- *     Copyright 2010 Couchbase, Inc
+ *     Copyright 2015 Couchbase, Inc
  *
  *   Licensed under the Apache License, Version 2.0 (the "License");
  *   you may not use this file except in compliance with the License.
@@ -19,77 +19,46 @@
 #define SRC_SYNCOBJECT_H_ 1
 
 #include "config.h"
-#include "common.h"
-#include "time.h"
+
+#include "utility.h"
+
+#include <condition_variable>
 
 /**
- * Abstraction built on top our own condition variable implemntation
+ * Abstraction built on top of std::condition_variable & std::mutex
  */
-class SyncObject : public Mutex {
+class SyncObject : public std::mutex {
 public:
-    SyncObject() : Mutex() {
-        cb_cond_initialize(&cond);
+    SyncObject() {
     }
 
     ~SyncObject() {
-        cb_cond_destroy(&cond);
     }
 
-    void wait() {
-        cb_cond_wait(&cond, &mutex);
-        setHolder(true);
+    void wait(std::unique_lock<std::mutex>& lock) {
+        cond.wait(lock);
     }
 
-    void wait(const struct timeval &tv) {
-        // Todo:
-        //   This logic is a bit weird, because normally we want to
-        //   sleep for a certain amount of time, but since we built
-        //   the stuff on pthreads and the API looked like it did we
-        //   used the absolute timers making us sleep to a certain
-        //   point in the future.. now we need to roll back that work
-        //   and do it again in the library API...
-        //   I believe we should rather try to modify our own code
-        //   to only do relative waits, and then have the native
-        //   calls do the either absolute or relative checks.
-        //
-        //   There is no point of having an explicit return
-        //   value if it was a timeout or something else, because
-        //   you would have to evaluate the reason you waited anyway
-        //   (because one could have spurious wakeups etc)
-        struct timeval now;
-        gettimeofday(&now, NULL);
-
-        if (tv.tv_sec < now.tv_sec) {
-            return ;
-        }
-
-        uint64_t a = (now.tv_sec * 1000) + (now.tv_usec / 1000);
-        uint64_t b = (tv.tv_sec * 1000) + (tv.tv_usec / 1000);
-
-        if (b < a) {
-            // Already expired
-            return ;
-        }
-
-        cb_cond_timedwait(&cond, &mutex, (int)(b - a));
-        setHolder(true);
+    void wait_for(std::unique_lock<std::mutex>& lock,
+                  const double secs) {
+        cond.wait_for(lock, std::chrono::milliseconds(int64_t(secs * 1000.0)));
     }
 
-    void wait(const double secs) {
-        cb_cond_timedwait(&cond, &mutex, (unsigned int)(secs * 1000.0));
-        setHolder(true);
+    void wait_for(std::unique_lock<std::mutex>& lock,
+                  const hrtime_t nanoSecs) {
+        cond.wait_for(lock, std::chrono::nanoseconds(nanoSecs));
     }
 
-    void notify() {
-        cb_cond_broadcast(&cond);
+    void notify_all() {
+        cond.notify_all();
     }
 
-    void notifyOne() {
-        cb_cond_signal(&cond);
+    void notify_one() {
+        cond.notify_one();
     }
 
 private:
-    cb_cond_t cond;
+    std::condition_variable cond;
 
     DISALLOW_COPY_AND_ASSIGN(SyncObject);
 };

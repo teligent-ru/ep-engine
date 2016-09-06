@@ -1,10 +1,5 @@
 {
     "params": {
-        "allow_data_loss_during_shutdown": {
-            "default": "false",
-            "dynamic": false,
-            "type": "bool"
-        },
         "alog_block_size": {
             "default": "4096",
             "descr": "Logging block size.",
@@ -40,6 +35,18 @@
             "validator": {
                 "range": {
                     "max": 23,
+                    "min": 0
+                }
+            }
+        },
+        "alog_resident_ratio_threshold": {
+            "default": "95",
+            "desr": "Resident ratio percentage above which we do not generate access log",
+            "dynamic": false,
+            "type": "size_t",
+            "validator": {
+                "range": {
+                    "max": 100,
                     "min": 0
                 }
             }
@@ -84,7 +91,12 @@
         "bfilter_key_count": {
             "default": "10000",
             "desr": "Bloomfilter: Estimated key count per vbucket",
-            "type": "size_t"
+            "type": "size_t",
+            "validator": {
+                "range": {
+                    "min": 1
+                }
+            }
         },
         "bfilter_fp_prob": {
             "default": "0.01",
@@ -94,7 +106,13 @@
         "bfilter_residency_threshold": {
             "default": "0.1",
             "desr" : "If resident ratio (during full eviction) were found less than this threshold, compaction will include all items into bloomfilter",
-            "type" : "float"
+            "type" : "float",
+            "validator": {
+                "range": {
+                    "max": 1.0,
+                    "min": 0.0
+                }
+            }
         },
         "compaction_exp_mem_threshold": {
             "default": "85",
@@ -122,7 +140,12 @@
         "compaction_write_queue_cap": {
             "default": "10000",
             "desr" : "Disk write queue threshold after which compaction tasks will be made to snooze, if there are already pending compaction tasks",
-            "type" : "size_t"
+            "type" : "size_t",
+            "validator": {
+                "range": {
+                    "min": 1
+                }
+            }
         },
         "config_file": {
             "default": "",
@@ -144,13 +167,35 @@
             "dynamic": false,
             "type": "std::string"
         },
+        "cursor_dropping_lower_mark": {
+            "default": "80",
+            "descr": "Percentage of memQuota, below which checkpoint cursor dropping will not continue",
+            "type": "size_t",
+            "validator": {
+                "range": {
+                    "max": 100,
+                    "min": 0
+                }
+            }
+        },
+        "cursor_dropping_upper_mark": {
+            "default": "95",
+            "descr": "Percentage of memQuota, above which checkpoint cursor dropping will commence",
+            "type": "size_t",
+            "validator": {
+                "range": {
+                    "max": 100,
+                    "min": 0
+                }
+            }
+        },
         "data_traffic_enabled": {
             "default": "true",
             "descr": "True if we want to enable data traffic after warmup is complete",
             "type": "bool"
         },
         "dbname": {
-            "default": "/tmp/test",
+            "default": "./test",
             "descr": "Path to on-disk storage.",
             "dynamic": false,
             "type": "std::string"
@@ -173,16 +218,38 @@
         "defragmenter_chunk_duration": {
             "default": "20",
             "descr": "Maximum time (in ms) defragmentation task will run for before being paused (and resumed at the next defragmenter_interval).",
-            "type": "size_t"
+            "type": "size_t",
+            "validator": {
+                "range": {
+                    "min": 1
+                }
+            }
         },
         "enable_chk_merge": {
             "default": "false",
             "descr": "True if merging closed checkpoints is enabled",
             "type": "bool"
         },
+        "exp_pager_enabled": {
+            "default": "true",
+            "descr": "True if expiry pager task is enabled",
+            "type": "bool"
+        },
         "exp_pager_stime": {
             "default": "3600",
+            "descr": "Number of seconds between expiry pager runs.",
             "type": "size_t"
+        },
+        "exp_pager_initial_run_time": {
+            "default": "-1",
+            "descr": "Hour in GMT time when expiry pager can be scheduled for initial run",
+            "type": "ssize_t",
+            "validator": {
+                "range": {
+                    "max": 23,
+                    "min": -1
+                }
+            }
         },
         "failpartialwarmup": {
             "default": "true",
@@ -456,17 +523,66 @@
             "dynamic": false,
             "type": "size_t"
         },
+        "dcp_flow_control_policy": {
+            "default": "aggressive",
+            "descr": "Flow control policy used on consumer side buffer",
+            "type": "std::string",
+            "validator": {
+                "enum": [
+                         "none",
+                         "static",
+                         "dynamic",
+                         "aggressive"
+                        ]
+            }
+        },
         "dcp_conn_buffer_size": {
             "default": "10485760",
             "descr": "Size in bytes of an dcp consumer connection buffer",
             "dynamic": false,
             "type": "size_t"
         },
-        "dcp_enable_flow_control": {
-            "default": "true",
-            "descr": "Whether or not dcp connections should use flow control",
+        "dcp_conn_buffer_size_max": {
+            "default": "52428800",
+            "descr": "Max size in bytes of an dcp consumer connection buffer",
             "dynamic": false,
-            "type": "bool"
+            "type": "size_t"
+        },
+        "dcp_conn_buffer_size_perc": {
+            "default": "1",
+            "descr": "Percentage of memQuota for a dcp consumer connection buffer in dynamic flow ctl policy",
+            "type": "size_t",
+            "dynamic": false,
+            "validator": {
+                "range": {
+                    "max": 10,
+                    "min": 1
+                }
+            }
+        },
+        "dcp_conn_buffer_size_aggr_mem_threshold": {
+            "default": "10",
+            "descr": "Aggr mem usage by all dcp conns (as percentage of memQuota) after which only dcp_conn_buffer_size is allocated",
+            "type": "size_t",
+            "dynamic": false,
+            "validator": {
+                "range": {
+                    "max": 20,
+                    "min": 1
+                }
+            }
+        },
+        "dcp_conn_buffer_size_aggressive_perc": {
+            "default": "5",
+            "descr": "Percentage of memQuota for all dcp consumer connection buffers in aggressive flow ctl policy",
+            "type": "size_t",
+            "dynamic": false,
+            "validator": {
+                "range": {
+                    "max": 20,
+                    "min": 1
+                }
+            }
         },
         "dcp_enable_noop": {
             "default": "true",
@@ -474,10 +590,37 @@
             "dynamic": false,
             "type": "bool"
         },
-        "dcp_noop_interval": {
-            "default": "180",
-            "descr": "Number of seconds between a noop",
+        "dcp_value_compression_enabled": {
+            "default": "false",
+            "desr": "Whether or not dcp producer should compress value before transmitting",
+            "dynamic": false,
+            "type": "bool"
+        },
+        "dcp_min_compression_ratio": {
+            "default": "0.85",
+            "desr": "Compression ratio to be achieved above which producer will ship documents as is",
+            "type": "float",
+            "validator": {
+                "range": {
+                    "min": 0.0
+                }
+            }
+        },
+        "dcp_idle_timeout": {
+            "default": "360",
+            "descr": "The maximum number of seconds between dcp messages before a connection is disconnected",
             "type": "size_t"
+        },
+        "dcp_noop_tx_interval": {
+            "default": "1",
+            "descr": "The time interval in seconds between noop messages being sent to the consumer",
+            "type": "size_t",
+            "validator": {
+                "range": {
+                    "max" : 360,
+                    "min" : 1
+                }
+            }
         },
         "dcp_max_unacked_bytes": {
             "default": "524288",
@@ -496,6 +639,57 @@
             "descr": "Max items that can be read in a single disk scan",
             "dynamic": false,
             "type": "size_t"
+        },
+        "dcp_takeover_max_time": {
+            "default": "60",
+            "descr": "Max amount of time for takeover send (in seconds) after which front end ops would return ETMPFAIL",
+            "dynamic": false,
+            "type": "size_t"
+        },
+        "dcp_producer_snapshot_marker_yield_limit": {
+            "default": "10",
+            "descr": "The number of snapshots before ActiveStreamCheckpointProcessorTask::run yields.",
+            "type": "size_t",
+            "validator": {
+                "range": {
+                    "max": 100000000,
+                    "min": 1
+                }
+            }
+        },
+        "dcp_consumer_process_buffered_messages_yield_limit" : {
+            "default": "10",
+            "descr": "The number of processBufferedMessages iterations before forcing the task to yield.",
+            "type": "size_t",
+            "validator": {
+                "range": {
+                    "max": 100000000,
+                    "min": 1
+                }
+            }
+        },
+        "dcp_consumer_process_buffered_messages_batch_size" : {
+            "default": "10",
+            "descr": "The maximum number of items stream->processBufferedMessages will consume.",
+            "type": "size_t",
+            "validator": {
+                "range": {
+                    "max": 100000000,
+                    "min": 1
+                }
+            }
+        },
+        "time_synchronization": {
+            "default": "disabled",
+            "descr": "Time synchronization setting for XDCR Last Write Wins (LWW) conflict resolution",
+            "type": "std::string",
+            "validator": {
+                "enum": [
+                    "disabled",
+                    "enabled_without_drift",
+                    "enabled_with_drift"
+                ]
+            }
         },
         "vb0": {
             "default": "false",

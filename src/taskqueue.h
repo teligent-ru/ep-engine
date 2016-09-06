@@ -21,6 +21,7 @@
 
 #include <queue>
 
+#include "futurequeue.h"
 #include "ringbuffer.h"
 #include "task_type.h"
 #include "tasks.h"
@@ -35,7 +36,7 @@ public:
 
     void schedule(ExTask &task);
 
-    struct timeval reschedule(ExTask &task, task_type_t &curTaskType);
+    hrtime_t reschedule(ExTask &task);
 
     void checkPendingQueue(void);
 
@@ -57,15 +58,19 @@ public:
 
     size_t getPendingQueueSize();
 
+    void snooze(ExTask& task, const double secs) {
+        futureQueue.snooze(task, secs);
+    }
+
 private:
     void _schedule(ExTask &task);
-    struct timeval _reschedule(ExTask &task, task_type_t &curTaskType);
+    hrtime_t _reschedule(ExTask &task);
     void _checkPendingQueue(void);
     bool _fetchNextTask(ExecutorThread &thread, bool toSleep);
     void _wake(ExTask &task);
-    bool _doSleep(ExecutorThread &thread);
+    bool _doSleep(ExecutorThread &thread, std::unique_lock<std::mutex>& lock);
     void _doWake_UNLOCKED(size_t &numToWake);
-    size_t _moveReadyTasks(struct timeval tv);
+    size_t _moveReadyTasks(hrtime_t tv);
     ExTask _popReadyTask(void);
 
     SyncObject mutex;
@@ -74,11 +79,12 @@ private:
     ExecutorPool *manager;
     size_t sleepers; // number of threads sleeping in this taskQueue
 
-    // sorted by task priority then waketime ..
-    std::priority_queue<ExTask, std::deque<ExTask >,
+    // sorted by task priority.
+    std::priority_queue<ExTask, std::deque<ExTask>,
                         CompareByPriority> readyQueue;
-    std::priority_queue<ExTask, std::deque<ExTask >,
-                        CompareByDueDate> futureQueue;
+
+    // sorted by waketime.
+    FutureQueue<> futureQueue;
 
     std::list<ExTask> pendingQueue;
 };

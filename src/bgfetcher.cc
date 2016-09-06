@@ -31,17 +31,14 @@ void BgFetcher::start() {
     bool inverse = false;
     pendingFetch.compare_exchange_strong(inverse, true);
     ExecutorPool* iom = ExecutorPool::get();
-    ExTask task = new BgFetcherTask(&(store->getEPEngine()), this,
-                                      Priority::BgFetcherPriority, false);
+    ExTask task = new MultiBGFetcherTask(&(store->getEPEngine()), this, false);
     this->setTaskId(task->getId());
     iom->schedule(task, READER_TASK_IDX);
-    cb_assert(taskId > 0);
 }
 
 void BgFetcher::stop() {
     bool inverse = true;
     pendingFetch.compare_exchange_strong(inverse, false);
-    cb_assert(taskId > 0);
     ExecutorPool::get()->cancel(taskId);
 }
 
@@ -49,55 +46,52 @@ void BgFetcher::notifyBGEvent(void) {
     ++stats.numRemainingBgJobs;
     bool inverse = false;
     if (pendingFetch.compare_exchange_strong(inverse, true)) {
-        cb_assert(taskId > 0);
         ExecutorPool::get()->wake(taskId);
     }
 }
 
-size_t BgFetcher::doFetch(uint16_t vbId) {
+size_t BgFetcher::doFetch(VBucket::id_type vbId,
+                          vb_bgfetch_queue_t& itemsToFetch) {
     hrtime_t startTime(gethrtime());
     LOG(EXTENSION_LOG_DEBUG, "BgFetcher is fetching data, vBucket = %d "
-        "numDocs = %d, startTime = %lld\n", vbId, items2fetch.size(),
-        startTime/1000000);
+        "numDocs = %" PRIu64 ", startTime = %" PRIu64,
+        vbId, uint64_t(itemsToFetch.size()), startTime/1000000);
 
-    shard->getROUnderlying()->getMulti(vbId, items2fetch);
+    shard->getROUnderlying()->getMulti(vbId, itemsToFetch);
 
-    size_t totalfetches = 0;
     std::vector<bgfetched_item_t> fetchedItems;
-    vb_bgfetch_queue_t::iterator itr = items2fetch.begin();
-    for (; itr != items2fetch.end(); ++itr) {
-        std::list<VBucketBGFetchItem *> &requestedItems = (*itr).second;
-        std::list<VBucketBGFetchItem *>::iterator itm = requestedItems.begin();
-        for(; itm != requestedItems.end(); ++itm) {
-            const std::string &key = (*itr).first;
-            fetchedItems.push_back(std::make_pair(key, *itm));
-            ++totalfetches;
+    for (const auto& fetch : itemsToFetch) {
+        const std::string& key = fetch.first;
+        const vb_bgfetch_item_ctx_t& bg_item_ctx = fetch.second;
+
+        for (const auto& itm : bg_item_ctx.bgfetched_list) {
+            fetchedItems.push_back(std::make_pair(key, itm));
         }
     }
 
-    if (totalfetches > 0) {
+    if (fetchedItems.size() > 0) {
         store->completeBGFetchMulti(vbId, fetchedItems, startTime);
-        stats.getMultiHisto.add((gethrtime()-startTime)/1000, totalfetches);
+        stats.getMultiHisto.add((gethrtime() - startTime) / 1000,
+                                fetchedItems.size());
     }
 
     // failed requests will get requeued for retry within clearItems()
-    clearItems(vbId);
-    return totalfetches;
+    clearItems(vbId, itemsToFetch);
+    return fetchedItems.size();
 }
 
-void BgFetcher::clearItems(uint16_t vbId) {
-    vb_bgfetch_queue_t::iterator itr = items2fetch.begin();
-
-    for(; itr != items2fetch.end(); ++itr) {
+void BgFetcher::clearItems(VBucket::id_type vbId,
+                           const vb_bgfetch_queue_t& itemsToFetch) {
+    for (const auto& fetch : itemsToFetch) {
         // every fetched item belonging to the same key shares
         // a single data buffer, just delete it from the first fetched item
-        std::list<VBucketBGFetchItem *> &doneItems = (*itr).second;
+        const vb_bgfetch_item_ctx_t& bg_item_ctx = fetch.second;
+        const auto& doneItems = bg_item_ctx.bgfetched_list;
         VBucketBGFetchItem *firstItem = doneItems.front();
         firstItem->delValue();
 
-        std::list<VBucketBGFetchItem *>::iterator dItr = doneItems.begin();
-        for (; dItr != doneItems.end(); ++dItr) {
-            delete *dItr;
+        for (const auto& done : doneItems) {
+            delete done;
         }
     }
 }
@@ -107,32 +101,31 @@ bool BgFetcher::run(GlobalTask *task) {
     bool inverse = true;
     pendingFetch.compare_exchange_strong(inverse, false);
 
-    std::vector<uint16_t> bg_vbs;
-    LockHolder lh(queueMutex);
-    std::set<uint16_t>::iterator it = pendingVbs.begin();
-    for (; it != pendingVbs.end(); ++it) {
-        bg_vbs.push_back(*it);
+    std::vector<uint16_t> bg_vbs(pendingVbs.size());
+    {
+        LockHolder lh(queueMutex);
+        bg_vbs.assign(pendingVbs.begin(), pendingVbs.end());
+        pendingVbs.clear();
     }
-    pendingVbs.clear();
-    lh.unlock();
 
-    std::vector<uint16_t>::iterator ita = bg_vbs.begin();
-    for (; ita != bg_vbs.end(); ++ita) {
-        uint16_t vbId = *ita;
+    for (const uint16_t vbId : bg_vbs) {
         if (store->getVBuckets().isBucketCreation(vbId)) {
             // Requeue the bg fetch task if a vbucket DB file is not
             // created yet.
-            lh.lock();
-            pendingVbs.insert(vbId);
-            lh.unlock();
+            {
+                LockHolder lh(queueMutex);
+                pendingVbs.insert(vbId);
+            }
             bool inverse = false;
             pendingFetch.compare_exchange_strong(inverse, true);
             continue;
         }
         RCPtr<VBucket> vb = shard->getBucket(vbId);
-        if (vb && vb->getBGFetchItems(items2fetch)) {
-            num_fetched_items += doFetch(vbId);
-            items2fetch.clear();
+        if (vb) {
+            auto items = vb->getBGFetchItems();
+            if (items.size() > 0) {
+                num_fetched_items += doFetch(vbId, items);
+            }
         }
     }
 
@@ -152,11 +145,9 @@ bool BgFetcher::run(GlobalTask *task) {
     return true;
 }
 
-bool BgFetcher::pendingJob() {
-    std::vector<int> vbIds = shard->getVBuckets();
-    size_t numVbuckets = vbIds.size();
-    for (size_t i = 0; i < numVbuckets; ++i) {
-        RCPtr<VBucket> vb = shard->getBucket(vbIds[i]);
+bool BgFetcher::pendingJob() const {
+    for (const auto vbid : shard->getVBuckets()) {
+        RCPtr<VBucket> vb = shard->getBucket(vbid);
         if (vb && vb->hasPendingBGFetchItems()) {
             return true;
         }

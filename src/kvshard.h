@@ -20,18 +20,8 @@
 
 #include "config.h"
 
-#include <memcached/engine.h>
-
-#include <algorithm>
-#include <map>
-#include <set>
-#include <sstream>
-#include <vector>
-
-#include "bgfetcher.h"
-#include "callbacks.h"
-#include "kvstore.h"
-
+#include <atomic>
+#include "utility.h"
 
 /**
  * Base class encapsulating individual couchstore(vbucket) into a
@@ -61,29 +51,32 @@
  *   -----------------------------------
  *
  */
+class EventuallyPersistentStore;
 class Flusher;
 
 class KVShard {
     friend class VBucketMap;
 public:
-    KVShard(uint16_t id, EventuallyPersistentStore &store);
+    // Identifier for a KVShard
+    typedef uint16_t id_type;
+    KVShard(KVShard::id_type id, EventuallyPersistentStore &store);
     ~KVShard();
 
-    KVStore *getRWUnderlying();
-    KVStore *getROUnderlying();
+    KVStore *getRWUnderlying() { return rwUnderlying; }
+    KVStore *getROUnderlying() { return roUnderlying; }
 
     Flusher *getFlusher();
     BgFetcher *getBgFetcher();
 
     void notifyFlusher();
 
-    RCPtr<VBucket> getBucket(uint16_t id) const;
+    RCPtr<VBucket> getBucket(VBucket::id_type id) const;
     void setBucket(const RCPtr<VBucket> &b);
-    void resetBucket(uint16_t id);
+    void resetBucket(VBucket::id_type id);
 
-    uint16_t getId() { return shardId; }
-    std::vector<int> getVBucketsSortedByState();
-    std::vector<int> getVBuckets();
+    KVShard::id_type getId() { return shardId; }
+    std::vector<VBucket::id_type> getVBucketsSortedByState();
+    std::vector<VBucket::id_type> getVBuckets();
     size_t getMaxNumVbuckets() { return maxVbuckets; }
 
     /**
@@ -149,11 +142,13 @@ private:
     size_t maxVbuckets;
     uint16_t shardId;
 
-    AtomicValue<bool> highPrioritySnapshot;
-    AtomicValue<bool> lowPrioritySnapshot;
+    std::atomic<bool> highPrioritySnapshot;
+    std::atomic<bool> lowPrioritySnapshot;
+
+    KVStoreConfig kvConfig;
 
 public:
-    AtomicValue<size_t> highPriorityCount;
+    std::atomic<size_t> highPriorityCount;
 
     DISALLOW_COPY_AND_ASSIGN(KVShard);
 };

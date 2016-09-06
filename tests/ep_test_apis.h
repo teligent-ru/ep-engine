@@ -26,9 +26,14 @@
 #include <map>
 #include <string>
 
-#include "ep-engine/command_ids.h"
 #include "ext_meta_parser.h"
 #include "item.h"
+
+#define check(expr, msg) \
+    static_cast<void>((expr) ? 0 : abort_msg(#expr, msg, __FILE__, __LINE__))
+
+extern "C" bool abort_msg(const char *expr, const char *msg,
+                          const char *file, int line) CB_ATTR_NORETURN;
 
 #ifdef __cplusplus
 extern "C" {
@@ -49,18 +54,25 @@ ENGINE_ERROR_CODE vb_map_response(const void *cookie, const void *map,
 }
 #endif
 
-extern protocol_binary_response_status last_status;
-extern char *last_key;
-extern char *last_body;
+const uint8_t dcp_stream_end_resp_base_msg_bytes = 28;
+const uint8_t dcp_snapshot_marker_base_msg_bytes = 44;
+const uint8_t dcp_mutation_base_msg_bytes = 55;
+const uint8_t dcp_meta_size_none = 5;
+
+extern std::atomic<protocol_binary_response_status> last_status;
+extern std::string last_key;
+extern std::string last_body;
 extern bool dump_stats;
+
+// TODO: make `vals` non-public
 extern std::map<std::string, std::string> vals;
-extern uint32_t last_bodylen;
-extern uint64_t last_cas;
-extern uint8_t last_datatype;
-extern uint64_t last_uuid;
-extern uint64_t last_seqno;
+
+extern std::atomic<uint64_t> last_cas;
+extern std::atomic<uint8_t> last_datatype;
+extern std::atomic<uint64_t> last_uuid;
+extern std::atomic<uint64_t> last_seqno;
 extern bool last_deleted_flag;
-extern uint8_t last_conflict_resolution_mode;
+extern std::atomic<uint8_t> last_conflict_resolution_mode;
 extern ItemMetaData last_meta;
 
 extern uint8_t dcp_last_op;
@@ -81,11 +93,19 @@ extern uint64_t dcp_last_byseqno;
 extern uint64_t dcp_last_revseqno;
 extern uint64_t dcp_last_snap_start_seqno;
 extern uint64_t dcp_last_snap_end_seqno;
-extern uint16_t dcp_last_nmeta;
-extern void *dcp_last_meta;
+extern std::string dcp_last_meta;
+extern std::string dcp_last_value;
 extern std::string dcp_last_key;
 extern vbucket_state_t dcp_last_vbucket_state;
 
+/* This is an enum class to indicate what stats are required from the
+   HistogramStats. */
+enum class Histo_stat_info {
+    /* Total number of samples across all the bins in the histogram stat */
+    TOTAL_COUNT,
+    /* Number of bins in the histogram stat */
+    NUM_BINS
+};
 
 void decayingSleep(useconds_t *sleepTime);
 
@@ -101,7 +121,7 @@ protocol_binary_request_header* createPacket(uint8_t opcode,
                                              uint32_t vallen = 0,
                                              uint8_t datatype = 0x00,
                                              const char *meta = NULL,
-                                             uint16_t nmeta = 0);
+                                             uint16_t nmeta = 0) CB_MUST_USE_RESULT;
 
 // Basic Operations
 ENGINE_ERROR_CODE del(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1, const char *key,
@@ -127,14 +147,19 @@ void observe(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1,
              std::map<std::string, uint16_t> obskeys);
 void observe_seqno(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1, uint16_t vb_id ,
                    uint64_t uuid);
-protocol_binary_request_header* prepare_get_replica(ENGINE_HANDLE *h,
-                                                    ENGINE_HANDLE_V1 *h1,
-                                                    vbucket_state_t state,
-                                                    bool makeinvalidkey = false);
+
+protocol_binary_request_header*
+prepare_get_replica(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1,
+                    vbucket_state_t state, bool makeinvalidkey = false) CB_MUST_USE_RESULT;
+
 bool set_param(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1, protocol_binary_engine_param_t paramtype,
                const char *param, const char *val);
 bool set_vbucket_state(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1,
                        uint16_t vb, vbucket_state_t state);
+bool get_all_vb_seqnos(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1,
+                       vbucket_state_t state, const void *cookie);
+void verify_all_vb_seqnos(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1,
+                          int vb_start, int vb_end);
 void start_persistence(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1);
 void stop_persistence(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1);
 ENGINE_ERROR_CODE store(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1,
@@ -142,6 +167,16 @@ ENGINE_ERROR_CODE store(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1,
                         const char *key, const char *value, item **outitem,
                         uint64_t casIn = 0, uint16_t vb = 0,
                         uint32_t exp = 3600, uint8_t datatype = 0x00);
+
+/* Stores the specified document; returning the new CAS value via
+ * {out_cas}.
+ */
+ENGINE_ERROR_CODE storeCasOut(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1,
+                              const void *cookie, const uint16_t vb,
+                              const std::string& key, const std::string& value,
+                              const protocol_binary_datatypes datatype,
+                              item*& out_item, uint64_t& out_cas);
+
 ENGINE_ERROR_CODE storeCasVb11(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1,
                                const void *cookie, ENGINE_STORE_OPERATION op,
                                const char *key, const char *value, size_t vlen,
@@ -177,35 +212,71 @@ int get_int_stat(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1, const char *statname,
                  const char *statkey = NULL);
 float get_float_stat(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1, const char *statname,
                      const char *statkey = NULL);
+uint32_t get_ul_stat(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1,
+                     const char *statname, const char *statkey = NULL);
 uint64_t get_ull_stat(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1, const char *statname,
-                      const char *statkey);
+                      const char *statkey = NULL);
 std::string get_str_stat(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1,
                          const char *statname, const char *statkey = NULL);
+bool get_bool_stat(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1,
+                   const char *statname, const char *statkey = NULL);
+
+/* This is used to get stat info specified by 'histo_info' from histogram of
+ * "statname" which is got by running stats on "statkey"
+ */
+uint64_t get_histo_stat(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1,
+                        const char *statname, const char *statkey,
+                        const Histo_stat_info histo_info);
+
+typedef std::map<std::string, std::string> statistic_map;
+
+/* Returns a map of all statistics for the given statistic set.
+ * @param statset The set of statistics to fetch. May be nullptr, in which case
+ *                the default set will be returned.
+ */
+statistic_map get_all_stats(ENGINE_HANDLE *h,ENGINE_HANDLE_V1 *h1,
+                            const char *statset = nullptr);
+
+// Returns the value of the given stat, or the default value if the stat isn't
+// present.
+int get_int_stat_or_default(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1,
+                            int default_value, const char *statname,
+                            const char *statkey = NULL);
+
 void verify_curr_items(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1, int exp,
                        const char *msg);
 void wait_for_stat_change(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1,
                           const char *stat, int initial,
                           const char *statkey = NULL,
-                          const time_t wait_time = 60);
+                          const time_t max_wait_time_in_secs = 60);
 void wait_for_stat_to_be(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1, const char *stat,
                          int final, const char* stat_key = NULL,
-                         const time_t wait_time = 60);
+                         const time_t max_wait_time_in_secs = 60);
 void wait_for_stat_to_be_gte(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1,
                              const char *stat, int final,
                              const char* stat_key = NULL,
-                             const time_t wait_time = 60);
+                             const time_t max_wait_time_in_secs = 60);
+void wait_for_stat_to_be_lte(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1,
+                             const char *stat, int final,
+                             const char* stat_key = NULL,
+                             const time_t max_wait_time_in_secs = 60);
+void wait_for_expired_items_to_be(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1,
+                                  int final,
+                                  const time_t max_wait_time_in_secs = 60);
 void wait_for_str_stat_to_be(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1,
                              const char *stat, const char* final,
                              const char* stat_key,
-                             const time_t wait_time = 60);
+                             const time_t max_wait_time_in_secs = 60);
 bool wait_for_warmup_complete(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1);
 void wait_for_flusher_to_settle(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1);
+void wait_for_rollback_to_finish(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1);
 void wait_for_persisted_value(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1,
                               const char *key, const char *val,
                               uint16_t vbucketId = 0);
 
 void wait_for_memory_usage_below(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1,
-                                 int mem_threshold, const time_t wait_time = 60);
+                                 int mem_threshold,
+                                 const time_t max_wait_time_in_secs = 60);
 
 // Tap Operations
 void changeVBFilter(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1, std::string name,
@@ -217,13 +288,14 @@ void vbucketDelete(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1, uint16_t vb,
 
 void compact_db(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1,
                 const uint16_t vbid,
+                const uint16_t db_file_id,
                 const uint64_t purge_before_ts,
                 const uint64_t purge_before_seq,
                 const uint8_t  drop_deletes);
 
 // XDCR Operations
 void set_drift_counter_state(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1,
-                             int64_t initialDrift, uint8_t timeSync);
+                             int64_t initialDrift);
 void add_with_meta(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1, const char *key,
                    const size_t keylen, const char *val, const size_t vallen,
                    const uint32_t vb, ItemMetaData *itemMeta,
@@ -250,27 +322,36 @@ void return_meta(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1, const char *key,
                  const size_t keylen, const char *val, const size_t vallen,
                  const uint32_t vb, const uint64_t cas, const uint32_t flags,
                  const uint32_t exp, const uint32_t type,
-                 uint8_t datatype = 0x00);
+                 uint8_t datatype = 0x00, const void *cookie = NULL);
 void set_ret_meta(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1, const char *key,
                   const size_t keylen, const char *val, const size_t vallen,
                   const uint32_t vb, const uint64_t cas = 0,
                   const uint32_t flags = 0, const uint32_t exp = 0,
-                  uint8_t datatype = 0x00);
+                  uint8_t datatype = 0x00, const void *cookie = NULL);
 void add_ret_meta(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1, const char *key,
                   const size_t keylen, const char *val, const size_t vallen,
                   const uint32_t vb, const uint64_t cas = 0,
                   const uint32_t flags = 0, const uint32_t exp = 0,
-                  uint8_t datatype = 0x00);
+                  uint8_t datatype = 0x00, const void *cookie = NULL);
 void del_ret_meta(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1, const char *key,
                   const size_t keylen, const uint32_t vb,
-                  const uint64_t cas = 0);
-
-// DCP Operations
-void dcp_step(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1, const void* cookie);
+                  const uint64_t cas = 0, const void *cookie = NULL);
 
 void set_degraded_mode(ENGINE_HANDLE *h,
                        ENGINE_HANDLE_V1 *h1,
                        const void* cookie,
                        bool enable);
 
+/* Helper function to write unique "num_items" starting from keyXX
+   (XX is start_seqno) */
+void write_items(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1,
+                 int num_items, int start_seqno = 0,
+                 const char *key_prefix = "key", const char *value = "data");
+
+/* Helper function to write unique items starting from keyXX until memory usage
+   hits "mem_thresh_perc" (XX is start_seqno) */
+int write_items_upto_mem_perc(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1,
+                              int mem_thresh_perc, int start_seqno = 0,
+                              const char *key_prefix = "key",
+                              const char *value = "data");
 #endif  // TESTS_EP_TEST_APIS_H_

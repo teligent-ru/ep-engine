@@ -1,6 +1,6 @@
 /* -*- Mode: C++; tab-width: 4; c-basic-offset: 4; indent-tabs-mode: nil -*- */
 /*
- *     Copyright 2013 Couchbase, Inc
+ *     Copyright 2016 Couchbase, Inc
  *
  *   Licensed under the Apache License, Version 2.0 (the "License");
  *   you may not use this file except in compliance with the License.
@@ -17,209 +17,132 @@
 
 #include "config.h"
 
-#include <signal.h>
+#include <gtest/gtest.h>
 
-#include <algorithm>
-#include <vector>
-
-#include "configuration.h"
-#include "stats.h"
-#include "threadtests.h"
+#include "bgfetcher.h"
+#include "item.h"
 #include "vbucket.h"
-#include "vbucketmap.h"
 
-static const size_t numThreads = 10;
-static const size_t vbucketsEach = 100;
+// Dummy time functions (required by Item constructor).
+// TODO: Unify with the code in checkpoint_test.cc
+static rel_time_t basic_current_time(void) { return 0; }
 
-EPStats global_stats;
-CheckpointConfig checkpoint_config;
+rel_time_t (*ep_current_time)() = basic_current_time;
 
-extern "C" {
-    static rel_time_t basic_current_time(void) {
-        return 0;
-    }
-
-    rel_time_t (*ep_current_time)() = basic_current_time;
-
-    time_t ep_real_time() {
-        return time(NULL);
-    }
+time_t ep_real_time() {
+    return time(NULL);
 }
 
-class VBucketGenerator {
+/**
+ * Dummy callback to replace the flusher callback.
+ */
+class DummyCB: public Callback<uint16_t> {
 public:
-    VBucketGenerator(EPStats &s, CheckpointConfig &c, int start = 1)
-        : st(s), config(c), i(start) {}
-    VBucket *operator()() {
-        return new VBucket(i++, vbucket_state_active, st, config, NULL);
-    }
-private:
-    EPStats &st;
-    CheckpointConfig &config;
-    int i;
+    DummyCB() {}
+
+    void callback(uint16_t &dummy) { }
 };
 
-static void assertVBucket(const VBucketMap& vbm, int id) {
-    RCPtr<VBucket> v = vbm.getBucket(id);
-    cb_assert(v);
-    cb_assert(v->getId() == id);
-}
 
-static void testVBucketLookup() {
-    VBucketGenerator vbgen(global_stats, checkpoint_config);
-    std::vector<VBucket*> bucketList(3);
-    std::generate_n(bucketList.begin(), bucketList.capacity(), vbgen);
+class VBucketTest : public ::testing::Test {
+protected:
+    void SetUp() {
+        vbucket.reset(new VBucket(0, vbucket_state_active, global_stats,
+                                  checkpoint_config, /*kvshard*/nullptr,
+                                  /*lastSeqno*/1000, /*lastSnapStart*/0,
+                                  /*lastSnapEnd*/0, /*table*/nullptr,
+                                  std::make_shared<DummyCB>()));
+    }
 
-    Configuration config;
-    VBucketMap vbm(config);
-    vbm.addBuckets(bucketList);
+    void TearDown() {
+        vbucket.reset();
+    }
 
-    cb_assert(!vbm.getBucket(4));
-    assertVBucket(vbm, 1);
-    assertVBucket(vbm, 2);
-    assertVBucket(vbm, 3);
-}
+    std::unique_ptr<VBucket> vbucket;
+    EPStats global_stats;
+    CheckpointConfig checkpoint_config;
+};
 
-class AtomicUpdater : public Generator<bool> {
-public:
-    AtomicUpdater(VBucketMap *m) : vbm(m), i(0) {}
-    bool operator()() {
-        for (size_t j = 0; j < vbucketsEach; j++) {
-            int newId = ++i;
+// Measure performance of VBucket::getBGFetchItems - queue and then get
+// 10,000 items from the vbucket.
+TEST_F(VBucketTest, GetBGFetchItemsPerformance) {
+    BgFetcher fetcher(/*store*/nullptr, /*shard*/nullptr, global_stats);
 
-            RCPtr<VBucket> v(new VBucket(newId, vbucket_state_active,
-                                         global_stats, checkpoint_config, NULL));
-            vbm->addBucket(v);
-            cb_assert(vbm->getBucket(newId) == v);
+    for (unsigned int ii = 0; ii < 100000; ii++) {
+        auto* fetchItem = new VBucketBGFetchItem(/*cookie*/nullptr,
+                                                 /*isMeta*/false);
+        vbucket->queueBGFetchItem(std::to_string(ii), fetchItem, &fetcher);
+    }
+    auto items = vbucket->getBGFetchItems();
 
-            if (newId % 2 == 0) {
-                vbm->removeBucket(newId);
-            }
+    // Cleanup.
+    for (auto& it : items) {
+        for (auto* fetchItem : it.second.bgfetched_list) {
+            delete fetchItem;
         }
-
-        return true;
     }
-private:
-    VBucketMap *vbm;
-    Atomic<int> i;
+}
+
+
+class VBucketEvictionTest : public VBucketTest,
+                            public ::testing::WithParamInterface<item_eviction_policy_t> {
 };
 
-static void testConcurrentUpdate(void) {
-    Configuration config;
-    config.setMaxNumShards((size_t)1);
-    VBucketMap vbm(config);
-    AtomicUpdater au(&vbm);
-    getCompletedThreads<bool>(numThreads, &au);
 
-    // We remove half of the buckets in the test
-    std::vector<int> rv;
-    vbm.getBuckets(rv);
-    cb_assert(rv.size() == ((numThreads * vbucketsEach) / 2));
+// Check that counts of items and resident items are as expected when items are
+// ejected from the HashTable.
+TEST_P(VBucketEvictionTest, EjectionResidentCount) {
+    const auto eviction_policy = GetParam();
+    ASSERT_EQ(0, this->vbucket->getNumItems(eviction_policy));
+    ASSERT_EQ(0, this->vbucket->getNumNonResidentItems(eviction_policy));
+
+    std::string key{"key"};
+    Item item{key.c_str(), uint16_t(key.size()), /*flags*/0, /*exp*/0,
+              /*data*/nullptr, /*ndata*/0};
+
+    EXPECT_EQ(WAS_CLEAN,
+              this->vbucket->ht.set(item, eviction_policy));
+
+    EXPECT_EQ(1, this->vbucket->getNumItems(eviction_policy));
+    EXPECT_EQ(0, this->vbucket->getNumNonResidentItems(eviction_policy));
+
+    // TODO-MT: Should acquire lock really (ok given this is currently
+    // single-threaded).
+    auto* stored_item = this->vbucket->ht.find(key);
+    EXPECT_NE(nullptr, stored_item);
+    // Need to clear the dirty flag to allow it to be ejected.
+    stored_item->markClean();
+    EXPECT_TRUE(this->vbucket->ht.unlocked_ejectItem(stored_item,
+                                                     eviction_policy));
+
+    // After ejection, should still have 1 item in VBucket, but also have
+    // 1 non-resident item.
+    EXPECT_EQ(1, this->vbucket->getNumItems(eviction_policy));
+    EXPECT_EQ(1, this->vbucket->getNumNonResidentItems(eviction_policy));
 }
 
-static void testVBucketFilter() {
-    VBucketFilter empty;
+// Test cases which run in both Full and Value eviction
+INSTANTIATE_TEST_CASE_P(FullAndValueEviction,
+                        VBucketEvictionTest,
+                        ::testing::Values(VALUE_ONLY, FULL_EVICTION),
+                        [] (const ::testing::TestParamInfo<item_eviction_policy_t>& info) {
+                            if (info.param == VALUE_ONLY) {
+                                return "VALUE_ONLY";
+                            } else {
+                                return "FULL_EVICTION";
+                            }
+                        });
 
-    cb_assert(empty(0));
-    cb_assert(empty(1));
-    cb_assert(empty(2));
 
-    std::vector<uint16_t> v;
-
-    VBucketFilter emptyTwo(v);
-    cb_assert(emptyTwo(0));
-    cb_assert(emptyTwo(1));
-    cb_assert(emptyTwo(2));
-
-    v.push_back(2);
-
-    VBucketFilter hasOne(v);
-    cb_assert(!hasOne(0));
-    cb_assert(!hasOne(1));
-    cb_assert(hasOne(2));
-
-    v.push_back(0);
-
-    VBucketFilter hasTwo(v);
-    cb_assert(hasTwo(0));
-    cb_assert(!hasTwo(1));
-    cb_assert(hasTwo(2));
-
-    v.push_back(1);
-
-    VBucketFilter hasThree(v);
-    cb_assert(hasThree(0));
-    cb_assert(hasThree(1));
-    cb_assert(hasThree(2));
-    cb_assert(!hasThree(3));
-}
-
-static void assertFilterTxt(const VBucketFilter &filter, const std::string &res)
-{
-    std::stringstream ss;
-    ss << filter;
-    if (ss.str() != res) {
-        std::cerr << "Filter mismatch: "
-                  << ss.str() << " != " << res << std::endl;
-        std::cerr.flush();
-        abort();
-    }
-}
-
-static void testVBucketFilterFormatter(void) {
-    std::set<uint16_t> v;
-
-    VBucketFilter filter(v);
-    assertFilterTxt(filter, "{ empty }");
-    v.insert(1);
-    filter.assign(v);
-    assertFilterTxt(filter, "{ 1 }");
-
-    for (uint16_t ii = 2; ii < 100; ++ii) {
-        v.insert(ii);
-    }
-    filter.assign(v);
-    assertFilterTxt(filter, "{ [1,99] }");
-
-    v.insert(101);
-    v.insert(102);
-    filter.assign(v);
-    assertFilterTxt(filter, "{ [1,99], 101, 102 }");
-
-    v.insert(103);
-    filter.assign(v);
-    assertFilterTxt(filter, "{ [1,99], [101,103] }");
-
-    v.insert(100);
-    filter.assign(v);
-    assertFilterTxt(filter, "{ [1,103] }");
-}
-
-static void testGetVBucketsByState(void) {
-    Configuration config;
-    VBucketMap vbm(config);
-
-    int st = vbucket_state_dead;
-    for (int id = 0; id < 4; id++, st--) {
-        RCPtr<VBucket> v(new VBucket(id, (vbucket_state_t)st, global_stats,
-                                     checkpoint_config, NULL));
-        vbm.addBucket(v);
-        cb_assert(vbm.getBucket(id) == v);
-    }
-}
+/* static storage for environment variable set by putenv(). */
+static char allow_no_stats_env[] = "ALLOW_NO_STATS_UPDATE=yeah";
 
 int main(int argc, char **argv) {
-    (void)argc; (void)argv;
-    putenv(strdup("ALLOW_NO_STATS_UPDATE=yeah"));
+    ::testing::InitGoogleTest(&argc, argv);
+    putenv(allow_no_stats_env);
 
     HashTable::setDefaultNumBuckets(5);
     HashTable::setDefaultNumLocks(1);
 
-    alarm(60);
-
-    testVBucketLookup();
-    testConcurrentUpdate();
-    testVBucketFilter();
-    testVBucketFilterFormatter();
-    testGetVBucketsByState();
+    return RUN_ALL_TESTS();
 }

@@ -1,4 +1,4 @@
-# ep-engine
-Eventually Persistent Couchbase Data Layer.
+# ATTENTION
 
-see 3.0.3.teligent-2 branch
+see teligent branch!
+

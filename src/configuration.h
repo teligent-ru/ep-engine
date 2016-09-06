@@ -30,6 +30,7 @@
 #include <vector>
 
 #include "locks.h"
+#include "utility.h"
 
 /**
  * The value changed listeners runs _without_ the global mutex for
@@ -104,60 +105,65 @@ public:
      * Validator for boolean values
      * @param key the key that is about to change
      * @param value the requested new value
-     * @return true the value is ok, false the value is not ok
+     * @throws runtime_error if the validation failed
      */
-    virtual bool validateBool(const std::string &key, bool) {
-        LOG(EXTENSION_LOG_DEBUG, "Configuration error.. %s does not take"
-            " a boolean parameter", key.c_str());
-        return false;
+    virtual void validateBool(const std::string& key, bool) {
+        std::string error = "Configuration error.. " + key +
+                            " does not take a boolean parameter";
+        LOG(EXTENSION_LOG_DEBUG, "%s", error.c_str());
+        throw std::runtime_error(error);
     }
 
     /**
      * Validator for a numeric value
      * @param key the key that is about to change
      * @param value the requested new value
-     * @return true the value is ok, false the value is not ok
+     * @throws runtime_error if the validation failed
      */
-    virtual bool validateSize(const std::string &key, size_t) {
-        LOG(EXTENSION_LOG_DEBUG, "Configuration error.. %s does not take"
-            " a size_t parameter", key.c_str());
-        return false;
+    virtual void validateSize(const std::string& key, size_t) {
+        std::string error = "Configuration error.. " + key +
+                            " does not take a size_t parameter";
+        LOG(EXTENSION_LOG_DEBUG, "%s", error.c_str());
+        throw std::runtime_error(error);
     }
 
     /**
      * Validator for a signed numeric value
      * @param key the key that is about to change
      * @param value the requested new value
-     * @return true the value is ok, false the value is not ok
+     * @throws runtime_error if the validation failed
      */
-    virtual bool validateSSize(const std::string &key, ssize_t) {
-        LOG(EXTENSION_LOG_DEBUG, "Configuration error.. %s does not take"
-            " a ssize_t parameter", key.c_str());
-        return false;
+    virtual void validateSSize(const std::string& key, ssize_t) {
+        std::string error = "Configuration error.. " + key +
+                            " does not take a ssize_t parameter";
+        LOG(EXTENSION_LOG_DEBUG, "%s", error.c_str());
+        throw std::runtime_error(error);
     }
 
     /**
      * Validator for a floating point
      * @param key the key that is about to change
      * @param value the requested new value
-     * @return true the value is ok, false the value is not ok
+     * @throws runtime_error if the validation failed
      */
-    virtual bool validateFloat(const std::string &key, float) {
-        LOG(EXTENSION_LOG_DEBUG, "Configuration error.. %s does not take"
-            " a floating point parameter", key.c_str());
-        return false;
+    virtual void validateFloat(const std::string& key, float) {
+        std::string error = "Configuration error.. " + key +
+                            " does not take a float parameter";
+        LOG(EXTENSION_LOG_DEBUG, "%s", error.c_str());
+        throw std::runtime_error(error);
     }
 
     /**
      * Validator for a character string
      * @param key the key that is about to change
      * @param value the requested new value
-     * @return true the value is ok, false the value is not ok
+     * @throws runtime_error if the validation failed
      */
-    virtual bool validateString(const std::string &key, const char *) {
-        LOG(EXTENSION_LOG_DEBUG, "Configuration error.. %s does not take"
-            " a character string", key.c_str());
-        return false;
+    virtual void validateString(const std::string& key, const char*) {
+        std::string error = "Configuration error.. " + key +
+                            " does not take a string parameter";
+        LOG(EXTENSION_LOG_DEBUG, "%s", error.c_str());
+        throw std::runtime_error(error);
     }
 
     virtual ~ValueChangedValidator() { }
@@ -181,20 +187,66 @@ public:
         return this;
     }
 
-    virtual bool validateSize(const std::string &key, size_t value) {
-        (void)key;
-        return (value >= lower && value <= upper);
+    virtual void validateSize(const std::string& key, size_t value) {
+        if (value < lower || value > upper) {
+            std::string error = "Validation Error, " + key +
+                                " takes values between " +
+                                std::to_string(lower) + " and " +
+                                std::to_string(upper) + " (Got: " +
+                                std::to_string(value) + ")";
+            throw std::range_error(error);
+        }
     }
 
-    virtual bool validateSSize(const std::string &key, ssize_t value) {
-        (void)key;
+    virtual void validateSSize(const std::string& key, ssize_t value) {
         ssize_t s_lower = static_cast<ssize_t> (lower);
         ssize_t s_upper = static_cast<ssize_t> (upper);
-        return (value >= s_lower && value <= s_upper);
+
+        if (value < s_lower || value > s_upper) {
+            std::string error = "Validation Error, " + key +
+                                " takes values between " +
+                                std::to_string(s_lower) + " and " +
+                                std::to_string(s_upper) + " (Got: " +
+                                std::to_string(value) + ")";
+            throw std::range_error(error);
+        }
     }
 private:
     size_t lower;
     size_t upper;
+};
+
+/**
+ * A configuration input validator that ensures a signed numeric (ssize_t)
+ * value falls between a specified upper and lower limit.
+ */
+class SSizeRangeValidator : public ValueChangedValidator {
+public:
+    SSizeRangeValidator() : lower(0), upper(0) {}
+
+    SSizeRangeValidator* min(size_t v) {
+        lower = v;
+        return this;
+    }
+
+    SSizeRangeValidator* max(size_t v) {
+        upper = v;
+        return this;
+    }
+
+    virtual void validateSSize(const std::string& key, ssize_t value) {
+        if (value < lower || value > upper) {
+            std::string error = "Validation Error, " + key +
+                                " takes values between " +
+                                std::to_string(lower) + " and " +
+                                std::to_string(upper) + " (Got: " +
+                                std::to_string(value) + ")";
+            throw std::range_error(error);
+        }
+    }
+private:
+    ssize_t lower;
+    ssize_t upper;
 };
 
 /**
@@ -215,9 +267,15 @@ public:
         return this;
     }
 
-    virtual bool validateFloat(const std::string &key, float value) {
-        (void)key;
-        return (value >= lower && value <= upper);
+    virtual void validateFloat(const std::string& key, float value) {
+        if (value < lower || value > upper) {
+            std::string error = "Validation Error, " + key +
+                                " takes values between " +
+                                std::to_string(lower) + " and " +
+                                std::to_string(upper) + " (Got: " +
+                                std::to_string(value) + ")";
+            throw std::range_error(error);
+        }
     }
 private:
     float lower;
@@ -237,9 +295,21 @@ public:
         return this;
     }
 
-    virtual bool validateString(const std::string &key, const char *value) {
-        (void)key;
-        return acceptable.find(std::string(value)) != acceptable.end();
+    virtual void validateString(const std::string& key, const char* value) {
+        if (acceptable.find(std::string(value)) == acceptable.end()) {
+            std::string error = "Validation Error, " + key +
+                                " takes one of [";
+            for (const auto& it : acceptable) {
+                error += it + ", ";
+            }
+            if (acceptable.size() > 0) {
+                error.pop_back();
+                error.pop_back();
+            }
+
+            error += "] (Got: " + std::string(value) + ")";
+            throw std::range_error(error);
+        }
     }
 
 private:
@@ -276,9 +346,9 @@ public:
 
     /**
      * Add a listener for changes for a key. The configuration class
-     * will release the memory for the ValueChangedListner by calling
+     * will release the memory for the ValueChangedListener by calling
      * delete in it's destructor (so you have to allocate it by using
-     * new). There is no way to remove a valueChangeListner.
+     * new). There is no way to remove a ValueChangeListener.
      *
      * @param key the key to add the listener for
      * @param val the listener that will receive all of the callbacks
@@ -308,7 +378,7 @@ protected:
      * a boolean value.
      * @param key the key to specify
      * @param value the new value
-     * @throws std::string if the value is refused by the validator
+     * @throws runtime_error if the validation failed
      */
     void setParameter(const std::string &key, bool value);
     /**
@@ -316,7 +386,7 @@ protected:
      * a size_t value.
      * @param key the key to specify
      * @param value the new value
-     * @throws std::string if the value is refused by the validator
+     * @throws runtime_error if the validation failed
      */
     void setParameter(const std::string &key, size_t value);
     /**
@@ -324,7 +394,7 @@ protected:
      * a ssize_t value.
      * @param key the key to specify
      * @param value the new value
-     * @throws std::string if the value is refused by the validator
+     * @throws runtime_error if the validation failed
      */
     void setParameter(const std::string &key, ssize_t value);
     /**
@@ -332,7 +402,7 @@ protected:
      * a floating value.
      * @param key the key to specify
      * @param value the new value
-     * @throws std::string if the value is refused by the validator
+     * @throws runtime_error if the validation failed
      */
     void setParameter(const std::string &key, float value);
     /**
@@ -340,7 +410,7 @@ protected:
      * a character string
      * @param key the key to specify
      * @param value the new value
-     * @throws std::string if the value is refused by the validator
+     * @throws runtime_error if the validation failed
      */
     void setParameter(const std::string &key, const char *value);
     /**
@@ -348,17 +418,48 @@ protected:
      * a string.
      * @param key the key to specify
      * @param value the new value
-     * @throws std::string if the value is refused by the validator
+     * @throws runtime_error if the validation failed
      */
     void setParameter(const std::string &key, const std::string &value);
 
+    /**
+     * Get the configuration parameter for a given key
+     * @param key the key to specify
+     * @return value the value
+     * @throws runtime_error if the validation failed
+     */
+    bool getBool(const std::string& key) const;
+
+    /**
+     * Get the configuration parameter for a given key
+     * @param key the key to specify
+     * @return value the value
+     */
+    size_t getInteger(const std::string& key) const;
+
+    /**
+     * Get the configuration parameter for a given key
+     * @param key the key to specify
+     * @return value the value
+     */
+    ssize_t getSignedInteger(const std::string& key) const;
+
+    /**
+     * Get the configuration parameter for a given key
+     * @param key the key to specify
+     * @return value the value
+     */
+    float getFloat(const std::string& key) const;
+
+    /**
+     * Get the configuration parameter for a given key
+     * @param key the key to specify
+     * @return value the value
+     */
+    std::string getString(const std::string& key) const;
+
 private:
     void initialize();
-    std::string getString(const std::string &key) const;
-    bool getBool(const std::string &key) const;
-    float getFloat(const std::string &key) const;
-    size_t getInteger(const std::string &key) const;
-    ssize_t getSignedInteger(const std::string &key) const;
 
     struct value_t {
         value_t() : validator(NULL) { val.v_string = 0; }
@@ -375,7 +476,7 @@ private:
     };
 
     // Access to the configuration variables is protected by the mutex
-    Mutex mutex;
+    std::mutex mutex;
     std::map<std::string, value_t> attributes;
 
     friend std::ostream& operator<< (std::ostream& out,

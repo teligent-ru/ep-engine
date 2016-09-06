@@ -1,6 +1,6 @@
 /* -*- Mode: C++; tab-width: 4; c-basic-offset: 4; indent-tabs-mode: nil -*- */
 /*
- *     Copyright 2010 Couchbase, Inc
+ *     Copyright 2015 Couchbase, Inc
  *
  *   Licensed under the Apache License, Version 2.0 (the "License");
  *   you may not use this file except in compliance with the License.
@@ -23,11 +23,13 @@
 #include <string>
 
 #include "atomic.h"
+#include "bgfetcher.h"
 #include "ep_engine.h"
-#include "failover-table.h"
+
 #define STATWRITER_NAMESPACE vbucket
 #include "statwriter.h"
 #undef STATWRITER_NAMESPACE
+
 #include "vbucket.h"
 
 VBucketFilter VBucketFilter::filter_diff(const VBucketFilter &other) const {
@@ -115,6 +117,71 @@ const vbucket_state_t VBucket::PENDING =
 const vbucket_state_t VBucket::DEAD =
                     static_cast<vbucket_state_t>(htonl(vbucket_state_dead));
 
+VBucket::VBucket(id_type i,
+                 vbucket_state_t newState,
+                 EPStats &st,
+                 CheckpointConfig &chkConfig,
+                 KVShard *kvshard,
+                 int64_t lastSeqno,
+                 uint64_t lastSnapStart,
+                 uint64_t lastSnapEnd,
+                 FailoverTable *table,
+                 std::shared_ptr<Callback<id_type> > cb,
+                 vbucket_state_t initState,
+                 uint64_t chkId,
+                 uint64_t purgeSeqno,
+                 uint64_t maxCas,
+                 int64_t driftCounter)
+    : ht(st),
+      checkpointManager(st, i, chkConfig, lastSeqno, lastSnapStart,
+                        lastSnapEnd, cb, chkId),
+      failovers(table),
+      opsCreate(0),
+      opsUpdate(0),
+      opsDelete(0),
+      opsReject(0),
+      dirtyQueueSize(0),
+      dirtyQueueMem(0),
+      dirtyQueueFill(0),
+      dirtyQueueDrain(0),
+      dirtyQueueAge(0),
+      dirtyQueuePendingWrites(0),
+      metaDataDisk(0),
+      numExpiredItems(0),
+      id(i),
+      state(newState),
+      initialState(initState),
+      stats(st),
+      purge_seqno(purgeSeqno),
+      max_cas(maxCas),
+      drift_counter(driftCounter),
+      time_sync_config(time_sync_t::DISABLED),
+      takeover_backed_up(false),
+      persisted_snapshot_start(lastSnapStart),
+      persisted_snapshot_end(lastSnapEnd),
+      numHpChks(0),
+      shard(kvshard),
+      bFilter(NULL),
+      tempFilter(NULL),
+      rollbackItemCount(0)
+{
+    backfill.isBackfillPhase = false;
+    pendingOpsStart = 0;
+    stats.memOverhead.fetch_add(sizeof(VBucket)
+                                + ht.memorySize() + sizeof(CheckpointManager));
+    LOG(EXTENSION_LOG_NOTICE,
+        "VBucket: created vbucket:%" PRIu16 " with state:%s "
+                "initialState:%s "
+                "lastSeqno:%" PRIu64 " "
+                "lastSnapshot:{%" PRIu64 ",%" PRIu64 "} "
+                "persisted_snapshot:{%" PRIu64 ",%" PRIu64 "} "
+                "max_cas:%" PRIu64,
+        id, VBucket::toString(state), VBucket::toString(initialState),
+        lastSeqno, lastSnapStart, lastSnapEnd,
+        persisted_snapshot_start, persisted_snapshot_end,
+        max_cas.load());
+}
+
 VBucket::~VBucket() {
     if (!pendingOps.empty() || !pendingBGFetches.empty()) {
         LOG(EXTENSION_LOG_WARNING,
@@ -128,7 +195,8 @@ VBucket::~VBucket() {
     size_t num_pending_fetches = 0;
     vb_bgfetch_queue_t::iterator itr = pendingBGFetches.begin();
     for (; itr != pendingBGFetches.end(); ++itr) {
-        std::list<VBucketBGFetchItem *> &bgitems = itr->second;
+        vb_bgfetch_item_ctx_t &bg_itm_ctx = itr->second;
+        std::list<VBucketBGFetchItem *> &bgitems = bg_itm_ctx.bgfetched_list;
         std::list<VBucketBGFetchItem *>::iterator vit = bgitems.begin();
         for (; vit != bgitems.end(); ++vit) {
             delete (*vit);
@@ -142,8 +210,8 @@ VBucket::~VBucket() {
     // Clear out the bloomfilter(s)
     clearFilter();
 
-    stats.memOverhead.fetch_sub(sizeof(VBucket) + ht.memorySize() + sizeof(CheckpointManager));
-    cb_assert(stats.memOverhead.load() < GIGANTOR);
+    stats.memOverhead.fetch_sub(sizeof(VBucket) + ht.memorySize() +
+                                sizeof(CheckpointManager));
 
     LOG(EXTENSION_LOG_INFO, "Destroying vbucket %d\n", id);
 }
@@ -169,7 +237,7 @@ void VBucket::fireAllOps(EventuallyPersistentEngine &engine,
     pendingOps.clear();
 
     LOG(EXTENSION_LOG_INFO,
-        "Fired pendings ops for vbucket %d in state %s\n",
+        "Fired pendings ops for vbucket %" PRIu16 " in state %s\n",
         id, VBucket::toString(state));
 }
 
@@ -185,19 +253,23 @@ void VBucket::fireAllOps(EventuallyPersistentEngine &engine) {
     }
 }
 
-void VBucket::setState(vbucket_state_t to, SERVER_HANDLE_V1 *sapi) {
-    cb_assert(sapi);
-    vbucket_state_t oldstate(state);
+void VBucket::setState(vbucket_state_t to) {
+    vbucket_state_t oldstate;
+    {
+        WriterLockHolder wlh(stateLock);
+        oldstate = state;
 
-    if (to == vbucket_state_active &&
-        checkpointManager.getOpenCheckpointId() < 2) {
-        checkpointManager.setOpenCheckpointId(2);
+        if (to == vbucket_state_active &&
+            checkpointManager.getOpenCheckpointId() < 2) {
+            checkpointManager.setOpenCheckpointId(2);
+        }
+
+        LOG(EXTENSION_LOG_NOTICE,
+            "VBucket::setState: transitioning vbucket:%" PRIu16 " from:%s to:%s",
+            id, VBucket::toString(oldstate), VBucket::toString(to));
+
+        state = to;
     }
-
-    LOG(EXTENSION_LOG_DEBUG, "transitioning vbucket %d from %s to %s",
-        id, VBucket::toString(oldstate), VBucket::toString(to));
-
-    state = to;
 }
 
 void VBucket::doStatsForQueueing(Item& qi, size_t itemBytes)
@@ -212,24 +284,10 @@ void VBucket::doStatsForQueueing(Item& qi, size_t itemBytes)
 void VBucket::doStatsForFlushing(Item& qi, size_t itemBytes)
 {
     decrDirtyQueueSize(1);
-    if (dirtyQueueMem > sizeof(Item)) {
-        dirtyQueueMem.fetch_sub(sizeof(Item));
-    } else {
-        dirtyQueueMem.store(0);
-    }
+    decrDirtyQueueMem(sizeof(Item));
     ++dirtyQueueDrain;
-
-    if (dirtyQueueAge > qi.getQueuedTime()) {
-        dirtyQueueAge.fetch_sub(qi.getQueuedTime());
-    } else {
-        dirtyQueueAge.store(0);
-    }
-
-    if (dirtyQueuePendingWrites > itemBytes) {
-        dirtyQueuePendingWrites.fetch_sub(itemBytes);
-    } else {
-        dirtyQueuePendingWrites.store(0);
-    }
+    decrDirtyQueueAge(qi.getQueuedTime());
+    decrDirtyQueuePendingWrites(itemBytes);
 }
 
 void VBucket::incrMetaDataDisk(Item& qi)
@@ -256,8 +314,6 @@ void VBucket::resetStats() {
     dirtyQueueAge.store(0);
     dirtyQueuePendingWrites.store(0);
     dirtyQueueDrain.store(0);
-    fileSpaceUsed = 0;
-    fileSize = 0;
 }
 
 template <typename T>
@@ -274,21 +330,30 @@ void VBucket::addStat(const char *nm, const T &val, ADD_STAT add_stat,
     add_casted_stat(n.data(), value.str().data(), add_stat, c);
 }
 
-void VBucket::queueBGFetchItem(const std::string &key,
-                               VBucketBGFetchItem *fetch,
-                               BgFetcher *bgFetcher) {
+size_t VBucket::queueBGFetchItem(const std::string &key,
+                                 VBucketBGFetchItem *fetch,
+                                 BgFetcher *bgFetcher) {
     LockHolder lh(pendingBGFetchesLock);
-    pendingBGFetches[key].push_back(fetch);
+    vb_bgfetch_item_ctx_t& bgfetch_itm_ctx = pendingBGFetches[key];
+
+    if (bgfetch_itm_ctx.bgfetched_list.empty()) {
+        bgfetch_itm_ctx.isMetaOnly = true;
+    }
+
+    bgfetch_itm_ctx.bgfetched_list.push_back(fetch);
+
+    if (!fetch->metaDataOnly) {
+        bgfetch_itm_ctx.isMetaOnly = false;
+    }
     bgFetcher->addPendingVB(id);
-    lh.unlock();
+    return pendingBGFetches.size();
 }
 
-bool VBucket::getBGFetchItems(vb_bgfetch_queue_t &fetches) {
+vb_bgfetch_queue_t VBucket::getBGFetchItems() {
+    vb_bgfetch_queue_t fetches;
     LockHolder lh(pendingBGFetchesLock);
-    fetches.insert(pendingBGFetches.begin(), pendingBGFetches.end());
-    pendingBGFetches.clear();
-    lh.unlock();
-    return fetches.size() > 0;
+    fetches.swap(pendingBGFetches);
+    return fetches;
 }
 
 void VBucket::addHighPriorityVBEntry(uint64_t id, const void *cookie,
@@ -298,15 +363,19 @@ void VBucket::addHighPriorityVBEntry(uint64_t id, const void *cookie,
         ++shard->highPriorityCount;
     }
     hpChks.push_back(HighPriorityVBEntry(cookie, id, isBySeqno));
-    numHpChks = hpChks.size();
+    numHpChks.store(hpChks.size());
 }
 
-void VBucket::notifyCheckpointPersisted(EventuallyPersistentEngine &e,
-                                        uint64_t idNum,
-                                        bool isBySeqno) {
+void VBucket::notifyOnPersistence(EventuallyPersistentEngine &e,
+                                  uint64_t idNum,
+                                  bool isBySeqno) {
     LockHolder lh(hpChksMutex);
     std::map<const void*, ENGINE_ERROR_CODE> toNotify;
     std::list<HighPriorityVBEntry>::iterator entry = hpChks.begin();
+
+    std::string logStr(isBySeqno
+                       ? "seqno persistence"
+                       : "checkpoint persistence");
 
     while (entry != hpChks.end()) {
         if (isBySeqno != entry->isBySeqno_) {
@@ -314,15 +383,20 @@ void VBucket::notifyCheckpointPersisted(EventuallyPersistentEngine &e,
             continue;
         }
 
+        std::string logStr(isBySeqno ?
+                           "seqno persistence" :
+                           "checkpoint persistence");
+
         hrtime_t wall_time(gethrtime() - entry->start);
         size_t spent = wall_time / 1000000000;
         if (entry->id <= idNum) {
             toNotify[entry->cookie] = ENGINE_SUCCESS;
             stats.chkPersistenceHisto.add(wall_time / 1000);
             adjustCheckpointFlushTimeout(wall_time / 1000000000);
-            LOG(EXTENSION_LOG_WARNING, "Notified the completion of checkpoint "
-                "persistence for vbucket %d, id %llu, cookie %p", id, idNum,
-                entry->cookie);
+            LOG(EXTENSION_LOG_NOTICE, "Notified the completion of %s "
+                "for vbucket %" PRIu16 ", Check for: %" PRIu64 ", "
+                "Persisted upto: %" PRIu64 ", cookie %p",
+                logStr.c_str(), id, entry->id, idNum, entry->cookie);
             entry = hpChks.erase(entry);
             if (shard) {
                 --shard->highPriorityCount;
@@ -331,9 +405,10 @@ void VBucket::notifyCheckpointPersisted(EventuallyPersistentEngine &e,
             adjustCheckpointFlushTimeout(spent);
             e.storeEngineSpecific(entry->cookie, NULL);
             toNotify[entry->cookie] = ENGINE_TMPFAIL;
-            LOG(EXTENSION_LOG_WARNING, "Notified the timeout on checkpoint "
-                "persistence for vbucket %d, id %llu, cookie %p", id, idNum,
-                entry->cookie);
+            LOG(EXTENSION_LOG_WARNING, "Notified the timeout on %s "
+                "for vbucket %" PRIu16 ", Check for: %" PRIu64 ", "
+                "Persisted upto: %" PRIu64 ", cookie %p",
+                logStr.c_str(), id, entry->id, idNum, entry->cookie);
             entry = hpChks.erase(entry);
             if (shard) {
                 --shard->highPriorityCount;
@@ -342,7 +417,7 @@ void VBucket::notifyCheckpointPersisted(EventuallyPersistentEngine &e,
             ++entry;
         }
     }
-    numHpChks = hpChks.size();
+    numHpChks.store(hpChks.size());
     lh.unlock();
 
     std::map<const void*, ENGINE_ERROR_CODE>::iterator itr = toNotify.begin();
@@ -387,7 +462,7 @@ void VBucket::adjustCheckpointFlushTimeout(size_t wall_time) {
 }
 
 size_t VBucket::getHighPriorityChkSize() {
-    return numHpChks;
+    return numHpChks.load();
 }
 
 size_t VBucket::getCheckpointFlushTimeout() {
@@ -415,7 +490,11 @@ size_t VBucket::getNumNonResidentItems(item_eviction_policy_t policy) {
 
 bool VBucket::isResidentRatioUnderThreshold(float threshold,
                                             item_eviction_policy_t policy) {
-    cb_assert(policy == FULL_EVICTION);
+    if (policy != FULL_EVICTION) {
+        throw std::invalid_argument("VBucket::isResidentRatioUnderThreshold: "
+                "policy (which is " + std::to_string(policy) +
+                ") must be FULL_EVICTION");
+    }
     size_t num_items = getNumItems(policy);
     size_t num_non_resident_items = getNumNonResidentItems(policy);
     if (threshold >= ((float)(num_items - num_non_resident_items) /
@@ -423,6 +502,20 @@ bool VBucket::isResidentRatioUnderThreshold(float threshold,
         return true;
     } else {
         return false;
+    }
+}
+
+void VBucket::createFilter(size_t key_count, double probability) {
+    // Create the actual bloom filter upon vbucket creation during
+    // scenarios:
+    //      - Bucket creation
+    //      - Rebalance
+    LockHolder lh(bfMutex);
+    if (bFilter == nullptr && tempFilter == nullptr) {
+        bFilter = new BloomFilter(key_count, probability, BFILTER_ENABLED);
+    } else {
+        LOG(EXTENSION_LOG_WARNING, "(vb %" PRIu16 ") Bloom filter / Temp filter"
+            " already exist!", id);
     }
 }
 
@@ -564,29 +657,11 @@ size_t VBucket::getNumOfKeysInFilter() {
     }
 }
 
-void VBucket::addPersistenceNotification(shared_ptr<Callback<uint64_t> > cb) {
-    LockHolder lh(persistedNotificationsMutex);
-    persistedNotifications.push_back(cb);
-}
-
-void VBucket::notifySeqnoPersisted(uint64_t highSeqno) {
-    LockHolder lh(persistedNotificationsMutex);
-    std::list<shared_ptr<Callback<uint64_t>> >::iterator itr =
-                                                persistedNotifications.begin();
-    for (; itr != persistedNotifications.end(); ++itr) {
-        shared_ptr<Callback<uint64_t> > cb = *itr;
-        cb->callback(highSeqno);
-        if (cb->getStatus() == ENGINE_SUCCESS) {
-            persistedNotifications.erase(itr);
-        }
-    }
-}
-
 uint64_t VBucket::nextHLCCas() {
     int64_t adjusted_time = gethrtime();
     uint64_t final_adjusted_time = 0;
 
-    if (time_sync_enabled) {
+    if (time_sync_config == time_sync_t::ENABLED_WITH_DRIFT) {
         adjusted_time += drift_counter;
     }
 
@@ -631,10 +706,13 @@ void VBucket::addStats(bool details, ADD_STAT add_stat, const void *c,
         addStat("queue_drain", dirtyQueueDrain, add_stat, c);
         addStat("queue_age", getQueueAge(), add_stat, c);
         addStat("pending_writes", dirtyQueuePendingWrites, add_stat, c);
-        addStat("db_data_size", fileSpaceUsed, add_stat, c);
-        addStat("db_file_size", fileSize, add_stat, c);
+
+        DBFileInfo fileInfo = shard->getRWUnderlying()->getDbFileInfo(getId());
+
+        addStat("db_data_size", fileInfo.spaceUsed, add_stat, c);
+        addStat("db_file_size", fileInfo.fileSize, add_stat, c);
         addStat("high_seqno", getHighSeqno(), add_stat, c);
-        addStat("uuid", failovers->getLatestEntry().vb_uuid, add_stat, c);
+        addStat("uuid", failovers->getLatestUUID(), add_stat, c);
         addStat("purge_seqno", getPurgeSeqno(), add_stat, c);
         addStat("bloom_filter", getFilterStatusString().data(),
                 add_stat, c);
@@ -642,7 +720,47 @@ void VBucket::addStats(bool details, ADD_STAT add_stat, const void *c,
         addStat("bloom_filter_key_count", getNumOfKeysInFilter(), add_stat, c);
         addStat("max_cas", getMaxCas(), add_stat, c);
         addStat("drift_counter", getDriftCounter(), add_stat, c);
-        addStat("time_sync", time_sync_enabled ? "enabled" : "disabled",
+        addStat("time_sync", isTimeSyncEnabled() ? "enabled" : "disabled",
                 add_stat, c);
+        addStat("rollback_item_count", getRollbackItemCount(), add_stat, c);
     }
+}
+
+void VBucket::decrDirtyQueueMem(size_t decrementBy)
+{
+    size_t oldVal, newVal;
+    do {
+        oldVal = dirtyQueueMem.load(std::memory_order_relaxed);
+        if (oldVal < decrementBy) {
+            newVal = 0;
+        } else {
+            newVal = oldVal - decrementBy;
+        }
+    } while (!dirtyQueueMem.compare_exchange_strong(oldVal, newVal));
+}
+
+void VBucket::decrDirtyQueueAge(uint32_t decrementBy)
+{
+    uint64_t oldVal, newVal;
+    do {
+        oldVal = dirtyQueueAge.load(std::memory_order_relaxed);
+        if (oldVal < decrementBy) {
+            newVal = 0;
+        } else {
+            newVal = oldVal - decrementBy;
+        }
+    } while (!dirtyQueueAge.compare_exchange_strong(oldVal, newVal));
+}
+
+void VBucket::decrDirtyQueuePendingWrites(size_t decrementBy)
+{
+    size_t oldVal, newVal;
+    do {
+        oldVal = dirtyQueuePendingWrites.load(std::memory_order_relaxed);
+        if (oldVal < decrementBy) {
+            newVal = 0;
+        } else {
+            newVal = oldVal - decrementBy;
+        }
+    } while (!dirtyQueuePendingWrites.compare_exchange_strong(oldVal, newVal));
 }

@@ -21,12 +21,13 @@
 #include "locks.h"
 #include "threadtests.h"
 
-#ifdef _MSC_VER
-#define alarm(a)
-#endif
-
 #define NUM_THREADS 50
-#define NUM_TIMES 100000
+#define NUM_TIMES 10000
+
+// Clang analyzer doesn't really understand
+// our custom smart-pointers so we'll skip compiling
+// this test under the clang analyzer
+#ifndef __clang_analyzer__
 
 class Doodad : public RCValue {
 public:
@@ -47,10 +48,10 @@ public:
     }
 
 private:
-    static AtomicValue<int> numInstances;
+    static std::atomic<int> numInstances;
 };
 
-AtomicValue<int> Doodad::numInstances(0);
+std::atomic<int> Doodad::numInstances(0);
 
 class AtomicPtrTest : public Generator<bool> {
 public:
@@ -135,7 +136,9 @@ static void testOperators() {
 }
 
 int main() {
-    alarm(60);
     testOperators();
     testAtomicPtr();
 }
+#else
+int main() {}
+#endif

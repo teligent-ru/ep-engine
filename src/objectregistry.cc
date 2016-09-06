@@ -1,6 +1,6 @@
 /* -*- Mode: C++; tab-width: 4; c-basic-offset: 4; indent-tabs-mode: nil -*- */
 /*
- *     Copyright 2011 Couchbase, Inc
+ *     Copyright 2015 Couchbase, Inc
  *
  *   Licensed under the Apache License, Version 2.0 (the "License");
  *   you may not use this file except in compliance with the License.
@@ -17,13 +17,15 @@
 
 #include "config.h"
 
+#include "objectregistry.h"
+
 #include "threadlocal.h"
 #include "ep_engine.h"
-#include "objectregistry.h"
 #include "stored-value.h"
 
+#if 1
 static ThreadLocal<EventuallyPersistentEngine*> *th;
-static ThreadLocal<AtomicValue<size_t>*> *initial_track;
+static ThreadLocal<std::atomic<size_t>*> *initial_track;
 
 extern "C" {
     static size_t defaultGetAllocSize(const void *) {
@@ -44,8 +46,13 @@ public:
    installer() {
       if (th == NULL) {
          th = new ThreadLocal<EventuallyPersistentEngine*>();
-         initial_track = new ThreadLocal<AtomicValue<size_t>*>();
+         initial_track = new ThreadLocal<std::atomic<size_t>*>();
       }
+   }
+
+   ~installer() {
+       delete initial_track;
+       delete th;
    }
 } install;
 
@@ -55,7 +62,7 @@ static bool verifyEngine(EventuallyPersistentEngine *engine)
        if (getenv("ALLOW_NO_STATS_UPDATE") != NULL) {
            return false;
        } else {
-           cb_assert(engine);
+           throw std::logic_error("verifyEngine: engine should be non-NULL");
        }
    }
    return true;
@@ -80,7 +87,6 @@ void ObjectRegistry::onCreateBlob(const Blob *blob)
        stats.currentSize.fetch_add(size);
        stats.totalValueSize.fetch_add(size);
        stats.numBlob++;
-       cb_assert(stats.currentSize.load() < GIGANTOR);
    }
 }
 
@@ -98,7 +104,6 @@ void ObjectRegistry::onDeleteBlob(const Blob *blob)
        stats.currentSize.fetch_sub(size);
        stats.totalValueSize.fetch_sub(size);
        stats.numBlob--;
-       cb_assert(stats.currentSize.load() < GIGANTOR);
    }
 }
 
@@ -115,7 +120,6 @@ void ObjectRegistry::onCreateStoredValue(const StoredValue *sv)
        }
        stats.numStoredVal++;
        stats.totalStoredValSize.fetch_add(size);
-       cb_assert(stats.currentSize.load() < GIGANTOR);
    }
 }
 
@@ -132,7 +136,6 @@ void ObjectRegistry::onDeleteStoredValue(const StoredValue *sv)
        }
        stats.totalStoredValSize.fetch_sub(size);
        stats.numStoredVal--;
-       cb_assert(stats.currentSize.load() < GIGANTOR);
    }
 }
 
@@ -143,7 +146,6 @@ void ObjectRegistry::onCreateItem(const Item *pItem)
    if (verifyEngine(engine)) {
        EPStats &stats = engine->getEpStats();
        stats.memOverhead.fetch_add(pItem->size() - pItem->getValMemSize());
-       cb_assert(stats.memOverhead.load() < GIGANTOR);
        stats.numItem++;
    }
 }
@@ -154,7 +156,6 @@ void ObjectRegistry::onDeleteItem(const Item *pItem)
    if (verifyEngine(engine)) {
        EPStats &stats = engine->getEpStats();
        stats.memOverhead.fetch_sub(pItem->size() - pItem->getValMemSize());
-       cb_assert(stats.memOverhead.load() < GIGANTOR);
        stats.numItem--;
    }
 }
@@ -175,7 +176,7 @@ EventuallyPersistentEngine *ObjectRegistry::onSwitchThread(
     return old_engine;
 }
 
-void ObjectRegistry::setStats(AtomicValue<size_t>* init_track) {
+void ObjectRegistry::setStats(std::atomic<size_t>* init_track) {
     initial_track->set(init_track);
 }
 
@@ -189,12 +190,6 @@ bool ObjectRegistry::memoryAllocated(size_t mem) {
     }
     EPStats &stats = engine->getEpStats();
     stats.totalMemory.fetch_add(mem);
-    if (stats.memoryTrackerEnabled && stats.totalMemory.load() >= GIGANTOR) {
-        LOG(EXTENSION_LOG_WARNING,
-            "Total memory in memoryAllocated() >= GIGANTOR !!! "
-            "Disable the memory tracker...\n");
-        stats.memoryTrackerEnabled.store(false);
-    }
     return true;
 }
 
@@ -208,15 +203,6 @@ bool ObjectRegistry::memoryDeallocated(size_t mem) {
     }
     EPStats &stats = engine->getEpStats();
     stats.totalMemory.fetch_sub(mem);
-    if (stats.memoryTrackerEnabled && stats.totalMemory.load() >= GIGANTOR) {
-        EXTENSION_LOG_LEVEL logSeverity = EXTENSION_LOG_WARNING;
-        if (stats.isShutdown && !stats.forceShutdown) {
-            logSeverity = EXTENSION_LOG_INFO;
-        }
-        LOG(logSeverity,
-            "Total memory in memoryDeallocated() >= GIGANTOR !!! "
-            "Disable the memory tracker...\n");
-        stats.memoryTrackerEnabled.store(false);
-    }
     return true;
 }
+#endif

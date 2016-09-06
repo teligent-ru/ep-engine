@@ -20,11 +20,16 @@
 
 #include "config.h"
 
-#include "tapconnection.h"
-#include "dcp/stream.h"
+#include <relaxed_atomic.h>
 
-class PassiveStream;
+#include "connmap.h"
+#include "dcp/dcp-types.h"
+#include "dcp/flow-control.h"
+#include "dcp/stream.h"
+#include "tapconnection.h"
+
 class DcpResponse;
+class StreamEndResponse;
 
 class DcpConsumer : public Consumer, public Notifiable {
 typedef std::map<uint32_t, std::pair<uint32_t, uint16_t> > opaque_map;
@@ -82,15 +87,68 @@ public:
 
     void addStats(ADD_STAT add_stat, const void *c);
 
-    void aggregateQueueStats(ConnCounter* aggregator);
+    void aggregateQueueStats(ConnCounter& aggregator);
 
     void notifyStreamReady(uint16_t vbucket);
 
     void closeAllStreams();
 
+    void vbucketStateChanged(uint16_t vbucket, vbucket_state_t state);
+
     process_items_error_t processBufferedItems();
 
-private:
+    uint64_t incrOpaqueCounter();
+
+    uint32_t getFlowControlBufSize();
+
+    void setFlowControlBufSize(uint32_t newSize);
+
+    static const std::string& getControlMsgKey(void);
+
+    bool isStreamPresent(uint16_t vbucket);
+
+    void cancelTask();
+
+    void taskCancelled();
+
+    bool notifiedProcessor(bool to);
+
+    void setProcessorTaskState(enum process_items_error_t to);
+
+    std::string getProcessorTaskStatusStr();
+
+    /**
+     * Check if the enough bytes have been removed from the
+     * flow control buffer, for the consumer to send an ACK
+     * back to the producer.
+     *
+     * @param schedule true if the notification is to be
+     *                 scheduled
+     */
+    void notifyConsumerIfNecessary(bool schedule);
+
+    void setProcessorYieldThreshold(size_t newValue) {
+        processBufferedMessagesYieldThreshold = newValue;
+    }
+
+    void setProcessBufferedMessagesBatchSize(size_t newValue) {
+        processBufferedMessagesBatchSize = newValue;
+    }
+
+protected:
+    /**
+     * Records when the consumer last received a message from producer.
+     * It is used to detect dead connections. The connection is closed
+     * if a message, including a No-Op message, is not seen in a
+     * specified time period.
+     * It is protected so we can access from MockDcpConsumer, for
+     * for testing purposes.
+     */
+    rel_time_t lastMessageTime;
+
+    // Searches the streams map for a stream for vbucket ID. Returns the found
+    // stream, or an empty pointer if none found.
+    SingleThreadedRCPtr<PassiveStream> findStream(uint16_t vbid);
 
     DcpResponse* getNextItem();
 
@@ -109,39 +167,81 @@ private:
 
     ENGINE_ERROR_CODE handleNoop(struct dcp_message_producers* producers);
 
-    ENGINE_ERROR_CODE handleFlowCtl(struct dcp_message_producers* producers);
-
     ENGINE_ERROR_CODE handlePriority(struct dcp_message_producers* producers);
 
     ENGINE_ERROR_CODE handleExtMetaData(struct dcp_message_producers* producers);
 
-    uint64_t opaqueCounter;
-    size_t processTaskId;
-    AtomicValue<bool> itemsToProcess;
-    Mutex streamMutex;
-    std::list<uint16_t> ready;
-    passive_stream_t* streams;
-    opaque_map opaqueMap_;
-    rel_time_t lastNoopTime;
-    uint32_t backoffs;
-    uint32_t noopInterval;
-    bool enableNoop;
-    bool sendNoopInterval;
-    bool setPriority;
-    bool enableExtMetaData;
+    ENGINE_ERROR_CODE handleValueCompression(struct dcp_message_producers* producers);
 
-    struct FlowControl {
-        FlowControl() : enabled(true), pendingControl(true), bufferSize(0),
-                        maxUnackedBytes(0), lastBufferAck(ep_current_time()),
-                        freedBytes(0), ackedBytes(0) {}
-        bool enabled;
-        bool pendingControl;
-        uint32_t bufferSize;
-        uint32_t maxUnackedBytes;
-        rel_time_t lastBufferAck;
-        AtomicValue<uint32_t> freedBytes;
-        AtomicValue<uint64_t> ackedBytes;
-    } flowControl;
+    ENGINE_ERROR_CODE supportCursorDropping(struct dcp_message_producers* producers);
+
+    void notifyVbucketReady(uint16_t vbucket);
+
+    /**
+     * Drain the stream of bufferedItems
+     * The function will stop draining
+     *  - if there's no more data - all_processed
+     *  - if the replication throttle says no more - cannot_process
+     *  - if there's an error, e.g. ETMPFAIL/ENOMEM - cannot_process
+     *  - if we hit the yieldThreshold - more_to_process
+     */
+    process_items_error_t drainStreamsBufferedItems(SingleThreadedRCPtr<PassiveStream>& stream,
+                                                    size_t yieldThreshold);
+
+    uint64_t opaqueCounter;
+    size_t processorTaskId;
+    std::atomic<enum process_items_error_t> processorTaskState;
+
+    DcpReadyQueue vbReady;
+    std::atomic<bool> processorNotification;
+
+    std::mutex readyMutex;
+    std::list<uint16_t> ready;
+
+    // Map of vbid -> passive stream. Map itself is atomic (thread-safe).
+    typedef AtomicUnorderedMap<uint16_t,
+                               SingleThreadedRCPtr<PassiveStream>> PassiveStreamMap;
+    PassiveStreamMap streams;
+
+    opaque_map opaqueMap_;
+
+    Couchbase::RelaxedAtomic<uint32_t> backoffs;
+    // The maximum interval between dcp messages before the consumer disconnects
+    const std::chrono::seconds dcpIdleTimeout;
+    // The interval that the consumer tells the producer to send noops
+    const std::chrono::seconds dcpNoopTxInterval;
+
+    bool pendingEnableNoop;
+    bool pendingSendNoopInterval;
+    bool pendingSetPriority;
+    bool pendingEnableExtMetaData;
+    bool pendingEnableValueCompression;
+    bool pendingSupportCursorDropping;
+    std::atomic<bool> taskAlreadyCancelled;
+
+    FlowControl flowControl;
+
+       /**
+     * An upper bound on how many times drainStreamsBufferedItems will
+     * call into processBufferedMessages before returning and triggering
+     * Processor to yield. Initialised from the configuration
+     *  'dcp_consumer_process_buffered_messages_yield_limit'
+     */
+    size_t processBufferedMessagesYieldThreshold;
+
+    /**
+     * An upper bound on how many items a single consumer stream will process
+     * in one call of stream->processBufferedMessages()
+     */
+    size_t processBufferedMessagesBatchSize;
+
+    static const std::string noopCtrlMsg;
+    static const std::string noopIntervalCtrlMsg;
+    static const std::string connBufferCtrlMsg;
+    static const std::string priorityCtrlMsg;
+    static const std::string extMetadataCtrlMsg;
+    static const std::string valueCompressionCtrlMsg;
+    static const std::string cursorDroppingCtrlMsg;
 };
 
 /*
@@ -152,9 +252,8 @@ class RollbackTask : public GlobalTask {
 public:
     RollbackTask(EventuallyPersistentEngine* e,
                  uint32_t opaque_, uint16_t vbid_,
-                 uint64_t rollbackSeqno_, DcpConsumer *conn,
-                 const Priority &p):
-        GlobalTask(e, p, 0, false), engine(e),
+                 uint64_t rollbackSeqno_, dcp_consumer_t conn):
+        GlobalTask(e, TaskId::RollbackTask, 0, false), engine(e),
         opaque(opaque_), vbid(vbid_), rollbackSeqno(rollbackSeqno_),
         cons(conn) { }
 
@@ -169,7 +268,7 @@ private:
     uint32_t opaque;
     uint16_t vbid;
     uint64_t rollbackSeqno;
-    DcpConsumer* cons;
+    dcp_consumer_t cons;
 };
 
 #endif  // SRC_DCP_CONSUMER_H_

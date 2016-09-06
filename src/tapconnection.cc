@@ -1,6 +1,6 @@
 /* -*- Mode: C++; tab-width: 4; c-basic-offset: 4; indent-tabs-mode: nil -*- */
 /*
- *     Copyright 2010 Couchbase, Inc
+ *     Copyright 2015 Couchbase, Inc
  *
  *   Licensed under the Apache License, Version 2.0 (the "License");
  *   you may not use this file except in compliance with the License.
@@ -19,6 +19,8 @@
 
 #include <limits>
 
+#include <phosphor/phosphor.h>
+
 #include "backfill.h"
 #include "tasks.h"
 #include "ep_engine.h"
@@ -29,7 +31,7 @@
 #include "vbucket.h"
 
 
-AtomicValue<uint64_t> ConnHandler::counter_(1);
+std::atomic<uint64_t> ConnHandler::counter_(1);
 
 const short int TapEngineSpecific::sizeRevSeqno(8);
 const short int TapEngineSpecific::sizeExtra(1);
@@ -43,7 +45,12 @@ void TapEngineSpecific::readSpecificData(uint16_t ev, void *engine_specific,
     if (ev == TAP_CHECKPOINT_START || ev == TAP_CHECKPOINT_END || ev == TAP_DELETION ||
         ev == TAP_MUTATION)
         {
-            cb_assert(nengine >= sizeRevSeqno);
+            if (nengine < sizeRevSeqno) {
+                throw std::invalid_argument("TapEngineSpecific::readSpecificData: "
+                        "nengine (which is " + std::to_string(nengine) +
+                        ") is less than sizeRevSeqno (which is " +
+                        std::to_string(sizeRevSeqno));
+            }
             memcpy(seqnum, engine_specific, sizeRevSeqno);
             *seqnum = ntohll(*seqnum);
             if (ev == TAP_MUTATION && nengine == sizeTotal) {
@@ -153,7 +160,7 @@ ConnHandler::ConnHandler(EventuallyPersistentEngine& e, const void* c,
     stats(engine_.getEpStats()),
     supportCheckpointSync_(false),
     name(n),
-    cookie(c),
+    cookie(const_cast<void*>(c)),
     reserved(false),
     connToken(gethrtime()),
     created(ep_current_time()),
@@ -166,21 +173,21 @@ ConnHandler::ConnHandler(EventuallyPersistentEngine& e, const void* c,
 
 ENGINE_ERROR_CODE ConnHandler::addStream(uint32_t opaque, uint16_t,
                                          uint32_t flags) {
-    LOG(EXTENSION_LOG_WARNING, "%s Disconnecting - This connection doesn't "
-        "support the dcp add stream API", logHeader());
+    logger.log(EXTENSION_LOG_WARNING, "Disconnecting - This connection doesn't "
+        "support the dcp add stream API");
     return ENGINE_DISCONNECT;
 }
 
 ENGINE_ERROR_CODE ConnHandler::closeStream(uint32_t opaque, uint16_t vbucket) {
-    LOG(EXTENSION_LOG_WARNING, "%s Disconnecting - This connection doesn't "
-        "support the dcp close stream API", logHeader());
+    logger.log(EXTENSION_LOG_WARNING, "Disconnecting - This connection doesn't "
+        "support the dcp close stream API");
     return ENGINE_DISCONNECT;
 }
 
 ENGINE_ERROR_CODE ConnHandler::streamEnd(uint32_t opaque, uint16_t vbucket,
                                          uint32_t flags) {
-    LOG(EXTENSION_LOG_WARNING, "%s Disconnecting - This connection doesn't "
-        "support the dcp stream end API", logHeader());
+    logger.log(EXTENSION_LOG_WARNING, "Disconnecting - This connection doesn't "
+        "support the dcp stream end API");
     return ENGINE_DISCONNECT;
 }
 
@@ -192,8 +199,8 @@ ENGINE_ERROR_CODE ConnHandler::mutation(uint32_t opaque, const void* key,
                                         uint64_t bySeqno, uint64_t revSeqno,
                                         uint32_t exptime, uint8_t nru,
                                         const void* meta, uint16_t nmeta) {
-    LOG(EXTENSION_LOG_WARNING, "%s Disconnecting - This connection doesn't "
-        "support the mutation API", logHeader());
+    logger.log(EXTENSION_LOG_WARNING, "Disconnecting - This connection doesn't "
+        "support the mutation API");
     return ENGINE_DISCONNECT;
 }
 
@@ -202,8 +209,8 @@ ENGINE_ERROR_CODE ConnHandler::deletion(uint32_t opaque, const void* key,
                                         uint16_t vbucket, uint64_t bySeqno,
                                         uint64_t revSeqno, const void* meta,
                                         uint16_t nmeta) {
-    LOG(EXTENSION_LOG_WARNING, "%s Disconnecting - This connection doesn't "
-        "support the deletion API", logHeader());
+    logger.log(EXTENSION_LOG_WARNING, "Disconnecting - This connection doesn't "
+        "support the deletion API");
     return ENGINE_DISCONNECT;
 }
 
@@ -212,8 +219,8 @@ ENGINE_ERROR_CODE ConnHandler::expiration(uint32_t opaque, const void* key,
                                           uint16_t vbucket, uint64_t bySeqno,
                                           uint64_t revSeqno, const void* meta,
                                           uint16_t nmeta) {
-    LOG(EXTENSION_LOG_WARNING, "%s Disconnecting - This connection doesn't "
-        "support the expiration API", logHeader());
+    logger.log(EXTENSION_LOG_WARNING, "Disconnecting - This connection doesn't "
+        "support the expiration API");
     return ENGINE_DISCONNECT;
 }
 
@@ -223,22 +230,22 @@ ENGINE_ERROR_CODE ConnHandler::snapshotMarker(uint32_t opaque,
                                               uint64_t end_seqno,
                                               uint32_t flags)
 {
-    LOG(EXTENSION_LOG_WARNING, "%s Disconnecting - This connection doesn't "
-        "support the dcp snapshot marker API", logHeader());
+    logger.log(EXTENSION_LOG_WARNING, "Disconnecting - This connection doesn't "
+        "support the dcp snapshot marker API");
     return ENGINE_DISCONNECT;
 }
 
 ENGINE_ERROR_CODE ConnHandler::flushall(uint32_t opaque, uint16_t vbucket) {
-    LOG(EXTENSION_LOG_WARNING, "%s Disconnecting - This connection doesn't "
-        "support the flush API", logHeader());
+    logger.log(EXTENSION_LOG_WARNING, "Disconnecting - This connection doesn't "
+        "support the flush API");
     return ENGINE_DISCONNECT;
 }
 
 ENGINE_ERROR_CODE ConnHandler::setVBucketState(uint32_t opaque,
                                                uint16_t vbucket,
                                                vbucket_state_t state) {
-    LOG(EXTENSION_LOG_WARNING, "%s Disconnecting - This connection doesn't "
-        "support the set vbucket state API", logHeader());
+    logger.log(EXTENSION_LOG_WARNING, "Disconnecting - This connection doesn't "
+        "support the set vbucket state API");
     return ENGINE_DISCONNECT;
 }
 
@@ -252,51 +259,55 @@ ENGINE_ERROR_CODE ConnHandler::streamRequest(uint32_t flags,
                                              uint64_t snapEndSeqno,
                                              uint64_t *rollback_seqno,
                                              dcp_add_failover_log callback) {
-    LOG(EXTENSION_LOG_WARNING, "%s Disconnecting - This connection doesn't "
-        "support the dcp stream request API", logHeader());
+    logger.log(EXTENSION_LOG_WARNING, "Disconnecting - This connection doesn't "
+        "support the dcp stream request API");
     return ENGINE_DISCONNECT;
 }
 
 ENGINE_ERROR_CODE ConnHandler::getFailoverLog(uint32_t opaque, uint16_t vbucket,
                                               dcp_add_failover_log callback) {
-    LOG(EXTENSION_LOG_WARNING, "%s Disconnecting - This connection doesn't "
-        "support the dcp get failover log API", logHeader());
+    logger.log(EXTENSION_LOG_WARNING, "Disconnecting - This connection doesn't "
+        "support the dcp get failover log API");
     return ENGINE_DISCONNECT;
 }
 
 ENGINE_ERROR_CODE ConnHandler::noop(uint32_t opaque) {
-    LOG(EXTENSION_LOG_WARNING, "%s Disconnecting - This connection doesn't "
-        "support the noop API", logHeader());
+    logger.log(EXTENSION_LOG_WARNING, "Disconnecting - This connection doesn't "
+        "support the noop API");
     return ENGINE_DISCONNECT;
 }
 
 ENGINE_ERROR_CODE ConnHandler::bufferAcknowledgement(uint32_t opaque,
                                                      uint16_t vbucket,
                                                      uint32_t buffer_bytes) {
-    LOG(EXTENSION_LOG_WARNING, "%s Disconnecting - This connection doesn't "
-        "support the buffer acknowledgement API", logHeader());
+    logger.log(EXTENSION_LOG_WARNING, "Disconnecting - This connection doesn't "
+        "support the buffer acknowledgement API");
     return ENGINE_DISCONNECT;
 }
 
 ENGINE_ERROR_CODE ConnHandler::control(uint32_t opaque, const void* key,
                                        uint16_t nkey, const void* value,
                                        uint32_t nvalue) {
-    LOG(EXTENSION_LOG_WARNING, "%s Disconnecting - This connection doesn't "
-        "support the control API", logHeader());
+    logger.log(EXTENSION_LOG_WARNING, "Disconnecting - This connection doesn't "
+        "support the control API");
     return ENGINE_DISCONNECT;
 }
 
 ENGINE_ERROR_CODE ConnHandler::step(struct dcp_message_producers* producers) {
-    LOG(EXTENSION_LOG_WARNING, "%s Disconnecting - This connection doesn't "
-        "support the dcp step API", logHeader());
+    logger.log(EXTENSION_LOG_WARNING, "Disconnecting - This connection doesn't "
+        "support the dcp step API");
     return ENGINE_DISCONNECT;
 }
 
 ENGINE_ERROR_CODE ConnHandler::handleResponse(
                                         protocol_binary_response_header *resp) {
-    LOG(EXTENSION_LOG_WARNING, "%s Disconnecting - This connection doesn't "
-        "support the dcp response handler API", logHeader());
+    logger.log(EXTENSION_LOG_WARNING, "Disconnecting - This connection doesn't "
+        "support the dcp response handler API");
     return ENGINE_DISCONNECT;
+}
+
+const Logger& ConnHandler::getLogger() const {
+    return logger;
 }
 
 void ConnHandler::releaseReference(bool force)
@@ -363,7 +374,7 @@ TapProducer::TapProducer(EventuallyPersistentEngine &e,
     specificData = new uint8_t[TapEngineSpecific::sizeTotal];
 
     size_t maxVbuckets = e.getConfiguration().getMaxVbuckets();
-    transmitted = new AtomicValue<size_t>[maxVbuckets];
+    transmitted = new std::atomic<size_t>[maxVbuckets];
     for (uint16_t i = 0; i < maxVbuckets; ++i) {
         transmitted[i].store(0);
     }
@@ -391,8 +402,7 @@ void TapProducer::setBackfillAge(uint64_t age, bool reconnect) {
 
     if (flags & TAP_CONNECT_FLAG_BACKFILL) {
         backfillAge = age;
-        LOG(EXTENSION_LOG_DEBUG, "%s Backfill age set to %llu\n",
-            logHeader(), age);
+        logger.log(EXTENSION_LOG_DEBUG, "Backfill age set to %" PRIu64, age);
     }
 }
 
@@ -427,10 +437,9 @@ void TapProducer::setVBucketFilter(const std::vector<uint16_t> &vbuckets,
         }
 
         std::stringstream ss;
-        ss << logHeader() << ": Changing the vbucket filter from "
-           << vbucketFilter << " to "
+        ss << "Changing the vbucket filter from " << vbucketFilter << " to "
            << filter << " (diff: " << diff << ")" << std::endl;
-        LOG(EXTENSION_LOG_DEBUG, "%s\n", ss.str().c_str());
+        logger.log(EXTENSION_LOG_DEBUG, "%s", ss.str().c_str());
         vbucketFilter = filter;
 
         std::stringstream f;
@@ -530,7 +539,6 @@ void TapProducer::clearQueues_UNLOCKED() {
     // Clear bg-fetched items.
     while (!backfilledItems.empty()) {
         Item *i(backfilledItems.front());
-        cb_assert(i);
         delete i;
         backfilledItems.pop();
     }
@@ -560,16 +568,14 @@ void TapProducer::clearQueues_UNLOCKED() {
     ackLog_.clear();
 
     stats.memOverhead.fetch_sub(mem_overhead);
-    cb_assert(stats.memOverhead.load() < GIGANTOR);
 
-    LOG(EXTENSION_LOG_WARNING, "%s Clear the tap queues by force", logHeader());
+    logger.log(EXTENSION_LOG_WARNING, "Clear the tap queues by force");
 }
 
 void TapProducer::rollback() {
     LockHolder lh(queueLock);
-    LOG(EXTENSION_LOG_WARNING,
-        "%s Connection is re-established. Rollback unacked messages...",
-        logHeader());
+    logger.log(EXTENSION_LOG_NOTICE,
+               "Connection is re-established. Rollback unacked messages...");
 
     size_t checkpoint_msg_sent = 0;
     size_t ackLogSize = 0;
@@ -604,9 +610,9 @@ void TapProducer::rollback() {
                     if (map_it != checkpointState_.end()) {
                         map_it->second.lastSeqNum = std::numeric_limits<uint32_t>::max();
                     } else {
-                        LOG(EXTENSION_LOG_WARNING,
-                            "%s Checkpoint State for VBucket %d Not Found",
-                            logHeader(), i->vbucket_);
+                        logger.log(EXTENSION_LOG_WARNING,
+                            "Checkpoint State for VBucket %d Not Found",
+                            i->vbucket_);
                     }
                 }
                 addEvent_UNLOCKED(i->item_);
@@ -630,17 +636,16 @@ void TapProducer::rollback() {
                     }
                     break;
                 default:
-                    LOG(EXTENSION_LOG_WARNING,
-                        "%s Internal error in rollback()."
-                        " Tap opaque value %d not implemented",
-                        logHeader(), val);
+                    logger.log(EXTENSION_LOG_WARNING,
+                               "Internal error in rollback(). Tap opaque "
+                               "value %d not implemented", val);
                     abort();
                 }
             }
             break;
         default:
-            LOG(EXTENSION_LOG_WARNING, "%s Internal error in rollback()."
-                " Tap opcode value %d not implemented", logHeader(), i->event_);
+            logger.log(EXTENSION_LOG_WARNING, "Internal error in rollback()."
+                " Tap opcode value %d not implemented", i->event_);
             abort();
         }
         ackLog_.erase(i);
@@ -649,7 +654,6 @@ void TapProducer::rollback() {
     }
 
     stats.memOverhead.fetch_sub(ackLogSize * sizeof(TapLogElement));
-    cb_assert(stats.memOverhead.load() < GIGANTOR);
 
     seqnoReceived = seqno - 1;
     seqnoAckRequested = seqno - 1;
@@ -664,7 +668,7 @@ class ResumeCallback : public GlobalTask {
 public:
     ResumeCallback(EventuallyPersistentEngine &e, Producer *c,
                    double sleepTime)
-        : GlobalTask(&e, Priority::TapResumePriority, sleepTime),
+        : GlobalTask(&e, TaskId::ResumeCallback, sleepTime),
           engine(e), conn(c) {
         std::stringstream ss;
         ss << "Resuming suspended tap connection: " << conn->getName();
@@ -672,6 +676,8 @@ public:
     }
 
     bool run(void) {
+        TRACE_EVENT("ep-engine/task", "ResumeCallback",
+                     PHOSPHOR_PTR(conn.get()));
         if (engine.getEpStats().isShutdown) {
             return false;
         }
@@ -700,15 +706,14 @@ void TapProducer::suspendedConnection_UNLOCKED(bool value)
             ExTask resTapTask = new ResumeCallback(engine_, this,
                                     config.getBackoffSleepTime());
             ExecutorPool::get()->schedule(resTapTask, NONIO_TASK_IDX);
-            LOG(EXTENSION_LOG_WARNING, "%s Suspend for %.2f secs\n",
-                logHeader(), config.getBackoffSleepTime());
+            logger.log(EXTENSION_LOG_NOTICE, "Suspend for %.2f secs",
+                       config.getBackoffSleepTime());
         } else {
             // backoff disabled, or already in a suspended state
             return;
         }
     } else {
-        LOG(EXTENSION_LOG_INFO, "%s Unlocked from the suspended state\n",
-            logHeader());
+        logger.log(EXTENSION_LOG_NOTICE, "Unlocked from the suspended state");
     }
     setSuspended(value);
 }
@@ -764,8 +769,8 @@ void TapProducer::reschedule_UNLOCKED(const std::list<TapLogElement>::iterator &
         }
         break;
     default:
-        LOG(EXTENSION_LOG_WARNING, "%s Internal error in reschedule_UNLOCKED()."
-            " Tap opcode value %d not implemented", logHeader(), iter->event_);
+        logger.log(EXTENSION_LOG_WARNING, "Internal error in reschedule_UNLOCKED()."
+            " Tap opcode value %d not implemented", iter->event_);
         abort();
     }
 }
@@ -796,8 +801,7 @@ ENGINE_ERROR_CODE TapProducer::processAck(uint32_t s,
     size_t num_logs = 0;
     /* Implicit ack _every_ message up until this message */
     while (iter != ackLog_.end() && iter->seqno_ != s) {
-        LOG(EXTENSION_LOG_DEBUG, "%s Implicit ack (#%u)\n", logHeader(),
-            iter->seqno_);
+        logger.log(EXTENSION_LOG_DEBUG, "Implicit ack (#%u)", iter->seqno_);
         ++iter;
         ++num_logs;
     }
@@ -823,16 +827,15 @@ ENGINE_ERROR_CODE TapProducer::processAck(uint32_t s,
                 --opaqueMsgCounter;
                 notifyTapNotificationThread = true;
             }
-            LOG(EXTENSION_LOG_DEBUG, "%s Explicit ack (#%u)\n", logHeader(),
-                iter->seqno_);
+            logger.log(EXTENSION_LOG_DEBUG, "Explicit ack (#%u)", iter->seqno_);
             ++num_logs;
             ++iter;
             ackLog_.erase(ackLog_.begin(), iter);
             isLastAckSucceed = true;
         } else {
             num_logs = 0;
-            LOG(EXTENSION_LOG_WARNING,
-                "%s Explicit ack of nonexisting entry (#%u)\n", logHeader(), s);
+            logger.log(EXTENSION_LOG_WARNING,
+                       "Explicit ack of nonexisting entry (#%u)", s);
         }
 
         if (checkBackfillCompletion_UNLOCKED() || (doTakeOver && ackLog_.empty())) {
@@ -849,14 +852,10 @@ ENGINE_ERROR_CODE TapProducer::processAck(uint32_t s,
         if (mayCompleteDumpOrTakeover_UNLOCKED() && idle_UNLOCKED()) {
             // We've got all of the ack's need, now we can shut down the
             // stream
-            std::stringstream ss;
-            if (dumpQueue) {
-                ss << "TAP dump is completed. ";
-            } else if (doTakeOver) {
-                ss << "TAP takeover is completed. ";
-            }
-            ss << "Disconnecting tap stream <" << getName() << ">";
-            LOG(EXTENSION_LOG_WARNING, "%s", ss.str().c_str());
+            logger.log(EXTENSION_LOG_NOTICE,
+                       "TAP %s is completed. Disconnecting tap stream <%s>",
+                       (dumpQueue ? "dump" : "takeover"),
+                       getName().c_str());
 
             setDisconnect(true);
             setExpiryTime(0);
@@ -870,9 +869,9 @@ ENGINE_ERROR_CODE TapProducer::processAck(uint32_t s,
             suspendedConnection_UNLOCKED(true);
         }
         ++numTapNack;
-        LOG(EXTENSION_LOG_DEBUG,
-            "%s Received temporary TAP nack (#%u): Code: %u (%s)",
-            logHeader(), seqnoReceived, status, msg.c_str());
+        logger.log(EXTENSION_LOG_DEBUG,
+                   "Received temporary TAP nack (#%u): Code: %u (%s)",
+                   seqnoReceived, status, msg.c_str());
 
         // Reschedule _this_ sequence number..
         if (iter != ackLog_.end()) {
@@ -886,9 +885,9 @@ ENGINE_ERROR_CODE TapProducer::processAck(uint32_t s,
     default:
         ackLog_.erase(ackLog_.begin(), iter);
         ++numTapNack;
-        LOG(EXTENSION_LOG_WARNING,
-            "%s Received negative TAP ack (#%u): Code: %u (%s)",
-            logHeader(), seqnoReceived, status, msg.c_str());
+        logger.log(EXTENSION_LOG_WARNING,
+                   "Received negative TAP ack (#%u): Code: %u (%s)",
+                   seqnoReceived, status, msg.c_str());
         setDisconnect(true);
         setExpiryTime(0);
         transmitted[iter->vbucket_]--;
@@ -896,7 +895,6 @@ ENGINE_ERROR_CODE TapProducer::processAck(uint32_t s,
     }
 
     stats.memOverhead.fetch_sub(num_logs * sizeof(TapLogElement));
-    cb_assert(stats.memOverhead.load() < GIGANTOR);
 
     return ret;
 }
@@ -917,7 +915,7 @@ bool TapProducer::checkBackfillCompletion_UNLOCKED() {
             addVBucketHighPriority_UNLOCKED(backfillEnd);
         }
         backfillVBuckets.clear();
-        LOG(EXTENSION_LOG_WARNING, "%s %s\n", logHeader(), ss.str().c_str());
+        logger.log(EXTENSION_LOG_NOTICE, "%s", ss.str().c_str());
 
         rv = true;
     }
@@ -958,23 +956,25 @@ bool TapProducer::waitForOpaqueMsgAck() {
 
 
 bool BGFetchCallback::run() {
+    TRACE_EVENT("ep-engine/task", "BGFetchCallback", vbucket, connToken);
     hrtime_t start = gethrtime();
     RememberingCallback<GetValue> gcb;
 
-    EPStats &stats = epe->getEpStats();
-    EventuallyPersistentStore *epstore = epe->getEpStore();
-    cb_assert(epstore);
+    EPStats &stats = epe.getEpStats();
+    EventuallyPersistentStore *epstore = epe.getEpStore();
+    if (epstore == nullptr) {
+        throw std::logic_error("BGFetchCallback::run: epstore is NULL");
+    }
 
     epstore->getROUnderlying(vbucket)->get(key, vbucket, gcb, true);
     gcb.waitForValue();
-    cb_assert(gcb.fired);
 
     if (gcb.val.getStatus() != ENGINE_SUCCESS) {
         CompletedBGFetchTapOperation tapop(connToken, vbucket);
-        epe->getTapConnMap().performOp(name, tapop, gcb.val.getValue());
+        epe.getTapConnMap().performOp(name, tapop, gcb.val.getValue());
         if (gcb.val.getStatus() != ENGINE_KEY_ENOENT) {
             LOG(EXTENSION_LOG_WARNING,
-                "Warning: failed TAP background fetch for VBucket %d, TAP %s"
+                "Failed TAP background fetch for VBucket %d, TAP %s"
                 " with the status code (%d)\n",
                 vbucket, name.c_str(), gcb.val.getStatus());
         }
@@ -982,7 +982,7 @@ bool BGFetchCallback::run() {
     }
 
     CompletedBGFetchTapOperation tapop(connToken, vbucket);
-    if (!epe->getTapConnMap().performOp(name, tapop, gcb.val.getValue())) {
+    if (!epe.getTapConnMap().performOp(name, tapop, gcb.val.getValue())) {
         delete gcb.val.getValue(); // connection is closed. Free an item instance.
     }
 
@@ -1028,16 +1028,21 @@ const char *TapProducer::opaqueCmdToString(uint32_t opaque_code) {
 }
 
 void TapProducer::queueBGFetch_UNLOCKED(const std::string &key, uint64_t id, uint16_t vb) {
-    ExTask task = new BGFetchCallback(&engine(), getName(), key, vb,
-                                      getConnectionToken(),
-                                      Priority::TapBgFetcherPriority, 0);
+    ExTask task = new BGFetchCallback(engine(), getName(), key, vb,
+                                      getConnectionToken(), 0);
     ExecutorPool::get()->schedule(task, AUXIO_TASK_IDX);
     ++bgJobIssued;
     std::map<uint16_t, CheckpointState>::iterator it = checkpointState_.find(vb);
     if (it != checkpointState_.end()) {
         ++(it->second.bgJobIssued);
     }
-    cb_assert(bgJobIssued > bgJobCompleted);
+    if (bgJobIssued <= bgJobCompleted) {
+        throw std::logic_error("TapProducer::queueBGFetch_UNLOCKED: "
+                "postcondition bgJobIssued (which is " +
+                std::to_string(bgJobIssued.load()) +
+                ") > bgJobCompleted (which is " +
+                std::to_string(bgJobCompleted.load()) + ") failed");
+    }
 }
 
 void TapProducer::completeBGFetchJob(Item *itm, uint16_t vbid, bool implicitEnqueue) {
@@ -1057,7 +1062,13 @@ void TapProducer::completeBGFetchJob(Item *itm, uint16_t vbid, bool implicitEnqu
     if (it != checkpointState_.end()) {
         ++(it->second.bgJobCompleted);
     }
-    cb_assert(bgJobIssued >= bgJobCompleted);
+    if (bgJobIssued < bgJobCompleted) {
+        throw std::logic_error("TapProducer::completeBGFetchJob: "
+                "postcondition bgJobIssued (which is " +
+                std::to_string(bgJobIssued.load()) +
+                ") >= bgJobCompleted (which is " +
+                std::to_string(bgJobCompleted.load()) + ") failed");
+    }
 
     if (itm && vbucketFilter(itm->getVBucketId())) {
         backfilledItems.push(itm);
@@ -1066,16 +1077,21 @@ void TapProducer::completeBGFetchJob(Item *itm, uint16_t vbid, bool implicitEnqu
             ++(it->second.bgResultSize);
         }
         stats.memOverhead.fetch_add(sizeof(Item *));
-        cb_assert(stats.memOverhead.load() < GIGANTOR);
     } else {
         delete itm;
     }
 }
 
 Item* TapProducer::nextBgFetchedItem_UNLOCKED() {
-    cb_assert(!backfilledItems.empty());
+    if (backfilledItems.empty()) {
+        throw std::logic_error("TapProducer::nextBgFetchedItem_UNLOCKED: "
+                "backfilledItems is empty");
+    }
     Item *rv = backfilledItems.front();
-    cb_assert(rv);
+    if (rv == nullptr) {
+        throw std::logic_error("TapProducer::nextBgFetchedItem_UNLOCKED: "
+                "front item on backfilledItems queue is NULL");
+    }
     backfilledItems.pop();
     --bgResultSize;
 
@@ -1086,7 +1102,6 @@ Item* TapProducer::nextBgFetchedItem_UNLOCKED() {
     }
 
     stats.memOverhead.fetch_sub(sizeof(Item *));
-    cb_assert(stats.memOverhead.load() < GIGANTOR);
 
     return rv;
 }
@@ -1148,12 +1163,11 @@ void TapProducer::addStats(ADD_STAT add_stat, const void *c) {
 
     std::set<uint16_t> vbs = vbucketFilter.getVBSet();
     if (vbs.empty()) {
-        std::vector<int> ids = engine_.getEpStore()->getVBuckets().getBuckets();
-        std::vector<int>::iterator itr;
-        for (itr = ids.begin(); itr != ids.end(); ++itr) {
+        auto vbuckets = engine_.getEpStore()->getVBuckets().getBuckets();
+        for (auto vbid : vbuckets) {
             std::stringstream msg;
-            msg << "sent_from_vb_" << *itr;
-            addStat(msg.str().c_str(), transmitted[*itr], add_stat, c);
+            msg << "sent_from_vb_" << vbid;
+            addStat(msg.str().c_str(), transmitted[vbid], add_stat, c);
         }
     } else {
         std::set<uint16_t>::iterator itr;
@@ -1165,26 +1179,25 @@ void TapProducer::addStats(ADD_STAT add_stat, const void *c) {
     }
 }
 
-void TapProducer::aggregateQueueStats(ConnCounter* aggregator) {
+void TapProducer::aggregateQueueStats(ConnCounter& aggregator) {
     LockHolder lh(queueLock);
-    if (!aggregator) {
-        LOG(EXTENSION_LOG_WARNING,
-            "%s Pointer to the queue stats aggregator is NULL!!!", logHeader());
-        return;
-    }
-    aggregator->conn_queue += getQueueSize_UNLOCKED();
-    aggregator->conn_queueFill += queueFill;
-    aggregator->conn_queueDrain += queueDrain;
-    aggregator->conn_queueBackoff += numTapNack;
-    aggregator->conn_queueBackfillRemaining += getBackfillRemaining_UNLOCKED();
-    aggregator->conn_queueItemOnDisk += (bgJobIssued - bgJobCompleted);
-    aggregator->conn_totalBacklogSize += getBackfillRemaining_UNLOCKED() +
+    aggregator.conn_queue += getQueueSize_UNLOCKED();
+    aggregator.conn_queueFill += queueFill;
+    aggregator.conn_queueDrain += queueDrain;
+    aggregator.conn_queueBackoff += numTapNack;
+    aggregator.conn_queueBackfillRemaining += getBackfillRemaining_UNLOCKED();
+    aggregator.conn_queueItemOnDisk += (bgJobIssued - bgJobCompleted);
+    aggregator.conn_totalBacklogSize += getBackfillRemaining_UNLOCKED() +
         getRemainingOnCheckpoints_UNLOCKED();
 }
 
 void TapProducer::processedEvent(uint16_t event, ENGINE_ERROR_CODE)
 {
-    cb_assert(event == TAP_ACK);
+    if (event != TAP_ACK) {
+        throw std::invalid_argument("TapProducer::processedEvent: Unexpected "
+                "event - event (which is " + std::to_string(event) +
+                ") is not TAP_ACK (" + std::to_string(TAP_ACK) + ")");
+    }
 }
 
 
@@ -1220,9 +1233,9 @@ queued_item TapProducer::nextFgFetched_UNLOCKED(bool &shouldPause) {
             uint16_t vbid = it->first;
             RCPtr<VBucket> vb = vbuckets.getBucket(vbid);
             if (!vb || (vb->getState() == vbucket_state_dead && !doTakeOver)) {
-                LOG(EXTENSION_LOG_WARNING,
-                    "%s Skip vbucket %d checkpoint queue as it's in invalid state.",
-                    logHeader(), vbid);
+                logger.log(EXTENSION_LOG_WARNING,
+                           "Skip vbucket %d checkpoint queue as it's in invalid state.",
+                           vbid);
                 ++invalid_count;
                 continue;
             }
@@ -1301,7 +1314,6 @@ queued_item TapProducer::nextFgFetched_UNLOCKED(bool &shouldPause) {
             queueMemSize.store(0);
         }
         stats.memOverhead.fetch_sub(sizeof(queued_item));
-        cb_assert(stats.memOverhead.load() < GIGANTOR);
         ++recordsFetched;
         return qi;
     }
@@ -1372,9 +1384,8 @@ void TapProducer::scheduleBackfill_UNLOCKED(const std::vector<uint16_t> &vblist)
     for (; it != new_vblist.end(); ++it) {
         RCPtr<VBucket> vb = vbuckets.getBucket(*it);
         if (!vb) {
-            LOG(EXTENSION_LOG_WARNING,
-                "%s VBucket %d not exist for backfill. Skip it...\n",
-                logHeader(), *it);
+            logger.log(EXTENSION_LOG_WARNING,
+                       "VBucket %d not exist for backfill. Skip it.", *it);
             continue;
         }
 
@@ -1383,8 +1394,8 @@ void TapProducer::scheduleBackfill_UNLOCKED(const std::vector<uint16_t> &vblist)
         VBucketEvent hi(TAP_OPAQUE, *it,
                         (vbucket_state_t)htonl(TAP_OPAQUE_INITIAL_VBUCKET_STREAM));
         addVBucketHighPriority_UNLOCKED(hi);
-        LOG(EXTENSION_LOG_WARNING, "%s Schedule the backfill for vbucket %d",
-            logHeader(), *it);
+        logger.log(EXTENSION_LOG_NOTICE, "Schedule the backfill for vbucket %d",
+                   *it);
     }
 
     if (!new_vblist.empty()) {
@@ -1404,13 +1415,17 @@ VBucketEvent TapProducer::checkDumpOrTakeOverCompletion() {
         if (ev.event != TAP_PAUSE) {
             RCPtr<VBucket> vb = engine_.getVBucket(ev.vbucket);
             vbucket_state_t myState(vb ? vb->getState() : vbucket_state_dead);
-            cb_assert(ev.event == TAP_VBUCKET_SET);
+            if (ev.event != TAP_VBUCKET_SET) {
+                throw std::logic_error("TapProducer::checkDumpOrTakeOverCompletion: "
+                        "ev.event (which is " + std::to_string(ev.event) +
+                        ") is not TAP_VBUCKET_SET");
+            }
             if (ev.state == vbucket_state_active && myState == vbucket_state_active &&
                 ackLog_.size() < MAX_TAKEOVER_TAP_LOG_SIZE) {
                 // Set vbucket state to dead if the number of items waiting for
                 // implicit acks is less than the threshold.
-                LOG(EXTENSION_LOG_WARNING, "%s VBucket <%d> is going dead to "
-                    "complete vbucket takeover", logHeader(), ev.vbucket);
+                logger.log(EXTENSION_LOG_NOTICE, "VBucket <%d> is going dead to "
+                           "complete vbucket takeover", ev.vbucket);
                 engine_.getEpStore()->setVBucketState(ev.vbucket, vbucket_state_dead, false);
                 setTakeOverCompletionPhase(true);
             }
@@ -1425,8 +1440,7 @@ VBucketEvent TapProducer::checkDumpOrTakeOverCompletion() {
         } else if (!ackLog_.empty()) {
             ev.event = TAP_PAUSE;
         } else {
-            LOG(EXTENSION_LOG_WARNING, "%s Disconnecting tap stream.",
-                logHeader());
+            logger.log(EXTENSION_LOG_WARNING, "Disconnecting tap stream.");
             setDisconnect(true);
             ev.event = TAP_DISCONNECT;
         }
@@ -1442,7 +1456,6 @@ bool TapProducer::addEvent_UNLOCKED(const queued_item &it) {
         ++queueSize;
         queueMemSize.fetch_add(sizeof(queued_item));
         stats.memOverhead.fetch_add(sizeof(queued_item));
-        cb_assert(stats.memOverhead.load() < GIGANTOR);
         return wasEmpty;
     } else {
         return queue->empty();
@@ -1532,29 +1545,12 @@ size_t TapProducer::getQueueSize_UNLOCKED() {
 void TapProducer::flush() {
     LockHolder lh(queueLock);
 
-    LOG(EXTENSION_LOG_WARNING, "%s Clear tap queues as part of flush operation",
-        logHeader());
+    logger.log(EXTENSION_LOG_NOTICE, "Clear tap queues as part of flush operation");
 
     pendingFlush = true;
     clearQueues_UNLOCKED();
 }
 
-void TapProducer::appendQueue(std::list<queued_item> *q) {
-    LockHolder lh(queueLock);
-    size_t count = 0;
-    std::list<queued_item>::iterator it = q->begin();
-    for (; it != q->end(); ++it) {
-        if (vbucketFilter((*it)->getVBucketId())) {
-            queue->push_back(*it);
-            ++count;
-        }
-    }
-    queueSize += count;
-    stats.memOverhead.fetch_add(count * sizeof(queued_item));
-    cb_assert(stats.memOverhead.load() < GIGANTOR);
-    queueMemSize.fetch_add(count * sizeof(queued_item));
-    q->clear();
-}
 
 bool TapProducer::runBackfill(VBucketFilter &vbFilter) {
     LockHolder lh(queueLock);
@@ -1610,8 +1606,8 @@ void TapProducer::evaluateFlags()
         m << flags << " (" << ss.str().substr(1) << ")";
         flagsText.assign(m.str());
 
-        LOG(EXTENSION_LOG_DEBUG, "%s TAP connection option flags %s",
-            logHeader(), m.str().c_str());
+        logger.log(EXTENSION_LOG_DEBUG, "TAP connection option flags %s",
+                   m.str().c_str());
     }
 }
 
@@ -1667,17 +1663,14 @@ void TapProducer::registerCursor(const std::map<uint16_t, uint64_t> &lastCheckpo
     uint64_t current_time = (uint64_t)ep_real_time();
     std::vector<uint16_t> backfill_vbuckets;
     const VBucketMap &vbuckets = engine_.getEpStore()->getVBuckets();
-    size_t numOfVBuckets = vbuckets.getSize();
-    for (size_t i = 0; i < numOfVBuckets; ++i) {
-        cb_assert(i <= std::numeric_limits<uint16_t>::max());
-        uint16_t vbid = static_cast<uint16_t>(i);
+    for (VBucketMap::id_type vbid = 0; vbid < vbuckets.getSize(); ++vbid) {
         if (vbucketFilter(vbid)) {
             RCPtr<VBucket> vb = vbuckets.getBucket(vbid);
             if (!vb) {
                 checkpointState_.erase(vbid);
-                LOG(EXTENSION_LOG_WARNING,
-                    "%s VBucket %d not found for TAP cursor. Skip it...\n",
-                    logHeader(), vbid);
+                logger.log(EXTENSION_LOG_WARNING,
+                           "VBucket %d not found for TAP cursor. Skip it.",
+                           vbid);
                 continue;
             }
 
@@ -1705,7 +1698,11 @@ void TapProducer::registerCursor(const std::map<uint16_t, uint64_t> &lastCheckpo
             // If backfill is currently running for this vbucket, skip the cursor registration.
             if (backfillVBuckets.find(vbid) != backfillVBuckets.end()) {
                 cit = checkpointState_.find(vbid);
-                cb_assert(cit != checkpointState_.end());
+                if (cit == checkpointState_.end()) {
+                    throw std::logic_error("TapProducer::registerCursor: "
+                            "Failed to find checkpoint for vbid " +
+                            std::to_string(vbid) + " in checkpointState");
+                }
                 cit->second.currentCheckpointId = 0;
                 cit->second.state = backfill;
                 continue;
@@ -1725,8 +1722,13 @@ void TapProducer::registerCursor(const std::map<uint16_t, uint64_t> &lastCheckpo
             bool prev_session_completed =
                 engine_.getTapConnMap().prevSessionReplicaCompleted(getName());
             // Check if the unified queue contains the checkpoint to start with.
-            bool chk_exists = vb->checkpointManager.registerCursor(getName(),
-                                                                   chk_id_to_start);
+            bool chk_exists = vb->checkpointManager.registerCursor(
+                                                getName(),
+                                                chk_id_to_start,
+                                                /* alwaysFromBeginning */
+                                                false,
+                                                MustSendCheckpointEnd::YES);
+
             if(!prev_session_completed || !chk_exists) {
                 uint64_t chk_id;
                 proto_checkpoint_state cstate;
@@ -1743,21 +1745,23 @@ void TapProducer::registerCursor(const std::map<uint16_t, uint64_t> &lastCheckpo
                 } else { // Backfill age is in the future, simply start from the first checkpoint.
                     chk_id = vb->checkpointManager.getCheckpointIdForCursor(getName());
                     cstate = checkpoint_start;
-                    LOG(EXTENSION_LOG_INFO,
-                        "%s Backfill age is greater than current time."
-                        " Full backfill is not required for vbucket %d\n",
-                        logHeader(), vbid);
+                    logger.log(EXTENSION_LOG_INFO,
+                        "Backfill age is greater than current time."
+                        " Full backfill is not required for vbucket %d", vbid);
                 }
 
                 cit = checkpointState_.find(vbid);
-                cb_assert(cit != checkpointState_.end());
+                if(cit == checkpointState_.end()) {
+                    throw std::logic_error("TapProducer::registerCursor: "
+                            "Failed to find checkpoint for vbid " +
+                            std::to_string(vbid) + " in checkpointState (2)");
+                }
                 cit->second.currentCheckpointId = chk_id;
                 cit->second.state = cstate;
             } else {
-                LOG(EXTENSION_LOG_INFO,
-                    "%s The checkpoint to start with is still in memory. "
-                    "Full backfill is not required for vbucket %d\n",
-                    logHeader(), vbid);
+                logger.log(EXTENSION_LOG_INFO,
+                    "The checkpoint to start with is still in memory. "
+                    "Full backfill is not required for vbucket %d", vbid);
             }
         } else { // The vbucket doesn't belong to this tap connection anymore.
             checkpointState_.erase(vbid);
@@ -1788,9 +1792,9 @@ Item* TapProducer::getNextItem(const void *c, uint16_t *vbucket, uint16_t &ret,
             ret = TAP_CHECKPOINT_END;
             break;
         default:
-            LOG(EXTENSION_LOG_WARNING,
-                "%s Checkpoint start or end msg with incorrect opcode %d",
-                logHeader(), checkpoint_msg->getOperation());
+            logger.log(EXTENSION_LOG_WARNING,
+                "Checkpoint start or end msg with incorrect opcode %d",
+                checkpoint_msg->getOperation());
             ret = TAP_DISCONNECT;
             return NULL;
         }
@@ -1812,9 +1816,9 @@ Item* TapProducer::getNextItem(const void *c, uint16_t *vbucket, uint16_t &ret,
         itm = nextBgFetchedItem_UNLOCKED();
         *vbucket = itm->getVBucketId();
         if (!vbucketFilter(*vbucket)) {
-            LOG(EXTENSION_LOG_WARNING,
-                "%s Drop a backfill item because vbucket %d is no longer valid"
-                " against vbucket filter.\n", logHeader(), *vbucket);
+            logger.log(EXTENSION_LOG_NOTICE,
+                "Drop a backfill item because vbucket %d is no longer valid"
+                " against vbucket filter.", *vbucket);
             // We were going to use the item that we received from
             // disk, but the filter says not to, so we need to get rid
             // of it now.
@@ -1823,10 +1827,12 @@ Item* TapProducer::getNextItem(const void *c, uint16_t *vbucket, uint16_t &ret,
             return NULL;
         }
 
+        get_options_t options = DELETE_TEMP;
+
         // If there's a better version in memory, grab it,
         // else go with what we pulled from disk.
         GetValue gv(engine_.getEpStore()->get(itm->getKey(), itm->getVBucketId(),
-                                              c, false, false, false));
+                                              c, options));
         if (gv.getStatus() == ENGINE_SUCCESS) {
             delete itm;
             itm = gv.getValue();
@@ -1843,8 +1849,8 @@ Item* TapProducer::getNextItem(const void *c, uint16_t *vbucket, uint16_t &ret,
                                   itm->getRevSeqno(), itm->getBySeqno()));
     } else if (hasItemFromVBHashtable_UNLOCKED()) { // Item from memory backfill or checkpoints
         if (waitForCheckpointMsgAck()) {
-            LOG(EXTENSION_LOG_INFO, "%s Waiting for an ack for "
-                "checkpoint_start/checkpoint_end  messages", logHeader());
+            logger.log(EXTENSION_LOG_INFO, "Waiting for an ack for "
+                       "checkpoint_start/checkpoint_end messages");
             ret = TAP_PAUSE;
             return NULL;
         }
@@ -1862,12 +1868,16 @@ Item* TapProducer::getNextItem(const void *c, uint16_t *vbucket, uint16_t &ret,
         }
 
         if (qi->getOperation() == queue_op_set) {
+            get_options_t options = DELETE_TEMP;
             GetValue gv(engine_.getEpStore()->get(qi->getKey(), qi->getVBucketId(),
-                                                  c, false, false, false));
+                                                  c, options));
             ENGINE_ERROR_CODE r = gv.getStatus();
             if (r == ENGINE_SUCCESS) {
                 itm = gv.getValue();
-                cb_assert(itm);
+                if (itm == nullptr) {
+                    throw std::logic_error("TapProducer::getNextItem: found a"
+                            " NULL value for GetValue from queue_op_set");
+                }
                 nru = gv.getNRUValue();
                 ret = TAP_MUTATION;
             } else if (r == ENGINE_KEY_ENOENT) {
@@ -1892,13 +1902,13 @@ Item* TapProducer::getNextItem(const void *c, uint16_t *vbucket, uint16_t &ret,
                 return NULL;
             } else {
                 if (r == ENGINE_NOT_MY_VBUCKET) {
-                    LOG(EXTENSION_LOG_WARNING, "%s Trying to fetch an item for "
+                    logger.log(EXTENSION_LOG_WARNING, "Trying to fetch an item for "
                         "vbucket %d that doesn't exist on this server",
-                        logHeader(), qi->getVBucketId());
+                        qi->getVBucketId());
                     ret = TAP_NOOP;
                 } else {
-                    LOG(EXTENSION_LOG_WARNING, "%s Tap internal error with "
-                        "status %d. Disconnecting", logHeader(), r);
+                    logger.log(EXTENSION_LOG_WARNING, "Tap internal error with "
+                        "status %d. Disconnecting", r);
                     ret = TAP_DISCONNECT;
                 }
                 return NULL;
@@ -2006,25 +2016,28 @@ ENGINE_ERROR_CODE Consumer::setVBucketState(uint32_t opaque, uint16_t vbucket,
     (void) opaque;
 
     if (!is_valid_vbucket_state_t(state)) {
-        LOG(EXTENSION_LOG_WARNING,
-                "%s Received an invalid vbucket state. Force disconnect\n",
-                logHeader());
+        logger.log(EXTENSION_LOG_WARNING,
+                   "Received an invalid vbucket state. Force disconnect");
         return ENGINE_DISCONNECT;
     }
 
-    LOG(EXTENSION_LOG_INFO,
-        "%s Received TAP/DCP_VBUCKET_SET with vbucket %d and state \"%s\"\n",
-        logHeader(), vbucket, VBucket::toString(state));
+    logger.log(EXTENSION_LOG_INFO,
+               "Received TAP/DCP_VBUCKET_SET with vbucket %d and state \"%s\"",
+               vbucket, VBucket::toString(state));
 
-    return engine_.getEpStore()->setVBucketState(vbucket, state, true);
+    // For TAP-based VBucket takeover, we should create a new VBucket UUID
+    // to prevent any potential data loss after fully switching from TAP to
+    // DCP. Please refer to https://issues.couchbase.com/browse/MB-15837 for
+    // more details.
+    return engine_.getEpStore()->setVBucketState(vbucket, state, false);
 }
 
 void Consumer::processedEvent(uint16_t event, ENGINE_ERROR_CODE ret)
 {
     switch (event) {
     case TAP_ACK:
-        LOG(EXTENSION_LOG_WARNING, "%s Consumer should never recieve a tap ack",
-            logHeader());
+        logger.log(EXTENSION_LOG_WARNING,
+                   "Consumer should never recieve a tap ack");
         abort();
         break;
 
@@ -2116,9 +2129,9 @@ bool TapConsumer::processCheckpointCommand(uint8_t event, uint16_t vbucket,
     // If the vbucket is in active, but not allowed to accept checkpoint
     // messaages, simply ignore those messages.
     if (vb->getState() == vbucket_state_active) {
-        LOG(EXTENSION_LOG_INFO,
-            "%s Checkpoint %llu ignored because vbucket %d is in active state",
-            logHeader(), checkpointId, vbucket);
+        logger.log(EXTENSION_LOG_INFO,
+                   "Checkpoint %" PRIu64 " ignored because vbucket %d is in "
+                   "active state", checkpointId, vbucket);
         return true;
     }
 
@@ -2126,9 +2139,9 @@ bool TapConsumer::processCheckpointCommand(uint8_t event, uint16_t vbucket,
     switch (event) {
     case TAP_CHECKPOINT_START:
         {
-            LOG(EXTENSION_LOG_INFO,
-                "%s Received checkpoint_start message with id %llu for vbucket %d",
-                logHeader(), checkpointId, vbucket);
+            logger.log(EXTENSION_LOG_INFO,
+                       "Received checkpoint_start message with id %" PRIu64
+                       " for vbucket %d", checkpointId, vbucket);
             if (vb->isBackfillPhase() && checkpointId > 0) {
                 setBackfillPhase(false, vbucket);
             }
@@ -2137,15 +2150,15 @@ bool TapConsumer::processCheckpointCommand(uint8_t event, uint16_t vbucket,
         }
         break;
     case TAP_CHECKPOINT_END:
-        LOG(EXTENSION_LOG_INFO,
-            "%s Received checkpoint_end message with id %llu for vbucket %d",
-            logHeader(), checkpointId, vbucket);
+        logger.log(EXTENSION_LOG_INFO,
+                   "Received checkpoint_end message with id %" PRIu64
+                   " for vbucket %d", checkpointId, vbucket);
         ret = vb->checkpointManager.closeOpenCheckpoint();
         break;
     default:
-        LOG(EXTENSION_LOG_WARNING,
-            "%s Invalid checkpoint message type (%d) for vbucket %d",
-            logHeader(), event, vbucket);
+        logger.log(EXTENSION_LOG_WARNING,
+                   "Invalid checkpoint message type (%d) for vbucket %d",
+                   event, vbucket);
         ret = false;
         break;
     }
@@ -2162,16 +2175,25 @@ ENGINE_ERROR_CODE TapConsumer::mutation(uint32_t opaque, const void* key,
                                         const void* meta, uint16_t nmeta) {
     ENGINE_ERROR_CODE ret = ENGINE_SUCCESS;
 
+    // MB-17517: Check for the incoming item's CAS validity.
+    if (!Item::isValidCas(cas)) {
+        LOG(EXTENSION_LOG_WARNING,
+            "%s Invalid CAS (0x%" PRIx64 ") received for mutation {vb:%" PRIu16
+            ", seqno:%" PRIu64 "}. Regenerating new CAS",
+            logHeader(), cas, vbucket, bySeqno);
+        cas = Item::nextCas();
+    }
+
     Item *item = new Item(key, nkey, flags, exptime, value, nvalue,
                           &datatype, EXT_META_LEN, cas, -1,
-                          vbucket, revSeqno);
+                          vbucket, revSeqno, nru);
 
     EventuallyPersistentStore* epstore = engine_.getEpStore();
     if (isBackfillPhase(vbucket)) {
-        ret = epstore->addTAPBackfillItem(*item, nru, true);
+        ret = epstore->addTAPBackfillItem(*item, true);
     }
     else {
-        ret = epstore->setWithMeta(*item, 0, NULL, this, true, true, nru, true,
+        ret = epstore->setWithMeta(*item, 0, NULL, this, true, true, true,
                                    NULL, true);
     }
 
@@ -2182,8 +2204,8 @@ ENGINE_ERROR_CODE TapConsumer::mutation(uint32_t opaque, const void* key,
             ret = ENGINE_TMPFAIL;
         }
         else {
-            LOG(EXTENSION_LOG_WARNING, "%s Connection does not support "
-                "tap ack'ing.. Force disconnect", logHeader());
+            logger.log(EXTENSION_LOG_WARNING, "Connection does not support "
+                "tap ack'ing.. Force disconnect");
             ret = ENGINE_DISCONNECT;
         }
     }
@@ -2193,8 +2215,8 @@ ENGINE_ERROR_CODE TapConsumer::mutation(uint32_t opaque, const void* key,
     }
 
     if (ret == ENGINE_DISCONNECT) {
-        LOG(EXTENSION_LOG_WARNING, "%s Failed to apply tap mutation. "
-            "Force disconnect", logHeader());
+        logger.log(EXTENSION_LOG_WARNING, "Failed to apply tap mutation. "
+            "Force disconnect");
     }
 
     return ret;
@@ -2210,7 +2232,12 @@ ENGINE_ERROR_CODE TapConsumer::deletion(uint32_t opaque, const void* key,
     ENGINE_ERROR_CODE ret = ENGINE_SUCCESS;
     EventuallyPersistentStore* epstore = engine_.getEpStore();
 
-    if (cas == 0) {
+    // MB-17517: Check for the incoming item's CAS validity.
+    if (!Item::isValidCas(cas)) {
+        LOG(EXTENSION_LOG_WARNING,
+            "%s Invalid CAS (0x%" PRIx64 ") received for deletion {vb:%" PRIu16
+            ", seqno:%" PRIu64 "}. Regenerating new CAS",
+            logHeader(), cas, vbucket, bySeqno);
         cas = Item::nextCas();
     }
 

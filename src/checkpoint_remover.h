@@ -23,11 +23,10 @@
 #include <set>
 #include <string>
 
-#include "common.h"
 #include "tasks.h"
-#include "stats.h"
 
 class EventuallyPersistentEngine;
+class EPstats;
 
 /**
  * Dispatcher job responsible for removing closed unreferenced checkpoints
@@ -43,8 +42,10 @@ public:
      */
     ClosedUnrefCheckpointRemoverTask(EventuallyPersistentEngine *e,
                                      EPStats &st, size_t interval) :
-        GlobalTask(e, Priority::CheckpointRemoverPriority, interval, false),
+        GlobalTask(e, TaskId::ClosedUnrefCheckpointRemoverTask, interval, false),
         engine(e), stats(st), sleepTime(interval), available(true) {}
+
+    void cursorDroppingIfNeeded(void);
 
     bool run(void);
 
@@ -57,7 +58,7 @@ private:
     EventuallyPersistentEngine *engine;
     EPStats                   &stats;
     size_t                     sleepTime;
-    bool                       available;
+    std::atomic<bool>          available;
 };
 
 #endif  // SRC_CHECKPOINT_REMOVER_H_

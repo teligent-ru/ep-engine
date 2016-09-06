@@ -23,7 +23,7 @@
 #include "ext_meta_parser.h"
 #include "item.h"
 
-typedef enum {
+enum dcp_event_t {
     DCP_MUTATION,
     DCP_DELETION,
     DCP_EXPIRATION,
@@ -33,15 +33,20 @@ typedef enum {
     DCP_STREAM_END,
     DCP_SNAPSHOT_MARKER,
     DCP_ADD_STREAM
-} dcp_event_t;
+};
 
 
-typedef enum {
+enum dcp_marker_flag_t {
     MARKER_FLAG_MEMORY = 0x01,
     MARKER_FLAG_DISK   = 0x02,
     MARKER_FLAG_CHK    = 0x04,
     MARKER_FLAG_ACK    = 0x08
-} dcp_marker_flag_t;
+};
+
+typedef enum {
+    KEY_VALUE,
+    KEY_ONLY
+} MutationPayload;
 
 class DcpResponse {
 public:
@@ -56,6 +61,31 @@ public:
 
     dcp_event_t getEvent() {
         return event_;
+    }
+
+    /* Returns true if this response is a meta event (i.e. not an operation on
+     * an actual user document.
+     */
+    bool isMetaEvent() const {
+        switch (event_) {
+        case DCP_MUTATION:
+        case DCP_DELETION:
+        case DCP_EXPIRATION:
+        case DCP_FLUSH:
+            return false;
+
+        case DCP_SET_VBUCKET:
+        case DCP_STREAM_REQ:
+        case DCP_STREAM_END:
+        case DCP_SNAPSHOT_MARKER:
+        case DCP_ADD_STREAM:
+            return true;
+
+        default:
+            throw std::invalid_argument(
+                    "DcpResponse::isMetaEvent: Invalid event_ " +
+                    std::to_string(event_));
+        }
     }
 
     virtual uint32_t getMessageSize() = 0;
@@ -275,9 +305,10 @@ private:
 class MutationResponse : public DcpResponse {
 public:
     MutationResponse(queued_item item, uint32_t opaque,
-                     ExtendedMetaData *e = NULL)
+                     ExtendedMetaData *e = NULL,
+                     MutationPayload mutationPayloadType = KEY_VALUE)
         : DcpResponse(item->isDeleted() ? DCP_DELETION : DCP_MUTATION, opaque),
-          item_(item), emd(e) {}
+          item_(item), emd(e), payloadType(mutationPayloadType) {}
 
     ~MutationResponse() {
         if (emd) {
@@ -290,7 +321,16 @@ public:
     }
 
     Item* getItemCopy() {
-        return new Item(*item_);
+        switch (payloadType) {
+        case KEY_VALUE:
+            return new Item(*item_);
+        case KEY_ONLY:
+            return new Item(*item_, true);
+        default:
+            throw std::logic_error("Unsupported MutationPayload type while "
+                                   "copying an item from mutation response: "
+                                   + std::to_string(payloadType));
+        }
     }
 
     uint16_t getVBucket() {
@@ -308,7 +348,13 @@ public:
     uint32_t getMessageSize() {
         uint32_t base = item_->isDeleted() ? deletionBaseMsgBytes :
                                              mutationBaseMsgBytes;
-        uint32_t body = item_->getNKey() + item_->getNBytes();
+        uint32_t body = 0;
+        if (payloadType == KEY_VALUE) {
+            body = item_->getNKey() + item_->getNBytes();
+        } else { // KEY_ONLY
+            body = item_->getNKey();
+        }
+
         if (emd) {
             body += emd->getExtMeta().second;
         }
@@ -325,6 +371,7 @@ public:
 private:
     queued_item item_;
     ExtendedMetaData *emd;
+    MutationPayload payloadType;
 };
 
 #endif  // SRC_DCP_RESPONSE_H_

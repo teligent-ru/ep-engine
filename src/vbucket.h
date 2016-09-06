@@ -1,6 +1,6 @@
 /* -*- Mode: C++; tab-width: 4; c-basic-offset: 4; indent-tabs-mode: nil -*- */
 /*
- *     Copyright 2010 Couchbase, Inc
+ *     Copyright 2015 Couchbase, Inc
  *
  *   Licensed under the Apache License, Version 2.0 (the "License");
  *   you may not use this file except in compliance with the License.
@@ -20,25 +20,25 @@
 
 #include "config.h"
 
-#include <list>
-#include <queue>
-#include <set>
-#include <sstream>
-#include <string>
-#include <utility>
-#include <vector>
-
-#include "atomic.h"
-#include "bgfetcher.h"
 #include "bloomfilter.h"
 #include "checkpoint.h"
-#include "common.h"
+#include "failover-table.h"
 #include "kvstore.h"
+#include "hash_table.h"
 #include "stored-value.h"
+#include "utility.h"
+
+#include <queue>
+
+typedef struct {
+    uint64_t last_vb_uuid;
+    int64_t last_seqno;
+} set_drift_state_resp_t;
+
+class BgFetcher;
 
 const size_t MIN_CHK_FLUSH_TIMEOUT = 10; // 10 sec.
 const size_t MAX_CHK_FLUSH_TIMEOUT = 30; // 30 sec.
-static const int64_t INITIAL_DRIFT = -140737488355328; //lowest possible 48-bit integer
 
 struct HighPriorityVBEntry {
     HighPriorityVBEntry() :
@@ -136,63 +136,53 @@ class FailoverTable;
 class KVShard;
 
 /**
+ * Indicates the possible time synchronization settings
+ * for the vbucket
+ */
+
+enum class time_sync_t {
+    DISABLED,               //No time synchronization.
+    ENABLED_WITHOUT_DRIFT,  //Time synchronization but no usage of drift counter
+    ENABLED_WITH_DRIFT      //Time synchronization with usage of drift counter
+};
+
+/**
  * An individual vbucket.
  */
 class VBucket : public RCValue {
 public:
 
-    VBucket(int i, vbucket_state_t newState, EPStats &st,
-            CheckpointConfig &chkConfig, KVShard *kvshard,
-            int64_t lastSeqno, uint64_t lastSnapStart,
-            uint64_t lastSnapEnd, FailoverTable *table,
-            shared_ptr<Callback<uint16_t> > cb,
+    // Identifier for a vBucket
+    typedef uint16_t id_type;
+
+    VBucket(id_type i,
+            vbucket_state_t newState,
+            EPStats &st,
+            CheckpointConfig &chkConfig,
+            KVShard *kvshard,
+            int64_t lastSeqno,
+            uint64_t lastSnapStart,
+            uint64_t lastSnapEnd,
+            FailoverTable *table,
+            std::shared_ptr<Callback<id_type> > cb,
             vbucket_state_t initState = vbucket_state_dead,
-            uint64_t chkId = 1, uint64_t purgeSeqno = 0,
-            uint64_t maxCas = 0, int64_t driftCounter = INITIAL_DRIFT):
-        ht(st),
-        checkpointManager(st, i, chkConfig, lastSeqno, lastSnapStart,
-                          lastSnapEnd, cb, chkId),
-        failovers(table),
-        opsCreate(0),
-        opsUpdate(0),
-        opsDelete(0),
-        opsReject(0),
-        dirtyQueueSize(0),
-        dirtyQueueMem(0),
-        dirtyQueueFill(0),
-        dirtyQueueDrain(0),
-        dirtyQueueAge(0),
-        dirtyQueuePendingWrites(0),
-        metaDataDisk(0),
-        numExpiredItems(0),
-        fileSpaceUsed(0),
-        fileSize(0),
-        id(i),
-        state(newState),
-        initialState(initState),
-        stats(st),
-        purge_seqno(purgeSeqno),
-        max_cas(maxCas),
-        drift_counter(driftCounter),
-        time_sync_enabled(false),
-        persisted_snapshot_start(lastSnapStart),
-        persisted_snapshot_end(lastSnapEnd),
-        numHpChks(0),
-        shard(kvshard),
-        bFilter(NULL),
-        tempFilter(NULL)
-    {
-        backfill.isBackfillPhase = false;
-        pendingOpsStart = 0;
-        stats.memOverhead.fetch_add(sizeof(VBucket)
-                               + ht.memorySize() + sizeof(CheckpointManager));
-        cb_assert(stats.memOverhead.load() < GIGANTOR);
-    }
+            uint64_t chkId = 1,
+            uint64_t purgeSeqno = 0,
+            uint64_t maxCas = 0,
+            int64_t driftCounter = INITIAL_DRIFT);
 
     ~VBucket();
 
     int64_t getHighSeqno() {
         return checkpointManager.getHighSeqno();
+    }
+
+    size_t getChkMgrMemUsage() {
+        return checkpointManager.getMemoryUsage();
+    }
+
+    size_t getChkMgrMemUsageOfUnrefCheckpoints() {
+        return checkpointManager.getMemoryUsageOfUnrefCheckpoints();
     }
 
     uint64_t getPurgeSeqno() {
@@ -220,7 +210,20 @@ public:
     }
 
     bool isTimeSyncEnabled() {
-        return time_sync_enabled.load();
+        if (time_sync_config == time_sync_t::ENABLED_WITHOUT_DRIFT ||
+            time_sync_config == time_sync_t::ENABLED_WITH_DRIFT) {
+            return true;
+        }
+
+        return false;
+    }
+
+    time_sync_t getTimeSyncConfig() {
+        return time_sync_config;
+    }
+
+    void setTimeSyncConfig(time_sync_t timeSyncConfig) {
+        time_sync_config.store(timeSyncConfig);
     }
 
     void setMaxCas(uint64_t cas) {
@@ -229,11 +232,25 @@ public:
 
     /**
      * To set drift counter's initial value
-     * and to toggle the timeSync between ON/OFF.
+     *
+     * Returns last_vbuuid and last_seqno of vbucket (atomically)
      */
-    void setDriftCounterState(int64_t initial_drift, uint8_t time_sync) {
+    set_drift_state_resp_t setDriftCounterState(int64_t initial_drift) {
         drift_counter = initial_drift;
-        time_sync_enabled = time_sync;
+
+        // Get vbucket uuid from the failover table, and then get
+        // the vbucket high seqno, return these 2 values as long as
+        // the uuid did not change after getting the high seqno.
+        uint64_t last_vbuuid = 0;
+        int64_t last_seqno = 0;
+        do {
+            last_vbuuid = failovers->getLatestUUID();
+            last_seqno = getHighSeqno();
+        } while (failovers->getLatestUUID() != last_vbuuid);
+        set_drift_state_resp_t resp;
+        resp.last_vb_uuid = last_vbuuid;
+        resp.last_seqno = last_seqno;
+        return resp;
     }
 
     int64_t getDriftCounter() {
@@ -243,7 +260,7 @@ public:
     void setDriftCounter(int64_t adjustedTime) {
         // Update drift counter only if timeSync is enabled for
         // the vbucket.
-        if (time_sync_enabled) {
+        if (time_sync_config == time_sync_t::ENABLED_WITH_DRIFT) {
             int64_t wallTime = gethrtime();
             if ((wallTime + getDriftCounter()) < adjustedTime) {
                 drift_counter = (adjustedTime - wallTime);
@@ -251,9 +268,19 @@ public:
         }
     }
 
-    int getId(void) const { return id; }
+    bool isTakeoverBackedUp() {
+        return takeover_backed_up.load();
+    }
+
+    void setTakeoverBackedUpState(bool to) {
+        bool inverse = !to;
+        takeover_backed_up.compare_exchange_strong(inverse, to);
+    }
+
+    id_type getId() const { return id; }
     vbucket_state_t getState(void) const { return state.load(); }
-    void setState(vbucket_state_t to, SERVER_HANDLE_V1 *sapi);
+    void setState(vbucket_state_t to);
+    RWLock& getStateLock() {return stateLock;}
 
     vbucket_state_t getInitialState(void) { return initialState; }
     void setInitialState(vbucket_state_t initState) {
@@ -285,11 +312,13 @@ public:
 
     // Get age sum in millisecond
     uint64_t getQueueAge() {
+        uint64_t currDirtyQueueAge = dirtyQueueAge.load(
+                                                    std::memory_order_relaxed);
         rel_time_t currentAge = ep_current_time() * dirtyQueueSize;
-        if (currentAge < dirtyQueueAge) {
+        if (currentAge < currDirtyQueueAge) {
             return 0;
         }
-        return (currentAge - dirtyQueueAge) * 1000;
+        return (currentAge - currDirtyQueueAge) * 1000;
     }
 
     void fireAllOps(EventuallyPersistentEngine &engine);
@@ -336,13 +365,19 @@ public:
         backfill.isBackfillPhase = backfillPhase;
     }
 
-    bool getBGFetchItems(vb_bgfetch_queue_t &fetches);
-    void queueBGFetchItem(const std::string &key, VBucketBGFetchItem *fetch,
-                          BgFetcher *bgFetcher);
-    size_t numPendingBGFetchItems(void) {
-        // do a dirty read of number of fetch items
-        return pendingBGFetches.size();
-    }
+    /*
+     * Returns the map of bgfetch items for this vbucket, clearing the
+     * pendingBGFetches.
+     */
+    vb_bgfetch_queue_t getBGFetchItems();
+
+    /* queue a background fetch of the specified item.
+     * Returns the number of pending background fetches after
+     * adding the specified item.
+     **/
+    size_t queueBGFetchItem(const std::string &key, VBucketBGFetchItem *fetch,
+                            BgFetcher *bgFetcher);
+
     bool hasPendingBGFetchItems(void) {
         LockHolder lh(pendingBGFetchesLock);
         return !pendingBGFetches.empty();
@@ -370,10 +405,20 @@ public:
         }
     }
 
+    static time_sync_t convertStrToTimeSyncConfig(const std::string& timeSyncConfig) {
+        if (timeSyncConfig == "enabled_without_drift") {
+            return time_sync_t::ENABLED_WITHOUT_DRIFT;
+        } else if (timeSyncConfig == "enabled_with_drift") {
+            return time_sync_t::ENABLED_WITH_DRIFT;
+        }
+
+        return time_sync_t::DISABLED;
+    }
+
     void addHighPriorityVBEntry(uint64_t id, const void *cookie,
                                 bool isBySeqno);
-    void notifyCheckpointPersisted(EventuallyPersistentEngine &e,
-                                   uint64_t id, bool isBySeqno);
+    void notifyOnPersistence(EventuallyPersistentEngine &e,
+                             uint64_t id, bool isBySeqno);
     void notifyAllPendingConnsFailed(EventuallyPersistentEngine &e);
     size_t getHighPriorityChkSize();
     static size_t getCheckpointFlushTimeout();
@@ -381,6 +426,7 @@ public:
     /**
      * BloomFilter operations for vbucket
      */
+    void createFilter(size_t key_count, double probability);
     void initTempFilter(size_t key_count, double probability);
     void addToFilter(const std::string &key);
     bool maybeKeyExistsInFilter(const std::string &key);
@@ -416,16 +462,22 @@ public:
             oldVal = dirtyQueueSize.load();
             if (oldVal < decrementBy) {
                 LOG(EXTENSION_LOG_DEBUG,
-                    "Cannot decrement dirty queue size of vbucket %d by %lld, "
-                    "the current value is %lld\n", id, decrementBy, oldVal);
+                    "Cannot decrement dirty queue size of vbucket %" PRIu16
+                    "by %" PRIu64 ", the current value is %" PRIu64 "\n", id,
+                    uint64_t(decrementBy), uint64_t(oldVal));
                 return false;
             }
         } while (!dirtyQueueSize.compare_exchange_strong(oldVal, oldVal - decrementBy));
         return true;
     }
 
-    void addPersistenceNotification(shared_ptr<Callback<uint64_t> > cb);
-    void notifySeqnoPersisted(uint64_t highseqno);
+    void incrRollbackItemCount(uint64_t val) {
+        rollbackItemCount.fetch_add(val, std::memory_order_relaxed);
+    }
+
+    uint64_t getRollbackItemCount(void) {
+        return rollbackItemCount.load(std::memory_order_relaxed);
+    }
 
     static const vbucket_state_t ACTIVE;
     static const vbucket_state_t REPLICA;
@@ -435,7 +487,7 @@ public:
     HashTable         ht;
     CheckpointManager checkpointManager;
     struct {
-        Mutex mutex;
+        std::mutex mutex;
         std::queue<queued_item> items;
         bool isBackfillPhase;
     } backfill;
@@ -447,22 +499,20 @@ public:
     std::queue<queued_item> rejectQueue;
     FailoverTable *failovers;
 
-    AtomicValue<size_t>  opsCreate;
-    AtomicValue<size_t>  opsUpdate;
-    AtomicValue<size_t>  opsDelete;
-    AtomicValue<size_t>  opsReject;
+    std::atomic<size_t>  opsCreate;
+    std::atomic<size_t>  opsUpdate;
+    std::atomic<size_t>  opsDelete;
+    std::atomic<size_t>  opsReject;
 
-    AtomicValue<size_t>  dirtyQueueSize;
-    AtomicValue<size_t>  dirtyQueueMem;
-    AtomicValue<size_t>  dirtyQueueFill;
-    AtomicValue<size_t>  dirtyQueueDrain;
-    AtomicValue<uint64_t> dirtyQueueAge;
-    AtomicValue<size_t>  dirtyQueuePendingWrites;
-    AtomicValue<size_t>  metaDataDisk;
+    std::atomic<size_t>  dirtyQueueSize;
+    std::atomic<size_t>  dirtyQueueMem;
+    std::atomic<size_t>  dirtyQueueFill;
+    std::atomic<size_t>  dirtyQueueDrain;
+    std::atomic<uint64_t> dirtyQueueAge;
+    std::atomic<size_t>  dirtyQueuePendingWrites;
+    std::atomic<size_t>  metaDataDisk;
 
-    AtomicValue<size_t>  numExpiredItems;
-    AtomicValue<size_t>  fileSpaceUsed;
-    AtomicValue<size_t>  fileSize;
+    std::atomic<size_t>  numExpiredItems;
 
 private:
     template <typename T>
@@ -472,41 +522,47 @@ private:
 
     void adjustCheckpointFlushTimeout(size_t wall_time);
 
-    int                      id;
-    AtomicValue<vbucket_state_t>  state;
-    vbucket_state_t          initialState;
-    Mutex                    pendingOpLock;
-    std::vector<const void*> pendingOps;
-    hrtime_t                 pendingOpsStart;
-    EPStats                 &stats;
-    uint64_t                 purge_seqno;
-    AtomicValue<uint64_t>    max_cas;
-    AtomicValue<int64_t>     drift_counter;
-    AtomicValue<bool>        time_sync_enabled;
+    void decrDirtyQueueMem(size_t decrementBy);
 
-    Mutex pendingBGFetchesLock;
+    void decrDirtyQueueAge(uint32_t decrementBy);
+
+    void decrDirtyQueuePendingWrites(size_t decrementBy);
+
+    id_type                         id;
+    std::atomic<vbucket_state_t>    state;
+    RWLock                          stateLock;
+    vbucket_state_t                 initialState;
+    std::mutex                           pendingOpLock;
+    std::vector<const void*>        pendingOps;
+    hrtime_t                        pendingOpsStart;
+    EPStats                        &stats;
+    uint64_t                        purge_seqno;
+
+    std::atomic<uint64_t>           max_cas;
+    std::atomic<int64_t>            drift_counter;
+    std::atomic<time_sync_t>        time_sync_config;
+
+    std::atomic<bool>               takeover_backed_up;
+
+    std::mutex pendingBGFetchesLock;
     vb_bgfetch_queue_t pendingBGFetches;
 
-    Mutex snapshotMutex;
+    /* snapshotMutex is used to update/read the pair {start, end} atomically,
+       but not if reading a single field. */
+    std::mutex snapshotMutex;
     uint64_t persisted_snapshot_start;
     uint64_t persisted_snapshot_end;
 
-    Mutex hpChksMutex;
+    std::mutex hpChksMutex;
     std::list<HighPriorityVBEntry> hpChks;
-    volatile size_t numHpChks; // size of list hpChks (to avoid MB-9434)
+    std::atomic<size_t> numHpChks; // size of list hpChks (to avoid MB-9434)
     KVShard *shard;
 
-    Mutex bfMutex;
+    std::mutex bfMutex;
     BloomFilter *bFilter;
     BloomFilter *tempFilter;    // Used during compaction.
 
-    /**
-     * The following list is to contain pending notifications
-     * that need to be alerted whenever the desired sequence
-     * numbers have been persisted.
-     */
-    Mutex persistedNotificationsMutex;
-    std::list<shared_ptr<Callback<uint64_t>> > persistedNotifications;
+    std::atomic<uint64_t> rollbackItemCount;
 
     static size_t chkFlushTimeout;
 

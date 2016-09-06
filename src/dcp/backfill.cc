@@ -1,6 +1,6 @@
 /* -*- Mode: C++; tab-width: 4; c-basic-offset: 4; indent-tabs-mode: nil -*- */
 /*
- *     Copyright 2013 Couchbase, Inc
+ *     Copyright 2015 Couchbase, Inc
  *
  *   Licensed under the Apache License, Version 2.0 (the "License");
  *   you may not use this file except in compliance with the License.
@@ -17,11 +17,11 @@
 
 #include "config.h"
 
+#include "ep_engine.h"
 #include "dcp/backfill.h"
 #include "dcp/stream.h"
-#include "ep_engine.h"
 
-static const char* backfillStateToString(backfill_state_t state) {
+static std::string backfillStateToString(backfill_state_t state) {
     switch (state) {
         case backfill_state_init:
             return "initalizing";
@@ -37,8 +37,16 @@ static const char* backfillStateToString(backfill_state_t state) {
 }
 
 CacheCallback::CacheCallback(EventuallyPersistentEngine* e, stream_t &s)
-    : engine_(e), stream_(s) {
-    cb_assert(stream_.get() && stream_.get()->getType() == STREAM_ACTIVE);
+    : engine_(e),
+      stream_(s) {
+    if (stream_.get() == nullptr) {
+        throw std::invalid_argument("CacheCallback(): stream is NULL");
+    }
+    if (stream_.get()->getType() != STREAM_ACTIVE) {
+        throw std::invalid_argument("CacheCallback(): stream->getType() "
+                "(which is " + std::to_string(stream_.get()->getType()) +
+                ") is not ACTIVE");
+    }
 }
 
 void CacheCallback::callback(CacheLookup &lookup) {
@@ -52,9 +60,23 @@ void CacheCallback::callback(CacheLookup &lookup) {
     LockHolder lh = vb->ht.getLockedBucket(lookup.getKey(), &bucket_num);
     StoredValue *v = vb->ht.unlocked_find(lookup.getKey(), bucket_num, false, false);
     if (v && v->isResident() && v->getBySeqno() == lookup.getBySeqno()) {
-        Item* it = v->toItem(false, lookup.getVBucketId());
-        lh.unlock();
         ActiveStream* as = static_cast<ActiveStream*>(stream_.get());
+        Item* it;
+        try {
+            it = as->isSendMutationKeyOnlyEnabled() ?
+                        v->toValuelessItem(lookup.getVBucketId()) :
+                        v->toItem(false, lookup.getVBucketId());
+        } catch (const std::bad_alloc&) {
+            setStatus(ENGINE_ENOMEM);
+            as->getLogger().log(EXTENSION_LOG_WARNING,
+                           "Alloc error when trying to create an "
+                "item copy from hash table. Item key %s; seqno %" PRIi64 "; "
+                "vb %u; isSendMutationKeyOnlyEnabled %d", v->getKey().c_str(),
+                v->getBySeqno(), lookup.getVBucketId(),
+                as->isSendMutationKeyOnlyEnabled());
+            return;
+        }
+        lh.unlock();
         if (!as->backfillReceived(it, BACKFILL_FROM_MEMORY)) {
             setStatus(ENGINE_ENOMEM); // Pause the backfill
         } else {
@@ -67,11 +89,20 @@ void CacheCallback::callback(CacheLookup &lookup) {
 
 DiskCallback::DiskCallback(stream_t &s)
     : stream_(s) {
-    cb_assert(stream_.get() && stream_.get()->getType() == STREAM_ACTIVE);
+    if (stream_.get() == nullptr) {
+        throw std::invalid_argument("DiskCallback(): stream is NULL");
+    }
+    if (stream_.get()->getType() != STREAM_ACTIVE) {
+        throw std::invalid_argument("DiskCallback(): stream->getType() "
+                "(which is " + std::to_string(stream_.get()->getType()) +
+                ") is not ACTIVE");
+    }
 }
 
 void DiskCallback::callback(GetValue &val) {
-    cb_assert(val.getValue());
+    if (val.getValue() == nullptr) {
+        throw std::invalid_argument("DiskCallback::callback: val is NULL");
+    }
 
     ActiveStream* as = static_cast<ActiveStream*>(stream_.get());
     if (!as->backfillReceived(val.getValue(), BACKFILL_FROM_DISK)) {
@@ -85,7 +116,11 @@ DCPBackfill::DCPBackfill(EventuallyPersistentEngine* e, stream_t s,
                          uint64_t start_seqno, uint64_t end_seqno)
     : engine(e), stream(s),startSeqno(start_seqno), endSeqno(end_seqno),
       scanCtx(NULL), state(backfill_state_init) {
-    cb_assert(stream->getType() == STREAM_ACTIVE);
+    if (stream->getType() != STREAM_ACTIVE) {
+        throw std::invalid_argument("DCPBackfill(): stream->getType() "
+                "(which is " + std::to_string(stream->getType()) +
+                ") is not ACTIVE");
+    }
 }
 
 backfill_status_t DCPBackfill::run() {
@@ -99,10 +134,10 @@ backfill_status_t DCPBackfill::run() {
             return complete(false);
         case backfill_state_done:
             return backfill_finished;
-        default:
-            LOG(EXTENSION_LOG_WARNING, "Invalid backfill state");
-            abort();
     }
+
+    throw std::logic_error("DCPBackfill::run: Invalid backfill state " +
+                           std::to_string(state));
 }
 
 uint16_t DCPBackfill::getVBucketId() {
@@ -126,25 +161,32 @@ backfill_status_t DCPBackfill::create() {
     uint64_t lastPersistedSeqno =
         engine->getEpStore()->getLastPersistedSeqno(vbid);
 
+    ActiveStream* as = static_cast<ActiveStream*>(stream.get());
+
     if (lastPersistedSeqno < endSeqno) {
-        LOG(EXTENSION_LOG_WARNING, "Rescheduling backfill for vbucket %d "
-            "because backfill up to seqno %llu is needed but only up to "
-            "%llu is persisted", vbid, endSeqno, lastPersistedSeqno);
+        as->getLogger().log(EXTENSION_LOG_NOTICE, "(vb %d) Rescheduling backfill"
+            "because backfill up to seqno %" PRIu64 " is needed but only up to "
+            "%" PRIu64 " is persisted", vbid, endSeqno, lastPersistedSeqno);
         return backfill_snooze;
     }
 
-    ActiveStream* as = static_cast<ActiveStream*>(stream.get());
     KVStore* kvstore = engine->getEpStore()->getROUnderlying(vbid);
-    size_t numItems = kvstore->getNumItems(vbid, startSeqno,
-                                           std::numeric_limits<uint64_t>::max());
+    ValueFilter valFilter = ValueFilter::VALUES_DECOMPRESSED;
+    if (as->isSendMutationKeyOnlyEnabled()) {
+        valFilter = ValueFilter::KEYS_ONLY;
+    } else {
+        if (as->isCompressionEnabled()) {
+            valFilter = ValueFilter::VALUES_COMPRESSED;
+        }
+    }
 
-    as->incrBackfillRemaining(numItems);
+    std::shared_ptr<Callback<GetValue> > cb(new DiskCallback(stream));
+    std::shared_ptr<Callback<CacheLookup> > cl(new CacheCallback(engine, stream));
+    scanCtx = kvstore->initScanContext(cb, cl, vbid, startSeqno,
+                                       DocumentFilter::ALL_ITEMS, valFilter);
 
-    shared_ptr<Callback<GetValue> > cb(new DiskCallback(stream));
-    shared_ptr<Callback<CacheLookup> > cl(new CacheCallback(engine, stream));
-    scanCtx = kvstore->initScanContext(cb, cl, vbid, startSeqno, false, false,
-                                       false);
     if (scanCtx) {
+        as->incrBackfillRemaining(scanCtx->documentCount);
         as->markDiskSnapshot(startSeqno, scanCtx->maxSeqno);
         transitionState(backfill_state_scanning);
     } else {
@@ -181,9 +223,12 @@ backfill_status_t DCPBackfill::complete(bool cancelled) {
     ActiveStream* as = static_cast<ActiveStream*>(stream.get());
     as->completeBackfill();
 
-    LOG(EXTENSION_LOG_WARNING, "Backfill task (%llu to %llu) %s for vb %d",
-        startSeqno, endSeqno, cancelled ? "cancelled" : "finished",
-        stream->getVBucket());
+    EXTENSION_LOG_LEVEL severity = cancelled ? EXTENSION_LOG_NOTICE
+                                             : EXTENSION_LOG_INFO;
+    as->getLogger().log(severity,
+        "(vb %d) Backfill task (%" PRIu64 " to %" PRIu64 ") %s",
+        vbid, startSeqno, endSeqno,
+        cancelled ? "cancelled" : "finished");
 
     transitionState(backfill_state_done);
 
@@ -195,24 +240,36 @@ void DCPBackfill::transitionState(backfill_state_t newState) {
         return;
     }
 
+    bool validTransition = false;
     switch (newState) {
+        case backfill_state_init:
+            // Not valid to transition back to 'init'
+            break;
         case backfill_state_scanning:
-            cb_assert(state == backfill_state_init);
+            if (state == backfill_state_init) {
+                validTransition = true;
+            }
             break;
         case backfill_state_completing:
-            cb_assert(state == backfill_state_scanning);
+            if (state == backfill_state_scanning) {
+                validTransition = true;
+            }
             break;
         case backfill_state_done:
-            cb_assert(state == backfill_state_init ||
-                      state == backfill_state_scanning ||
-                      state == backfill_state_completing);
+            if (state == backfill_state_init ||
+                state == backfill_state_scanning ||
+                state == backfill_state_completing) {
+                validTransition = true;
+            }
             break;
-        default:
-            LOG(EXTENSION_LOG_WARNING, "Invalid backfill state transition from"
-                " %s to %s", backfillStateToString(state),
-                backfillStateToString(newState));
-            abort();
     }
+
+    if (!validTransition) {
+        throw std::invalid_argument("DCPBackfill::transitionState:"
+            " newState (which is " + backfillStateToString(newState) +
+            ") is not valid for current state (which is " +
+            backfillStateToString(state) + ")");
+    }
+
     state = newState;
 }
-

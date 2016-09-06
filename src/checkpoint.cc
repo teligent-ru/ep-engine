@@ -17,6 +17,7 @@
 
 #include "config.h"
 
+#include <platform/checked_snprintf.h>
 #include <string>
 #include <utility>
 #include <vector>
@@ -78,12 +79,22 @@ void CheckpointCursor::decrPos() {
     }
 }
 
+MustSendCheckpointEnd CheckpointCursor::shouldSendCheckpointEndMetaItem() const
+{
+    return sendCheckpointEndMetaItem;
+}
+
 Checkpoint::~Checkpoint() {
     LOG(EXTENSION_LOG_INFO,
-        "Checkpoint %llu for vbucket %d is purged from memory",
+        "Checkpoint %" PRIu64 " for vbucket %d is purged from memory",
         checkpointId, vbucketId);
     stats.memOverhead.fetch_sub(memorySize());
-    cb_assert(stats.memOverhead.load() < GIGANTOR);
+    if (stats.memOverhead.load() >= GIGANTOR) {
+        LOG(EXTENSION_LOG_WARNING,
+            "Checkpoint::~Checkpoint: stats.memOverhead (which is %" PRId64
+            ") is greater than %" PRId64, uint64_t(stats.memOverhead.load()),
+            uint64_t(GIGANTOR));
+    }
 }
 
 void Checkpoint::setState(checkpoint_state state) {
@@ -93,7 +104,7 @@ void Checkpoint::setState(checkpoint_state state) {
 void Checkpoint::popBackCheckpointEndItem() {
     if (!toWrite.empty() &&
         toWrite.back()->getOperation() == queue_op_checkpoint_end) {
-        keyIndex.erase(toWrite.back()->getKey());
+        metaKeyIndex.erase(toWrite.back()->getKey());
         toWrite.pop_back();
     }
 }
@@ -104,67 +115,87 @@ bool Checkpoint::keyExists(const std::string &key) {
 
 queue_dirty_t Checkpoint::queueDirty(const queued_item &qi,
                                      CheckpointManager *checkpointManager) {
-    assert (checkpointState == CHECKPOINT_OPEN);
+    if (checkpointState != CHECKPOINT_OPEN) {
+        throw std::logic_error("Checkpoint::queueDirty: checkpointState "
+                        "(which is" + std::to_string(checkpointState) +
+                        ") is not OPEN");
+    }
     queue_dirty_t rv;
 
     checkpoint_index::iterator it = keyIndex.find(qi->getKey());
-    // Check if this checkpoint already had an item for the same key.
-    if (it != keyIndex.end()) {
-        rv = EXISTING_ITEM;
-        std::list<queued_item>::iterator currPos = it->second.position;
-        uint64_t currMutationId = it->second.mutation_id;
 
-        cursor_index::iterator map_it = checkpointManager->tapCursors.begin();
-        for (; map_it != checkpointManager->tapCursors.end(); ++map_it) {
+    // Check if the item is a meta item
+    if (qi->isCheckPointMetaItem()) {
+        rv = NEW_ITEM;
+        toWrite.push_back(qi);
+    } else {
+        // Check if this checkpoint already had an item for the same key
+        if (it != keyIndex.end()) {
+            rv = EXISTING_ITEM;
+            CheckpointQueue::iterator currPos = it->second.position;
+            uint64_t currMutationId = it->second.mutation_id;
 
-            if (*(map_it->second.currentCheckpoint) == this) {
-                queued_item &tqi = *(map_it->second.currentPos);
-                const std::string &key = tqi->getKey();
-                checkpoint_index::iterator ita = keyIndex.find(key);
-                if (ita != keyIndex.end()) {
-                    uint64_t mutationId = ita->second.mutation_id;
-                    if (currMutationId <= mutationId &&
-                        tqi->getOperation() != queue_op_checkpoint_start) {
-                        map_it->second.decrOffset(1);
-                        if (map_it->second.name.compare(CheckpointManager::pCursorName) == 0) {
-                            rv = PERSIST_AGAIN;
+            cursor_index::iterator map_it =
+                                        checkpointManager->connCursors.begin();
+            for (; map_it != checkpointManager->connCursors.end(); ++map_it) {
+
+                if (*(map_it->second.currentCheckpoint) == this) {
+                    queued_item &tqi = *(map_it->second.currentPos);
+                    const std::string &key = tqi->getKey();
+                    checkpoint_index::iterator ita = keyIndex.find(key);
+                    if (ita != keyIndex.end() && (!tqi->isCheckPointMetaItem()))
+                    {
+                        uint64_t mutationId = ita->second.mutation_id;
+                        if (currMutationId <= mutationId) {
+                            map_it->second.decrOffset(1);
+                            if (map_it->second.name.compare(CheckpointManager::pCursorName)
+                                == 0) {
+                                rv = PERSIST_AGAIN;
+                            }
                         }
                     }
-                }
-                // If an TAP cursor points to the existing item for the same
-                // key, shift it left by 1
-                if (map_it->second.currentPos == currPos) {
-                    map_it->second.decrPos();
+                    /* If an TAP cursor points to the existing item for the same
+                       key, shift it left by 1 */
+                    if (map_it->second.currentPos == currPos) {
+                        map_it->second.decrPos();
+                    }
                 }
             }
-        }
 
-        toWrite.push_back(qi);
-        // Remove the existing item for the same key from the list.
-        toWrite.erase(currPos);
-    } else {
-        if (qi->getOperation() == queue_op_set ||
-            qi->getOperation() == queue_op_del) {
+            toWrite.push_back(qi);
+            // Remove the existing item for the same key from the list.
+            toWrite.erase(currPos);
+        } else {
             ++numItems;
+            rv = NEW_ITEM;
+            // Push the new item into the list
+            toWrite.push_back(qi);
         }
-        rv = NEW_ITEM;
-        // Push the new item into the list
-        toWrite.push_back(qi);
     }
 
     if (qi->getNKey() > 0) {
-        std::list<queued_item>::iterator last = toWrite.end();
+        CheckpointQueue::iterator last = toWrite.end();
         // --last is okay as the list is not empty now.
         index_entry entry = {--last, qi->getBySeqno()};
         // Set the index of the key to the new item that is pushed back into
         // the list.
-        keyIndex[qi->getKey()] = entry;
+        if (qi->isCheckPointMetaItem()) {
+            // We add a meta item only once to a checkpoint
+            metaKeyIndex[qi->getKey()] = entry;
+        } else {
+            keyIndex[qi->getKey()] = entry;
+        }
         if (rv == NEW_ITEM) {
             size_t newEntrySize = qi->getNKey() + sizeof(index_entry) +
                                   sizeof(queued_item);
             memOverhead += newEntrySize;
             stats.memOverhead.fetch_add(newEntrySize);
-            cb_assert(stats.memOverhead.load() < GIGANTOR);
+            if (stats.memOverhead.load() >= GIGANTOR) {
+                LOG(EXTENSION_LOG_WARNING,
+                    "Checkpoint::queueDirty: stats.memOverhead (which is %" PRId64
+                    ") is greater than %" PRId64, uint64_t(stats.memOverhead.load()),
+                    uint64_t(GIGANTOR));
+            }
         }
     }
 
@@ -180,19 +211,20 @@ queue_dirty_t Checkpoint::queueDirty(const queued_item &qi,
 size_t Checkpoint::mergePrevCheckpoint(Checkpoint *pPrevCheckpoint) {
     size_t numNewItems = 0;
     size_t newEntryMemOverhead = 0;
-    std::list<queued_item>::reverse_iterator rit = pPrevCheckpoint->rbegin();
+    CheckpointQueue::reverse_iterator rit = pPrevCheckpoint->rbegin();
 
     LOG(EXTENSION_LOG_INFO,
-        "Collapse the checkpoint %llu into the checkpoint %llu for vbucket %d",
+        "Collapse the checkpoint %" PRIu64 " into the checkpoint %" PRIu64
+        " for vbucket %d",
         pPrevCheckpoint->getId(), checkpointId, vbucketId);
 
-    std::list<queued_item>::iterator itr = toWrite.begin();
-    uint64_t seqno = pPrevCheckpoint->getMutationIdForKey("dummy_key");
-    keyIndex["dummy_key"].mutation_id = seqno;
+    CheckpointQueue::iterator itr = toWrite.begin();
+    uint64_t seqno = pPrevCheckpoint->getMutationIdForKey("dummy_key", true);
+    metaKeyIndex["dummy_key"].mutation_id = seqno;
     (*itr)->setBySeqno(seqno);
 
-    seqno = pPrevCheckpoint->getMutationIdForKey("checkpoint_start");
-    keyIndex["checkpoint_start"].mutation_id = seqno;
+    seqno = pPrevCheckpoint->getMutationIdForKey("checkpoint_start", true);
+    metaKeyIndex["checkpoint_start"].mutation_id = seqno;
     ++itr;
     (*itr)->setBySeqno(seqno);
 
@@ -204,35 +236,73 @@ size_t Checkpoint::mergePrevCheckpoint(Checkpoint *pPrevCheckpoint) {
         }
         checkpoint_index::iterator it = keyIndex.find(key);
         if (it == keyIndex.end()) {
-            std::list<queued_item>::iterator pos = toWrite.begin();
+            CheckpointQueue::iterator pos = toWrite.begin();
             // Skip the first two meta items
             ++pos; ++pos;
             toWrite.insert(pos, *rit);
             index_entry entry = {--pos, static_cast<int64_t>(pPrevCheckpoint->
-                                                    getMutationIdForKey(key))};
+                                            getMutationIdForKey(key, false))};
             keyIndex[key] = entry;
             newEntryMemOverhead += key.size() + sizeof(index_entry);
             ++numItems;
             ++numNewItems;
+
+            // Update new checkpoint's memory usage
+            incrementMemConsumption((*rit)->size());
         }
     }
+
+    /**
+     * Update snapshot start of current checkpoint to the first
+     * item's sequence number, after merge completed, as items
+     * from the previous checkpoint will be inserted into this
+     * checkpoint.
+     */
+    setSnapshotStartSeqno(getLowSeqno());
+
     memOverhead += newEntryMemOverhead;
     stats.memOverhead.fetch_add(newEntryMemOverhead);
-    cb_assert(stats.memOverhead.load() < GIGANTOR);
+    LOG(EXTENSION_LOG_WARNING,
+        "Checkpoint::mergePrevCheckpoint: stats.memOverhead (which is %" PRId64
+        ") is greater than %" PRId64, uint64_t(stats.memOverhead.load()),
+        uint64_t(GIGANTOR));
     return numNewItems;
 }
 
-uint64_t Checkpoint::getMutationIdForKey(const std::string &key) {
+uint64_t Checkpoint::getMutationIdForKey(const std::string &key, bool isMeta)
+{
     uint64_t mid = 0;
-    checkpoint_index::iterator it = keyIndex.find(key);
-    if (it != keyIndex.end()) {
+    checkpoint_index& chkIdx = isMeta ? metaKeyIndex : keyIndex;
+
+    checkpoint_index::iterator it = chkIdx.find(key);
+    if (it != chkIdx.end()) {
         mid = it->second.mutation_id;
+    } else {
+        LOG(EXTENSION_LOG_WARNING, "%s not found in chk index", key.c_str());
     }
     return mid;
 }
 
+bool Checkpoint::isEligibleToBeUnreferenced() {
+    const std::set<std::string> &cursors = getCursorNameList();
+    std::set<std::string>::const_iterator cit = cursors.begin();
+    for (; cit != cursors.end(); ++cit) {
+        if ((*cit).compare(CheckpointManager::pCursorName) == 0) {
+            // Persistence cursor is on current checkpoint
+            return false;
+        }
+    }
+    return true;
+}
+
+std::ostream& operator <<(std::ostream& os, const Checkpoint& c) {
+    os << "Checkpoint[" << &c << "] with "
+       << "seqno:{" << c.getLowSeqno() << "," << c.getHighSeqno() << "} "
+       << "state:" << c.getState();
+    return os;
+}
+
 CheckpointManager::~CheckpointManager() {
-    LockHolder lh(queueLock);
     std::list<Checkpoint*>::iterator it = checkpointList.begin();
     while(it != checkpointList.end()) {
         delete *it;
@@ -270,7 +340,7 @@ uint64_t CheckpointManager::getLastClosedCheckpointId() {
 void CheckpointManager::setOpenCheckpointId_UNLOCKED(uint64_t id) {
     if (!checkpointList.empty()) {
         // Update the checkpoint_start item with the new Id.
-        std::list<queued_item>::iterator it =
+        CheckpointQueue::iterator it =
             ++(checkpointList.back()->begin());
         (*it)->setRevSeqno(id);
         if (checkpointList.back()->getId() == 0) {
@@ -280,9 +350,9 @@ void CheckpointManager::setOpenCheckpointId_UNLOCKED(uint64_t id) {
         }
 
         checkpointList.back()->setId(id);
-        LOG(EXTENSION_LOG_INFO, "Set the current open checkpoint id to %llu "
-            "for vbucket %d, bySeqno is %llu, max is %llu", id, vbucketId,
-            (*it)->getBySeqno(), lastBySeqno);
+        LOG(EXTENSION_LOG_INFO, "Set the current open checkpoint id to %" PRIu64
+            " for vbucket %d, bySeqno is %" PRId64 ", max is %" PRId64,
+            id, vbucketId, (*it)->getBySeqno(), lastBySeqno);
     }
 }
 
@@ -300,8 +370,9 @@ bool CheckpointManager::addNewCheckpoint_UNLOCKED(uint64_t id,
         closeOpenCheckpoint_UNLOCKED();
     }
 
-    LOG(EXTENSION_LOG_INFO, "Create a new open checkpoint %llu for vbucket %d",
-        id, vbucketId);
+    LOG(EXTENSION_LOG_INFO, "Create a new open checkpoint %" PRIu64
+        " for vbucket %" PRIu16 " at seqno:%" PRIu64,
+        id, vbucketId, snapStartSeqno);
 
     bool was_empty = checkpointList.empty() ? true : false;
     Checkpoint *checkpoint = new Checkpoint(stats, id, snapStartSeqno,
@@ -324,17 +395,20 @@ bool CheckpointManager::addNewCheckpoint_UNLOCKED(uint64_t id,
         return true;
     }
 
-    // If any of replication cursors reached to the end of its current
-    // checkpoint, move it to the next checkpoint. Note that the replication
-    // cursors cannot skip a checkpoint_end meta item.
-    std::map<const std::string, CheckpointCursor>::iterator tap_it = tapCursors.begin();
-    for (; tap_it != tapCursors.end(); ++tap_it) {
-        CheckpointCursor &cursor = tap_it->second;
+    /* If cursors reached to the end of its current checkpoint, move it to the
+       next checkpoint. DCP and Persistence cursors can skip a "checkpoint end"
+       meta item, but TAP cursors cannot. This is needed so that the checkpoint
+       remover can remove the closed checkpoints and hence reduce the memory
+       usage */
+    for (auto& cur_it : connCursors) {
+        CheckpointCursor &cursor = cur_it.second;
         ++(cursor.currentPos);
-        if (cursor.name.compare(pCursorName) == 0 &&
+        if ((cursor.shouldSendCheckpointEndMetaItem() ==
+             MustSendCheckpointEnd::NO) &&
             cursor.currentPos != (*(cursor.currentCheckpoint))->end() &&
             (*(cursor.currentPos))->getOperation() == queue_op_checkpoint_end) {
-            // checkpoint_end meta item is only used by replication cursors
+            /* checkpoint_end meta item is expected by TAP cursors. Hence skip
+               it only for persitence and DCP cursors */
             ++(cursor.offset);
             ++(cursor.currentPos); // cursor now reaches to the checkpoint end
         }
@@ -365,13 +439,17 @@ bool CheckpointManager::closeOpenCheckpoint_UNLOCKED() {
         return true;
     }
 
-    uint64_t id = checkpointList.back()->getId();
-    LOG(EXTENSION_LOG_INFO, "Close the open checkpoint %llu for vbucket %d",
-        id, vbucketId);
+    auto& cur_ckpt = checkpointList.back();
+    LOG(EXTENSION_LOG_INFO, "Close the open checkpoint %" PRIu64
+        " for vbucket:%" PRIu16 " seqnos:{%" PRIu64 ",%" PRIu64 "}",
+        cur_ckpt->getId(), vbucketId, cur_ckpt->getLowSeqno(),
+        cur_ckpt->getHighSeqno());
 
-    // This item represents the end of the current open checkpoint and is sent to the slave node.
-    queued_item qi = createCheckpointItem(id, vbucketId,
+    // This item represents the end of the current open checkpoint and is sent
+    // to the slave node.
+    queued_item qi = createCheckpointItem(cur_ckpt->getId(), vbucketId,
                                           queue_op_checkpoint_end);
+
     checkpointList.back()->queueDirty(qi, this);
     ++numItems;
     checkpointList.back()->setState(CHECKPOINT_CLOSED);
@@ -384,18 +462,33 @@ bool CheckpointManager::closeOpenCheckpoint() {
     return closeOpenCheckpoint_UNLOCKED();
 }
 
-bool CheckpointManager::registerCursor(const std::string &name,
-                                          uint64_t checkpointId,
-                                          bool alwaysFromBeginning) {
+bool CheckpointManager::registerCursor(
+                            const std::string& name,
+                            uint64_t checkpointId,
+                            bool alwaysFromBeginning,
+                            MustSendCheckpointEnd needsCheckpointEndMetaItem) {
     LockHolder lh(queueLock);
-    return registerCursor_UNLOCKED(name, checkpointId, alwaysFromBeginning);
+    return registerCursor_UNLOCKED(name, checkpointId, alwaysFromBeginning,
+                                   needsCheckpointEndMetaItem);
 }
 
-CursorRegResult CheckpointManager::registerCursorBySeqno(const std::string &name,
-                                                         uint64_t startBySeqno) {
+CursorRegResult CheckpointManager::registerCursorBySeqno(
+                            const std::string &name,
+                            uint64_t startBySeqno,
+                            MustSendCheckpointEnd needsCheckPointEndMetaItem) {
     LockHolder lh(queueLock);
-    cb_assert(!checkpointList.empty());
-    cb_assert(checkpointList.back()->getHighSeqno() >= startBySeqno);
+    if (checkpointList.empty()) {
+        throw std::logic_error("CheckpointManager::registerCursorBySeqno: "
+                        "checkpointList is empty");
+    }
+    if (checkpointList.back()->getHighSeqno() < startBySeqno) {
+        throw std::invalid_argument("CheckpointManager::registerCursorBySeqno:"
+                        " startBySeqno (which is " +
+                        std::to_string(startBySeqno) + ") is less than last "
+                        "checkpoint highSeqno (which is " +
+                        std::to_string(checkpointList.back()->getHighSeqno()) +
+                        ")");
+    }
 
     removeCursor_UNLOCKED(name);
 
@@ -410,15 +503,17 @@ CursorRegResult CheckpointManager::registerCursorBySeqno(const std::string &name
         uint64_t st = (*itr)->getLowSeqno();
 
         if (startBySeqno < st) {
-            tapCursors[name] = CheckpointCursor(name, itr, (*itr)->begin(),
-                                                skipped, false);
+            connCursors[name] = CheckpointCursor(name, itr, (*itr)->begin(),
+                                                 skipped, false,
+                                                 needsCheckPointEndMetaItem);
             (*itr)->registerCursorName(name);
             result.first = (*itr)->getLowSeqno();
             break;
         } else if (startBySeqno <= en) {
-            std::list<queued_item>::iterator iitr = (*itr)->begin();
+            CheckpointQueue::iterator iitr = (*itr)->begin();
             while (++iitr != (*itr)->end() &&
-                    startBySeqno >= static_cast<uint64_t>((*iitr)->getBySeqno())) {
+                    (startBySeqno >=
+                     static_cast<uint64_t>((*iitr)->getBySeqno()))) {
                 skipped++;
             }
 
@@ -430,8 +525,9 @@ CursorRegResult CheckpointManager::registerCursorBySeqno(const std::string &name
                 --iitr;
             }
 
-            tapCursors[name] = CheckpointCursor(name, itr, iitr, skipped,
-                                                false);
+            connCursors[name] = CheckpointCursor(name, itr, iitr, skipped,
+                                                 false,
+                                                 needsCheckPointEndMetaItem);
             (*itr)->registerCursorName(name);
             break;
         } else {
@@ -439,25 +535,32 @@ CursorRegResult CheckpointManager::registerCursorBySeqno(const std::string &name
         }
     }
 
-    result.second = (result.first == checkpointList.front()->getLowSeqno()) ? true : false;
+    result.second = (result.first == checkpointList.front()->getLowSeqno()) ?
+                    true : false;
 
     if (result.first == std::numeric_limits<uint64_t>::max()) {
         /*
-         * We should never get here since this would mean that the sequence number
-         * we are looking for is higher than anything currently assigned and there
-         * is already an assert above for this case.
+         * We should never get here since this would mean that the sequence
+         * number we are looking for is higher than anything currently assigned
+         *  and there is already an assert above for this case.
          */
         LOG(EXTENSION_LOG_WARNING, "Cursor not registered into vb %d "
-            " for stream '%s' because seqno %llu is too high",
+            " for stream '%s' because seqno %" PRIu64 " is too high",
             vbucketId, name.c_str(), startBySeqno);
     }
     return result;
 }
 
-bool CheckpointManager::registerCursor_UNLOCKED(const std::string &name,
-                                                uint64_t checkpointId,
-                                                bool alwaysFromBeginning) {
-    cb_assert(!checkpointList.empty());
+bool CheckpointManager::registerCursor_UNLOCKED(
+                            const std::string &name,
+                            uint64_t checkpointId,
+                            bool alwaysFromBeginning,
+                            MustSendCheckpointEnd needsCheckpointEndMetaItem)
+{
+    if (checkpointList.empty()) {
+        throw std::logic_error("CheckpointManager::registerCursor_UNLOCKED: "
+                        "checkpointList is empty");
+    }
 
     bool resetOnCollapse = true;
     if (name.compare(pCursorName) == 0) {
@@ -474,13 +577,13 @@ bool CheckpointManager::registerCursor_UNLOCKED(const std::string &name,
     }
 
     LOG(EXTENSION_LOG_INFO,
-        "Register the tap cursor with the name \"%s\" for vbucket %d",
+        "Register the cursor with name \"%s\" for vbucket %d",
         name.c_str(), vbucketId);
 
-    // If the tap cursor exists, remove its name from the checkpoint that is
-    // currently referenced by the tap cursor.
-    cursor_index::iterator map_it = tapCursors.find(name);
-    if (map_it != tapCursors.end()) {
+    // If the cursor exists, remove its name from the checkpoint that is
+    // currently referenced by it.
+    cursor_index::iterator map_it = connCursors.find(name);
+    if (map_it != connCursors.end()) {
         (*(map_it->second.currentCheckpoint))->removeCursorName(name);
     }
 
@@ -493,11 +596,16 @@ bool CheckpointManager::registerCursor_UNLOCKED(const std::string &name,
         }
 
         LOG(EXTENSION_LOG_DEBUG,
-            "Checkpoint %llu for vbucket %d doesn't exist in memory. "
-            "Set the cursor with the name \"%s\" to checkpoint %d.\n",
+            "Checkpoint %" PRIu64 " for vbucket %d doesn't exist in memory. "
+            "Set the cursor with the name \"%s\" to checkpoint %" PRIu64 ".\n",
             checkpointId, vbucketId, name.c_str(), (*it)->getId());
 
-        cb_assert(it != checkpointList.end());
+        if (it == checkpointList.end()) {
+            throw std::logic_error("CheckpointManager::registerCursor_UNLOCKED: "
+                            "failed to find checkpoint with "
+                            "Id >= pCursorPreCheckpointId (which is" +
+                            std::to_string(pCursorPreCheckpointId) + ")");
+        }
 
         size_t offset = 0;
         std::list<Checkpoint*>::iterator pos = checkpointList.begin();
@@ -505,20 +613,21 @@ bool CheckpointManager::registerCursor_UNLOCKED(const std::string &name,
             offset += (*pos)->getNumItems() + 2;
         }
 
-        tapCursors[name] = CheckpointCursor(name, it, (*it)->begin(), offset,
-                                            resetOnCollapse);
+        connCursors[name] = CheckpointCursor(name, it, (*it)->begin(), offset,
+                                             resetOnCollapse,
+                                             needsCheckpointEndMetaItem);
         (*it)->registerCursorName(name);
     } else {
         size_t offset = 0;
-        std::list<queued_item>::iterator curr;
+        CheckpointQueue::iterator curr;
 
         LOG(EXTENSION_LOG_DEBUG,
-            "Checkpoint %llu for vbucket %d exists in memory. "
-            "Set the cursor with the name \"%s\" to the checkpoint %llu\n",
+            "Checkpoint %" PRIu64 " for vbucket %d exists in memory. "
+            "Set the cursor with the name \"%s\" to the checkpoint %" PRIu64,
             checkpointId, vbucketId, name.c_str(), checkpointId);
 
         if (!alwaysFromBeginning &&
-            map_it != tapCursors.end() &&
+            map_it != connCursors.end() &&
             (*(map_it->second.currentCheckpoint))->getId() == (*it)->getId()) {
             // If the cursor is currently in the checkpoint to start with,
             // simply start from
@@ -536,9 +645,10 @@ bool CheckpointManager::registerCursor_UNLOCKED(const std::string &name,
             }
         }
 
-        tapCursors[name] = CheckpointCursor(name, it, curr, offset,
-                                            resetOnCollapse);
-        // Register the tap cursor's name to the checkpoint.
+        connCursors[name] = CheckpointCursor(name, it, curr, offset,
+                                             resetOnCollapse,
+                                             needsCheckpointEndMetaItem);
+        // Register the cursor's name to the checkpoint.
         (*it)->registerCursorName(name);
     }
 
@@ -551,8 +661,8 @@ bool CheckpointManager::removeCursor(const std::string &name) {
 }
 
 bool CheckpointManager::removeCursor_UNLOCKED(const std::string &name) {
-    cursor_index::iterator it = tapCursors.find(name);
-    if (it == tapCursors.end()) {
+    cursor_index::iterator it = connCursors.find(name);
+    if (it == connCursors.end()) {
         return false;
     }
 
@@ -573,14 +683,14 @@ bool CheckpointManager::removeCursor_UNLOCKED(const std::string &name) {
         (*cit)->removeCursorName(name);
     }
 
-    tapCursors.erase(it);
+    connCursors.erase(it);
     return true;
 }
 
 uint64_t CheckpointManager::getCheckpointIdForCursor(const std::string &name) {
     LockHolder lh(queueLock);
-    cursor_index::iterator it = tapCursors.find(name);
-    if (it == tapCursors.end()) {
+    cursor_index::iterator it = connCursors.find(name);
+    if (it == connCursors.end()) {
         return 0;
     }
 
@@ -589,31 +699,32 @@ uint64_t CheckpointManager::getCheckpointIdForCursor(const std::string &name) {
 
 size_t CheckpointManager::getNumOfCursors() {
     LockHolder lh(queueLock);
-    return tapCursors.size();
+    return connCursors.size();
 }
 
-size_t CheckpointManager::getNumCheckpoints() {
+size_t CheckpointManager::getNumCheckpoints() const {
     LockHolder lh(queueLock);
     return checkpointList.size();
 }
 
-std::list<std::string> CheckpointManager::getCursorNames() {
+checkpointCursorInfoList CheckpointManager::getAllCursors() {
     LockHolder lh(queueLock);
-    std::list<std::string> cursor_names;
-    cursor_index::iterator tap_it = tapCursors.begin();
-        for (; tap_it != tapCursors.end(); ++tap_it) {
-        cursor_names.push_back((tap_it->first));
+    checkpointCursorInfoList cursorInfo;
+    for (auto& cur_it : connCursors) {
+        cursorInfo.push_back(std::make_pair(
+                        (cur_it.first),
+                        (cur_it.second.shouldSendCheckpointEndMetaItem())));
     }
-    return cursor_names;
+    return cursorInfo;
 }
 
 bool CheckpointManager::isCheckpointCreationForHighMemUsage(
                                               const RCPtr<VBucket> &vbucket) {
     bool forceCreation = false;
     double memoryUsed = static_cast<double>(stats.getTotalMemoryUsed());
-    // pesistence and tap cursors are all currently in the open checkpoint?
+    // pesistence and conn cursors are all currently in the open checkpoint?
     bool allCursorsInOpenCheckpoint =
-        (tapCursors.size() + 1) == checkpointList.back()->getNumberOfCursors();
+        (connCursors.size() + 1) == checkpointList.back()->getNumberOfCursors();
 
     if (memoryUsed > stats.mem_high_wat &&
         allCursorsInOpenCheckpoint &&
@@ -630,7 +741,10 @@ size_t CheckpointManager::removeClosedUnrefCheckpoints(
 
     // This function is executed periodically by the non-IO dispatcher.
     LockHolder lh(queueLock);
-    cb_assert(vbucket);
+    if (!vbucket) {
+        throw std::invalid_argument("CheckpointManager::removeCloseUnrefCheckpoints:"
+                        " vbucket must be non-NULL");
+    }
     uint64_t oldCheckpointId = 0;
     bool canCreateNewCheckpoint = false;
     if (checkpointList.size() < checkpointConfig.getMaxCheckpoints() ||
@@ -684,8 +798,8 @@ size_t CheckpointManager::removeClosedUnrefCheckpoints(
     size_t total_items = numUnrefItems + numMetaItems;
     numItems.fetch_sub(total_items);
     if (total_items > 0) {
-        cursor_index::iterator map_it = tapCursors.begin();
-        for (; map_it != tapCursors.end(); ++map_it) {
+        cursor_index::iterator map_it = connCursors.begin();
+        for (; map_it != connCursors.end(); ++map_it) {
             map_it->second.decrOffset(total_items);
         }
     }
@@ -730,8 +844,8 @@ void CheckpointManager::removeInvalidCursorsOnCheckpoint(
     const std::set<std::string> &cursors = pCheckpoint->getCursorNameList();
     std::set<std::string>::const_iterator cit = cursors.begin();
     for (; cit != cursors.end(); ++cit) {
-        cursor_index::iterator mit = tapCursors.find(*cit);
-        if (mit == tapCursors.end() ||
+        cursor_index::iterator mit = connCursors.find(*cit);
+        if (mit == connCursors.end() ||
             pCheckpoint != *(mit->second.currentCheckpoint)) {
             invalidCursorNames.push_back(*cit);
         }
@@ -761,8 +875,8 @@ void CheckpointManager::collapseClosedCheckpoints(
         // those cursors move to the first regular item. Otherwise, those cursors will
         // visit old items from collapsed checkpoints again.
         for (; nitr != (*lastClosedChk)->getCursorNameList().end(); ++nitr) {
-            cursor_index::iterator cc = tapCursors.find(*nitr);
-            if (cc == tapCursors.end()) {
+            cursor_index::iterator cc = connCursors.find(*nitr);
+            if (cc == connCursors.end()) {
                 continue;
             }
             enum queue_operation qop = (*(cc->second.currentPos))->getOperation();
@@ -784,15 +898,18 @@ void CheckpointManager::collapseClosedCheckpoints(
             std::set<std::string>::iterator nameItr =
                 (*rit)->getCursorNameList().begin();
             for (; nameItr != (*rit)->getCursorNameList().end(); ++nameItr) {
-                cursor_index::iterator cc = tapCursors.find(*nameItr);
+                cursor_index::iterator cc = connCursors.find(*nameItr);
                 const std::string& key = (*(cc->second.currentPos))->getKey();
+                bool isMetaItem =
+                            (*(cc->second.currentPos))->isCheckPointMetaItem();
                 bool cursor_on_chk_start = false;
                 if ((*(cc->second.currentPos))->getOperation() ==
                     queue_op_checkpoint_start) {
                     cursor_on_chk_start = true;
                 }
                 slowCursors[*nameItr] =
-                    std::make_pair((*rit)->getMutationIdForKey(key), cursor_on_chk_start);
+                    std::make_pair((*rit)->getMutationIdForKey(key, isMetaItem),
+                                   cursor_on_chk_start);
             }
         }
         putCursorsInCollapsedChk(slowCursors, lastClosedChk);
@@ -807,8 +924,8 @@ void CheckpointManager::collapseClosedCheckpoints(
         std::set<std::string>::const_iterator cit = fastCursors.begin();
         // Update the offset of each fast cursor.
         for (; cit != fastCursors.end(); ++cit) {
-            cursor_index::iterator mit = tapCursors.find(*cit);
-            if (mit != tapCursors.end()) {
+            cursor_index::iterator mit = connCursors.find(*cit);
+            if (mit != connCursors.end()) {
                 mit->second.decrOffset(total_items);
             }
         }
@@ -817,27 +934,75 @@ void CheckpointManager::collapseClosedCheckpoints(
     }
 }
 
+std::vector<std::string> CheckpointManager::getListOfCursorsToDrop() {
+    LockHolder lh(queueLock);
+
+    // List of cursor names whose streams will be closed
+    std::vector<std::string> cursorsToDrop;
+
+    size_t num_checkpoints_to_unref;
+    if (checkpointList.size() == 1) {
+        num_checkpoints_to_unref = 0;
+    } else if (checkpointList.size() <=
+              (DEFAULT_MAX_CHECKPOINTS + MAX_CHECKPOINTS_UPPER_BOUND) / 2) {
+        num_checkpoints_to_unref = 1;
+    } else {
+        num_checkpoints_to_unref = 2;
+    }
+
+    std::list<Checkpoint*>::const_iterator it = checkpointList.begin();
+    while (num_checkpoints_to_unref != 0 && it != checkpointList.end()) {
+        if ((*it)->isEligibleToBeUnreferenced()) {
+            const std::set<std::string> &cursors = (*it)->getCursorNameList();
+            cursorsToDrop.insert(cursorsToDrop.end(), cursors.begin(), cursors.end());
+        } else {
+            break;
+        }
+        --num_checkpoints_to_unref;
+        ++it;
+    }
+    return cursorsToDrop;
+}
+
 bool CheckpointManager::queueDirty(const RCPtr<VBucket> &vb, queued_item& qi,
                                    bool genSeqno) {
     LockHolder lh(queueLock);
-
-    cb_assert(vb);
+    if (!vb) {
+        throw std::invalid_argument("CheckpointManager::queueDirty: vb must "
+                        "be non-NULL");
+    }
     bool canCreateNewCheckpoint = false;
     if (checkpointList.size() < checkpointConfig.getMaxCheckpoints() ||
         (checkpointList.size() == checkpointConfig.getMaxCheckpoints() &&
          checkpointList.front()->getNumberOfCursors() == 0)) {
         canCreateNewCheckpoint = true;
     }
+
     if (vb->getState() == vbucket_state_active && canCreateNewCheckpoint) {
         // Only the master active vbucket can create a next open checkpoint.
         checkOpenCheckpoint_UNLOCKED(false, true);
     }
 
     if (checkpointList.back()->getState() == CHECKPOINT_CLOSED) {
-        addNewCheckpoint_UNLOCKED(checkpointList.back()->getId() + 1);
+        if (vb->getState() == vbucket_state_active) {
+            addNewCheckpoint_UNLOCKED(checkpointList.back()->getId() + 1);
+        } else {
+            throw std::logic_error("CheckpointManager::queueDirty: vBucket "
+                    "state (which is " +
+                    std::string(VBucket::toString(vb->getState())) +
+                    ") is not active. This is not expected. vb:" +
+                    std::to_string(vb->getId()) +
+                    " lastBySeqno:" + std::to_string(lastBySeqno) +
+                    " genSeqno:" + std::to_string(genSeqno));
+        }
     }
 
-    cb_assert(checkpointList.back()->getState() == CHECKPOINT_OPEN);
+    if (checkpointList.back()->getState() != CHECKPOINT_OPEN) {
+        throw std::logic_error(
+                "Checkpoint::queueDirty: current checkpointState (which is" +
+                std::to_string(checkpointList.back()->getState()) +
+                ") is not OPEN");
+    }
 
     if (genSeqno) {
         qi->setBySeqno(++lastBySeqno);
@@ -847,10 +1012,19 @@ bool CheckpointManager::queueDirty(const RCPtr<VBucket> &vb, queued_item& qi,
     }
     uint64_t st = checkpointList.back()->getSnapshotStartSeqno();
     uint64_t en = checkpointList.back()->getSnapshotEndSeqno();
-    cb_assert(st <= static_cast<uint64_t>(lastBySeqno) &&
-              static_cast<uint64_t>(lastBySeqno) <= en);
+    if (!(st <= static_cast<uint64_t>(lastBySeqno) &&
+          static_cast<uint64_t>(lastBySeqno) <= en)) {
+        throw std::logic_error("CheckpointManager::queueDirty: lastBySeqno "
+                "not in snapshot range. vb:" + std::to_string(vb->getId()) +
+                " state:" + std::string(VBucket::toString(vb->getState())) +
+                " snapshotStart:" + std::to_string(st) +
+                " lastBySeqno:" + std::to_string(lastBySeqno) +
+                " snapshotEnd:" + std::to_string(en) +
+                " genSeqno:" + (genSeqno ? "True" : "False"));
+    }
 
     queue_dirty_t result = checkpointList.back()->queueDirty(qi, this);
+
     if (result == NEW_ITEM) {
         ++numItems;
     }
@@ -859,6 +1033,9 @@ bool CheckpointManager::queueDirty(const RCPtr<VBucket> &vb, queued_item& qi,
         ++stats.totalEnqueued;
         ++stats.diskQueueSize;
         vb->doStatsForQueueing(*qi, qi->size());
+
+        // Update the checkpoint's memory usage
+        checkpointList.back()->incrementMemConsumption(qi->size());
     }
 
     return result != EXISTING_ITEM;
@@ -869,8 +1046,8 @@ snapshot_range_t CheckpointManager::getAllItemsForCursor(
                                              std::vector<queued_item> &items) {
     LockHolder lh(queueLock);
     snapshot_range_t range;
-    cursor_index::iterator it = tapCursors.find(name);
-    if (it == tapCursors.end()) {
+    cursor_index::iterator it = connCursors.find(name);
+    if (it == connCursors.end()) {
         range.start = 0;
         range.end = 0;
         return range;
@@ -886,9 +1063,6 @@ snapshot_range_t CheckpointManager::getAllItemsForCursor(
         if (qi->getOperation() == queue_op_checkpoint_end) {
             range.end = (*it->second.currentCheckpoint)->getSnapshotEndSeqno();
             moveCursorToNextCheckpoint(it->second);
-            if (name.compare(pCursorName) != 0) {
-                break;
-            }
         }
     }
 
@@ -902,8 +1076,8 @@ snapshot_range_t CheckpointManager::getAllItemsForCursor(
 queued_item CheckpointManager::nextItem(const std::string &name,
                                         bool &isLastMutationItem) {
     LockHolder lh(queueLock);
-    cursor_index::iterator it = tapCursors.find(name);
-    if (it == tapCursors.end()) {
+    cursor_index::iterator it = connCursors.find(name);
+    if (it == connCursors.end()) {
         LOG(EXTENSION_LOG_WARNING,
         "The cursor with name \"%s\" is not found in the checkpoint of vbucket"
         "%d.\n", name.c_str(), vbucketId);
@@ -914,7 +1088,7 @@ queued_item CheckpointManager::nextItem(const std::string &name,
     if (checkpointList.back()->getId() == 0) {
         LOG(EXTENSION_LOG_INFO,
             "VBucket %d is still in backfill phase that doesn't allow "
-            " the tap cursor to fetch an item from it's current checkpoint",
+            " the cursor to fetch an item from it's current checkpoint",
             vbucketId);
         queued_item qi(new Item(std::string(""), 0xffff,
                                 queue_op_empty, 0, 0));
@@ -973,8 +1147,8 @@ void CheckpointManager::clear_UNLOCKED(vbucket_state_t vbState, uint64_t seqno) 
 }
 
 void CheckpointManager::resetCursors(bool resetPersistenceCursor) {
-    cursor_index::iterator cit = tapCursors.begin();
-    for (; cit != tapCursors.end(); ++cit) {
+    cursor_index::iterator cit = connCursors.begin();
+    for (; cit != connCursors.end(); ++cit) {
         if (cit->second.name.compare(pCursorName) == 0) {
             if (!resetPersistenceCursor) {
                 continue;
@@ -990,11 +1164,12 @@ void CheckpointManager::resetCursors(bool resetPersistenceCursor) {
     }
 }
 
-void CheckpointManager::resetCursors(const std::list<std::string> &cursors) {
+void CheckpointManager::resetCursors(checkpointCursorInfoList &cursors) {
     LockHolder lh(queueLock);
-    std::list<std::string>::const_iterator it = cursors.begin();
-    for (; it != cursors.end(); ++it) {
-        registerCursor_UNLOCKED(*it, getOpenCheckpointId_UNLOCKED(), true);
+
+    for (auto& it : cursors) {
+        registerCursor_UNLOCKED(it.first, getOpenCheckpointId_UNLOCKED(), true,
+                                it.second);
     }
 }
 
@@ -1060,8 +1235,8 @@ size_t CheckpointManager::getNumItemsForCursor(const std::string &name) {
 
 size_t CheckpointManager::getNumItemsForCursor_UNLOCKED(const std::string &name) {
     size_t remains = 0;
-    cursor_index::iterator it = tapCursors.find(name);
-    if (it != tapCursors.end()) {
+    cursor_index::iterator it = connCursors.find(name);
+    if (it != connCursors.end()) {
         size_t offset = it->second.offset + getNumOfMetaItemsFromCursor(it->second);
         remains = (numItems > offset) ? numItems - offset : 0;
     }
@@ -1074,7 +1249,7 @@ size_t CheckpointManager::getNumOfMetaItemsFromCursor(CheckpointCursor &cursor) 
     std::list<Checkpoint*>::iterator curr_chk = cursor.currentCheckpoint;
     for (; curr_chk != checkpointList.end(); ++curr_chk) {
         if (curr_chk == cursor.currentCheckpoint) {
-            std::list<queued_item>::iterator curr_pos = cursor.currentPos;
+            CheckpointQueue::iterator curr_pos = cursor.currentPos;
             ++curr_pos;
             if (curr_pos == (*curr_chk)->end()) {
                 continue;
@@ -1103,8 +1278,8 @@ size_t CheckpointManager::getNumOfMetaItemsFromCursor(CheckpointCursor &cursor) 
 
 void CheckpointManager::decrCursorFromCheckpointEnd(const std::string &name) {
     LockHolder lh(queueLock);
-    cursor_index::iterator it = tapCursors.find(name);
-    if (it != tapCursors.end() &&
+    cursor_index::iterator it = connCursors.find(name);
+    if (it != connCursors.end() &&
         (*(it->second.currentPos))->getOperation() ==
         queue_op_checkpoint_end) {
         it->second.decrPos();
@@ -1113,7 +1288,7 @@ void CheckpointManager::decrCursorFromCheckpointEnd(const std::string &name) {
 
 bool CheckpointManager::isLastMutationItemInCheckpoint(
                                                    CheckpointCursor &cursor) {
-    std::list<queued_item>::iterator it = cursor.currentPos;
+    CheckpointQueue::iterator it = cursor.currentPos;
     ++it;
     if (it == (*(cursor.currentCheckpoint))->end() ||
         (*it)->getOperation() == queue_op_checkpoint_end) {
@@ -1132,7 +1307,10 @@ void CheckpointManager::setBackfillPhase(uint64_t start, uint64_t end) {
 void CheckpointManager::createSnapshot(uint64_t snapStartSeqno,
                                        uint64_t snapEndSeqno) {
     LockHolder lh(queueLock);
-    cb_assert(!checkpointList.empty());
+    if (checkpointList.empty()) {
+        throw std::logic_error("CheckpointManager::createSnapshot: "
+                        "checkpointList is empty");
+    }
 
     size_t lastChkId = checkpointList.back()->getId();
 
@@ -1152,7 +1330,10 @@ void CheckpointManager::createSnapshot(uint64_t snapStartSeqno,
 
 void CheckpointManager::resetSnapshotRange() {
     LockHolder lh(queueLock);
-    cb_assert(!checkpointList.empty());
+    if (checkpointList.empty()) {
+        throw std::logic_error("CheckpointManager::resetSnapshotRange: "
+                        "checkpointList is empty");
+    }
 
     // Update snapshot_start and snapshot_end only if the open
     // checkpoint has no items, otherwise just set the
@@ -1172,7 +1353,10 @@ void CheckpointManager::resetSnapshotRange() {
 
 snapshot_info_t CheckpointManager::getSnapshotInfo() {
     LockHolder lh(queueLock);
-    cb_assert(!checkpointList.empty());
+    if (checkpointList.empty()) {
+        throw std::logic_error("CheckpointManager::getSnapshotInfo: "
+                        "checkpointList is empty");
+    }
 
     snapshot_info_t info;
     info.range.start = checkpointList.back()->getSnapshotStartSeqno();
@@ -1247,8 +1431,8 @@ void CheckpointManager::checkAndAddNewCheckpoint(uint64_t id,
                 if ((*cit).compare(pCursorName) == 0) {
                     // Persistence cursor
                     continue;
-                } else { // TAP cursors
-                    cursor_index::iterator mit = tapCursors.find(*cit);
+                } else { // Dcp/Tap cursors
+                    cursor_index::iterator mit = connCursors.find(*cit);
                     mit->second.currentPos = checkpointList.back()->begin();
                 }
             }
@@ -1272,19 +1456,24 @@ void CheckpointManager::checkAndAddNewCheckpoint(uint64_t id,
 }
 
 void CheckpointManager::collapseCheckpoints(uint64_t id) {
-    cb_assert(!checkpointList.empty());
+    if (checkpointList.empty()) {
+        throw std::logic_error("CheckpointManager::collapseCheckpoints: "
+                        "checkpointList is empty");
+    }
 
     std::map<std::string, std::pair<uint64_t, bool> > cursorMap;
     cursor_index::iterator itr;
-    for (itr = tapCursors.begin(); itr != tapCursors.end(); itr++) {
+    for (itr = connCursors.begin(); itr != connCursors.end(); itr++) {
         Checkpoint* chk = *(itr->second.currentCheckpoint);
         const std::string& key = (*(itr->second.currentPos))->getKey();
+        bool isMetaItem = (*(itr->second.currentPos))->isCheckPointMetaItem();
         bool cursor_on_chk_start = false;
         if ((*(itr->second.currentPos))->getOperation() == queue_op_checkpoint_start) {
             cursor_on_chk_start = true;
         }
         cursorMap[itr->first.c_str()] =
-            std::make_pair(chk->getMutationIdForKey(key), cursor_on_chk_start);
+            std::make_pair(chk->getMutationIdForKey(key, isMetaItem),
+                           cursor_on_chk_start);
     }
 
     setOpenCheckpointId_UNLOCKED(id);
@@ -1305,7 +1494,12 @@ void CheckpointManager::collapseCheckpoints(uint64_t id) {
     if (checkpointList.size() > 1) {
         checkpointList.erase(checkpointList.begin(), --checkpointList.end());
     }
-    cb_assert(checkpointList.size() == 1);
+
+    if (checkpointList.size() != 1) {
+        throw std::logic_error("CheckpointManager::collapseCheckpoints: "
+                "checkpointList.size (which is" +
+                std::to_string(checkpointList.size()) + " is not 1");
+    }
 
     if (checkpointList.back()->getState() == CHECKPOINT_CLOSED) {
         checkpointList.back()->popBackCheckpointEndItem();
@@ -1320,18 +1514,19 @@ putCursorsInCollapsedChk(std::map<std::string, std::pair<uint64_t, bool> > &curs
                          std::list<Checkpoint*>::iterator chkItr) {
     size_t i;
     Checkpoint *chk = *chkItr;
-    std::list<queued_item>::iterator cit = chk->begin();
-    std::list<queued_item>::iterator last = chk->begin();
+    CheckpointQueue::iterator cit = chk->begin();
+    CheckpointQueue::iterator last = chk->begin();
     for (i = 0; cit != chk->end(); ++i, ++cit) {
-        uint64_t id = chk->getMutationIdForKey((*cit)->getKey());
+        uint64_t id = chk->getMutationIdForKey((*cit)->getKey(),
+                                               (*cit)->isCheckPointMetaItem());
         std::map<std::string, std::pair<uint64_t, bool> >::iterator mit = cursors.begin();
         while (mit != cursors.end()) {
             std::pair<uint64_t, bool> val = mit->second;
             if (val.first < id || (val.first == id && val.second &&
                 (*last)->getOperation() == queue_op_checkpoint_start)) {
 
-                cursor_index::iterator cc = tapCursors.find(mit->first);
-                if (cc == tapCursors.end() ||
+                cursor_index::iterator cc = connCursors.find(mit->first);
+                if (cc == connCursors.end() ||
                     cc->second.fromBeginningOnChkCollapse) {
                     ++mit;
                     continue;
@@ -1354,8 +1549,8 @@ putCursorsInCollapsedChk(std::map<std::string, std::pair<uint64_t, bool> > &curs
 
     std::map<std::string, std::pair<uint64_t, bool> >::iterator mit = cursors.begin();
     for (; mit != cursors.end(); ++mit) {
-        cursor_index::iterator cc = tapCursors.find(mit->first);
-        if (cc == tapCursors.end()) {
+        cursor_index::iterator cc = connCursors.find(mit->first);
+        if (cc == connCursors.end()) {
             continue;
         }
         cc->second.currentCheckpoint = chkItr;
@@ -1372,13 +1567,13 @@ putCursorsInCollapsedChk(std::map<std::string, std::pair<uint64_t, bool> > &curs
 
 bool CheckpointManager::hasNext(const std::string &name) {
     LockHolder lh(queueLock);
-    cursor_index::iterator it = tapCursors.find(name);
-    if (it == tapCursors.end() || getOpenCheckpointId_UNLOCKED() == 0) {
+    cursor_index::iterator it = connCursors.find(name);
+    if (it == connCursors.end() || getOpenCheckpointId_UNLOCKED() == 0) {
         return false;
     }
 
     bool hasMore = true;
-    std::list<queued_item>::iterator curr = it->second.currentPos;
+    CheckpointQueue::iterator curr = it->second.currentPos;
     ++curr;
     if (curr == (*(it->second.currentCheckpoint))->end() &&
         (*(it->second.currentCheckpoint)) == checkpointList.back()) {
@@ -1389,23 +1584,30 @@ bool CheckpointManager::hasNext(const std::string &name) {
 
 queued_item CheckpointManager::createCheckpointItem(uint64_t id, uint16_t vbid,
                                           enum queue_operation checkpoint_op) {
-    cb_assert(checkpoint_op == queue_op_checkpoint_start ||
-           checkpoint_op == queue_op_checkpoint_end ||
-           checkpoint_op == queue_op_empty);
-
     uint64_t bySeqno;
-    std::stringstream key;
-    if (checkpoint_op == queue_op_checkpoint_start) {
-        key << "checkpoint_start";
+    std::string key;
+
+    switch (checkpoint_op) {
+    case queue_op_checkpoint_start:
+        key = "checkpoint_start";
         bySeqno = lastBySeqno + 1;
-    } else if (checkpoint_op == queue_op_empty) {
-        key << "dummy_key";
+        break;
+    case queue_op_checkpoint_end:
+        key = "checkpoint_end";
         bySeqno = lastBySeqno;
-    } else {
-        key << "checkpoint_end";
+        break;
+    case queue_op_empty:
+        key = "dummy_key";
         bySeqno = lastBySeqno;
+        break;
+    default:
+        throw std::invalid_argument("CheckpointManager::createCheckpointItem:"
+                        "checkpoint_op (which is " +
+                        std::to_string(checkpoint_op) +
+                        ") is not a valid item to create");
     }
-    queued_item qi(new Item(key.str(), vbid, checkpoint_op, id, bySeqno));
+
+    queued_item qi(new Item(key, vbid, checkpoint_op, id, bySeqno));
     return qi;
 }
 
@@ -1425,9 +1627,46 @@ uint64_t CheckpointManager::getPersistenceCursorPreChkId() {
 
 void CheckpointManager::itemsPersisted() {
     LockHolder lh(queueLock);
-    CheckpointCursor& persistenceCursor = tapCursors[pCursorName];
+    CheckpointCursor& persistenceCursor = connCursors[pCursorName];
     std::list<Checkpoint*>::iterator itr = persistenceCursor.currentCheckpoint;
     pCursorPreCheckpointId = ((*itr)->getId() > 0) ? (*itr)->getId() - 1 : 0;
+}
+
+size_t CheckpointManager::getMemoryUsage_UNLOCKED() {
+    if (checkpointList.empty()) {
+        return 0;
+    }
+
+    size_t memUsage = 0;
+    std::list<Checkpoint*>::const_iterator it = checkpointList.begin();
+    for (; it != checkpointList.end(); ++it) {
+        memUsage += (*it)->getMemConsumption();
+    }
+    return memUsage;
+}
+
+size_t CheckpointManager::getMemoryUsage() {
+    LockHolder lh(queueLock);
+    return getMemoryUsage_UNLOCKED();
+}
+
+size_t CheckpointManager::getMemoryUsageOfUnrefCheckpoints() {
+    LockHolder lh(queueLock);
+
+    if (checkpointList.empty()) {
+        return 0;
+    }
+
+    size_t memUsage = 0;
+    std::list<Checkpoint*>::const_iterator it = checkpointList.begin();
+    for (; it != checkpointList.end(); ++it) {
+        if ((*it)->getNumberOfCursors() == 0) {
+            memUsage += (*it)->getMemConsumption();
+        } else {
+            break;
+        }
+    }
+    return memUsage;
 }
 
 void CheckpointConfig::addConfigChangeListener(
@@ -1526,35 +1765,59 @@ void CheckpointManager::addStats(ADD_STAT add_stat, const void *cookie) {
     LockHolder lh(queueLock);
     char buf[256];
 
-    snprintf(buf, sizeof(buf), "vb_%d:open_checkpoint_id", vbucketId);
-    add_casted_stat(buf, getOpenCheckpointId_UNLOCKED(), add_stat, cookie);
-    snprintf(buf, sizeof(buf), "vb_%d:last_closed_checkpoint_id", vbucketId);
-    add_casted_stat(buf, getLastClosedCheckpointId_UNLOCKED(),
-    add_stat, cookie);
-    snprintf(buf, sizeof(buf), "vb_%d:num_tap_cursors", vbucketId);
-    add_casted_stat(buf, tapCursors.size(), add_stat, cookie);
-    snprintf(buf, sizeof(buf), "vb_%d:num_checkpoint_items", vbucketId);
-    add_casted_stat(buf, numItems, add_stat, cookie);
-    snprintf(buf, sizeof(buf), "vb_%d:num_open_checkpoint_items", vbucketId);
-    add_casted_stat(buf, checkpointList.empty() ? 0 :
-                    checkpointList.back()->getNumItems(),
-                    add_stat, cookie);
-    snprintf(buf, sizeof(buf), "vb_%d:num_checkpoints", vbucketId);
-    add_casted_stat(buf, checkpointList.size(), add_stat, cookie);
-    snprintf(buf, sizeof(buf), "vb_%d:num_items_for_persistence", vbucketId);
-    add_casted_stat(buf, getNumItemsForCursor_UNLOCKED(pCursorName),
-                    add_stat, cookie);
+    try {
+        checked_snprintf(buf, sizeof(buf), "vb_%d:open_checkpoint_id",
+                         vbucketId);
+        add_casted_stat(buf, getOpenCheckpointId_UNLOCKED(), add_stat, cookie);
+        checked_snprintf(buf, sizeof(buf), "vb_%d:last_closed_checkpoint_id",
+                         vbucketId);
+        add_casted_stat(buf, getLastClosedCheckpointId_UNLOCKED(),
+                        add_stat, cookie);
+        checked_snprintf(buf, sizeof(buf), "vb_%d:num_conn_cursors", vbucketId);
+        add_casted_stat(buf, connCursors.size(), add_stat, cookie);
+        checked_snprintf(buf, sizeof(buf), "vb_%d:num_checkpoint_items",
+                         vbucketId);
+        add_casted_stat(buf, numItems, add_stat, cookie);
+        checked_snprintf(buf, sizeof(buf), "vb_%d:num_open_checkpoint_items",
+                         vbucketId);
+        add_casted_stat(buf, checkpointList.empty() ? 0 :
+                             checkpointList.back()->getNumItems(),
+                        add_stat, cookie);
+        checked_snprintf(buf, sizeof(buf), "vb_%d:num_checkpoints", vbucketId);
+        add_casted_stat(buf, checkpointList.size(), add_stat, cookie);
+        checked_snprintf(buf, sizeof(buf), "vb_%d:num_items_for_persistence",
+                         vbucketId);
+        add_casted_stat(buf, getNumItemsForCursor_UNLOCKED(pCursorName),
+                        add_stat, cookie);
 
-    cursor_index::iterator tap_it = tapCursors.begin();
-    for (; tap_it != tapCursors.end(); ++tap_it) {
-        snprintf(buf, sizeof(buf),
-                 "vb_%d:%s:cursor_checkpoint_id", vbucketId,
-                 tap_it->first.c_str());
-        add_casted_stat(buf, (*(tap_it->second.currentCheckpoint))->getId(),
-                        add_stat, cookie);
-        snprintf(buf, sizeof(buf), "vb_%d:%s:cursor_seqno", vbucketId,
-                 tap_it->first.c_str());
-        add_casted_stat(buf, (*(tap_it->second.currentPos))->getBySeqno(),
-                        add_stat, cookie);
+        checked_snprintf(buf, sizeof(buf), "vb_%d:mem_usage", vbucketId);
+        add_casted_stat(buf, getMemoryUsage_UNLOCKED(), add_stat, cookie);
+
+        cursor_index::iterator cur_it = connCursors.begin();
+        for (; cur_it != connCursors.end(); ++cur_it) {
+            checked_snprintf(buf, sizeof(buf),
+                             "vb_%d:%s:cursor_checkpoint_id", vbucketId,
+                             cur_it->first.c_str());
+            add_casted_stat(buf, (*(cur_it->second.currentCheckpoint))->getId(),
+                            add_stat, cookie);
+            checked_snprintf(buf, sizeof(buf), "vb_%d:%s:cursor_seqno",
+                             vbucketId,
+                             cur_it->first.c_str());
+            add_casted_stat(buf, (*(cur_it->second.currentPos))->getBySeqno(),
+                            add_stat, cookie);
+        }
+    } catch (std::exception& error) {
+        LOG(EXTENSION_LOG_WARNING,
+            "CheckpointManager::addStats: An error occurred while adding stats: %s",
+            error.what());
     }
+}
+
+std::ostream& operator <<(std::ostream& os, const CheckpointManager& m) {
+    os << "CheckpointManager[" << &m << "] with "
+       << m.getNumCheckpoints() << " checkpoints, " << m.getNumItems() << " items." << std::endl;
+    for (auto* c : m.checkpointList) {
+        os << "    " << *c << std::endl;
+    }
+    return os;
 }

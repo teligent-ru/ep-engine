@@ -20,6 +20,8 @@
 #include <string>
 #include <vector>
 
+#include <phosphor/phosphor.h>
+
 #include "atomic.h"
 #include "backfill.h"
 #include "ep.h"
@@ -30,7 +32,10 @@ public:
     ItemResidentCallback(hrtime_t token, const std::string &n,
                          TapConnMap &cm, EventuallyPersistentEngine* e)
     : connToken(token), tapConnName(n), connMap(cm), engine(e) {
-        cb_assert(engine);
+        if (engine == nullptr) {
+            throw std::invalid_argument("ItemResidentCallback: engine must "
+                            "be non-NULL");
+        }
     }
 
     void callback(CacheLookup &lookup);
@@ -85,7 +90,13 @@ private:
 };
 
 void BackfillDiskCallback::callback(GetValue &gv) {
-    cb_assert(gv.getValue());
+    if (gv.getValue() == nullptr) {
+        LOG(EXTENSION_LOG_WARNING,
+        "BackfillDiskCallback::callback: gv must be non-NULL."
+        "Ignoring callback for tapConnName:%s",
+        tapConnName.c_str());
+        return;
+    }
     CompletedBGFetchTapOperation tapop(connToken,
                                        gv.getValue()->getVBucketId(), true);
     // if the tap connection is closed, then free an Item instance
@@ -95,6 +106,7 @@ void BackfillDiskCallback::callback(GetValue &gv) {
 }
 
 bool BackfillDiskLoad::run() {
+    TRACE_EVENT0("ep-engine/task", "BackfillDiskload");
     if (engine->getEpStore()->isMemoryUsageTooHigh()) {
         LOG(EXTENSION_LOG_INFO, "VBucket %d backfill task from disk is "
          "temporarily suspended  because the current memory usage is too high",
@@ -105,18 +117,36 @@ bool BackfillDiskLoad::run() {
 
     if (connMap.checkConnectivity(name) &&
                                !engine->getEpStore()->isFlushAllScheduled()) {
-        DBFileInfo info = store->getDbFileInfo(vbucket);
-        size_t num_items = info.itemCount;
-        size_t num_deleted = store->getNumPersistedDeletes(vbucket);
+        size_t num_items;
+        size_t num_deleted;
+        try {
+            num_items = store->getItemCount(vbucket);
+            num_deleted = store->getNumPersistedDeletes(vbucket);
+        } catch (std::system_error& e) {
+            if (e.code() == std::error_code(ENOENT, std::system_category())) {
+                // File creation hasn't completed yet; backoff and wait.
+                LOG(EXTENSION_LOG_NOTICE,
+                    "BackfillDiskLoad::run: Failed to get itemCount for "
+                    "vBucket %" PRIu16 " - database file does not yet exist. "
+                    "(%s) Snoozing for %f seconds", vbucket,
+                    e.what(), DEFAULT_BACKFILL_SNOOZE_TIME);
+                snooze(DEFAULT_BACKFILL_SNOOZE_TIME);
+                return true;
+            } else {
+                // Some other (unexpected) system_error exception - re-throw
+                throw e;
+            }
+        }
         connMap.incrBackfillRemaining(name, num_items + num_deleted);
 
-        shared_ptr<Callback<GetValue> >
+        std::shared_ptr<Callback<GetValue> >
             cb(new BackfillDiskCallback(connToken, name, connMap));
-        shared_ptr<Callback<CacheLookup> >
+        std::shared_ptr<Callback<CacheLookup> >
             cl(new ItemResidentCallback(connToken, name, connMap, engine));
 
         ScanContext* ctx = store->initScanContext(cb, cl, vbucket, startSeqno,
-                                                  false, false, false);
+                                                  DocumentFilter::ALL_ITEMS,
+                                                  ValueFilter::VALUES_DECOMPRESSED);
         if (ctx) {
             store->scan(ctx);
             store->destroyScanContext(ctx);
@@ -156,7 +186,6 @@ bool BackFillVisitor::visitBucket(RCPtr<VBucket> &vb) {
             "Schedule a full backfill from disk for vbucket %d.", vb->getId());
         ExTask task = new BackfillDiskLoad(name, engine, connMap,
                                           underlying, vb->getId(), 0, connToken,
-                                          Priority::TapBgFetcherPriority,
                                           0, false);
         ExecutorPool::get()->schedule(task, AUXIO_TASK_IDX);
     }
@@ -183,7 +212,7 @@ bool BackFillVisitor::pauseVisitor() {
     pause = theSize > maxBackfillSize;
 
     if (pause) {
-        LOG(EXTENSION_LOG_INFO, "Tap queue depth is too big for %s!!! ",
+        LOG(EXTENSION_LOG_INFO, "Tap queue depth is too big for %s!!! "
             "Pausing backfill temporarily...\n", name.c_str());
     }
     return pause;
@@ -209,7 +238,8 @@ bool BackFillVisitor::checkValidity() {
 }
 
 bool BackfillTask::run(void) {
+    TRACE_EVENT0("ep-engine/task", "BackFillTask");
     engine->getEpStore()->visit(bfv, "Backfill task", NONIO_TASK_IDX,
-                                Priority::BackfillTaskPriority, 1);
+                                TaskId::BackfillVisitorTask, 1);
     return false;
 }

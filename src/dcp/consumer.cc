@@ -1,6 +1,6 @@
 /* -*- Mode: C++; tab-width: 4; c-basic-offset: 4; indent-tabs-mode: nil -*- */
 /*
- *     Copyright 2013 Couchbase, Inc
+ *     Copyright 2015 Couchbase, Inc
  *
  *   Licensed under the Apache License, Version 2.0 (the "License");
  *   you may not use this file except in compliance with the License.
@@ -15,106 +15,160 @@
  *   limitations under the License.
  */
 
-#include "config.h"
+#include "dcp/consumer.h"
 
 #include "ep_engine.h"
 #include "failover-table.h"
-#include "connmap.h"
 #include "replicationthrottle.h"
-#include "dcp/consumer.h"
-#include "dcp/response.h"
+#include "dcp/dcpconnmap.h"
 #include "dcp/stream.h"
+#include "dcp/response.h"
+#include <platform/make_unique.h>
 
-class Processer : public GlobalTask {
+#include <climits>
+#include <phosphor/phosphor.h>
+
+const std::string DcpConsumer::noopCtrlMsg = "enable_noop";
+const std::string DcpConsumer::noopIntervalCtrlMsg = "set_noop_interval";
+const std::string DcpConsumer::connBufferCtrlMsg = "connection_buffer_size";
+const std::string DcpConsumer::priorityCtrlMsg = "set_priority";
+const std::string DcpConsumer::extMetadataCtrlMsg = "enable_ext_metadata";
+const std::string DcpConsumer::valueCompressionCtrlMsg = "enable_value_compression";
+const std::string DcpConsumer::cursorDroppingCtrlMsg = "supports_cursor_dropping";
+
+class Processor : public GlobalTask {
 public:
-    Processer(EventuallyPersistentEngine* e, connection_t c,
-                const Priority &p, double sleeptime = 1, bool shutdown = false)
-        : GlobalTask(e, p, sleeptime, shutdown), conn(c) {}
+    Processor(EventuallyPersistentEngine* e,
+              connection_t c,
+              double sleeptime = 1,
+              bool completeBeforeShutdown = true)
+        : GlobalTask(e, TaskId::Processor, sleeptime, completeBeforeShutdown),
+          conn(c) {}
 
-    bool run();
+    ~Processor() {
+        DcpConsumer* consumer = static_cast<DcpConsumer*>(conn.get());
+        consumer->taskCancelled();
+    }
 
-    std::string getDescription();
+    bool run() {
+        TRACE_EVENT0("ep-engine/task", "Processor");
+        DcpConsumer* consumer = static_cast<DcpConsumer*>(conn.get());
+        if (consumer->doDisconnect()) {
+            return false;
+        }
+
+        double sleepFor = 0.0;
+        enum process_items_error_t state = consumer->processBufferedItems();
+        switch (state) {
+            case all_processed:
+                sleepFor = INT_MAX;
+                break;
+            case more_to_process:
+                sleepFor = 0.0;
+                break;
+            case cannot_process:
+                sleepFor = 5.0;
+                break;
+        }
+
+        if (consumer->notifiedProcessor(false)) {
+            snooze(0.0);
+            state = more_to_process;
+        } else {
+            snooze(sleepFor);
+            // Check if the processor was notified again,
+            // in which case the task should wake immediately.
+            if (consumer->notifiedProcessor(false)) {
+                snooze(0.0);
+                state = more_to_process;
+            }
+        }
+
+        consumer->setProcessorTaskState(state);
+
+        return true;
+    }
+
+    std::string getDescription() {
+        std::stringstream ss;
+        ss << "Processing buffered items for " << conn->getName();
+        return ss.str();
+    }
 
 private:
     connection_t conn;
 };
 
-bool Processer::run() {
-    DcpConsumer* consumer = static_cast<DcpConsumer*>(conn.get());
-    if (consumer->doDisconnect()) {
-        return false;
-    }
-
-    switch (consumer->processBufferedItems()) {
-        case all_processed:
-            snooze(1);
-            break;
-        case more_to_process:
-            snooze(0);
-            break;
-        case cannot_process:
-            snooze(5);
-            break;
-        default:
-            abort();
-    }
-
-    return true;
-}
-
-std::string Processer::getDescription() {
-    std::stringstream ss;
-    ss << "Processing buffered items for " << conn->getName();
-    return ss.str();
-}
-
 DcpConsumer::DcpConsumer(EventuallyPersistentEngine &engine, const void *cookie,
                          const std::string &name)
-    : Consumer(engine, cookie, name), opaqueCounter(0), processTaskId(0),
-          itemsToProcess(false), lastNoopTime(ep_current_time()), backoffs(0) {
+    : Consumer(engine, cookie, name),
+      lastMessageTime(ep_current_time()),
+      opaqueCounter(0),
+      processorTaskId(0),
+      processorTaskState(all_processed),
+      processorNotification(false),
+      backoffs(0),
+      dcpIdleTimeout(engine.getConfiguration().getDcpIdleTimeout()),
+      dcpNoopTxInterval(engine.getConfiguration().getDcpNoopTxInterval()),
+      taskAlreadyCancelled(false),
+      flowControl(engine, this),
+      processBufferedMessagesYieldThreshold(engine.getConfiguration().
+                                                getDcpConsumerProcessBufferedMessagesYieldLimit()),
+      processBufferedMessagesBatchSize(engine.getConfiguration().
+                                            getDcpConsumerProcessBufferedMessagesBatchSize()) {
     Configuration& config = engine.getConfiguration();
-    streams = new passive_stream_t[config.getMaxVbuckets()];
     setSupportAck(false);
     setLogHeader("DCP (Consumer) " + getName() + " -");
     setReserved(true);
 
-    flowControl.enabled = config.isDcpEnableFlowControl();
-    flowControl.bufferSize = config.getDcpConnBufferSize();
-    flowControl.maxUnackedBytes = config.getDcpMaxUnackedBytes();
+    pendingEnableNoop = config.isDcpEnableNoop();
+    pendingSendNoopInterval = config.isDcpEnableNoop();
+    pendingSetPriority = true;
+    pendingEnableExtMetaData = true;
+    pendingEnableValueCompression = config.isDcpValueCompressionEnabled();
+    pendingSupportCursorDropping = true;
 
-    noopInterval = config.getDcpNoopInterval();
-    enableNoop = config.isDcpEnableNoop();
-    sendNoopInterval = config.isDcpEnableNoop();
-
-    setPriority = true;
-    enableExtMetaData = true;
-
-    ExTask task = new Processer(&engine, this, Priority::PendingOpsPriority, 1);
-    processTaskId = ExecutorPool::get()->schedule(task, NONIO_TASK_IDX);
+    ExTask task = new Processor(&engine, this, 1);
+    processorTaskId = ExecutorPool::get()->schedule(task, NONIO_TASK_IDX);
 }
 
 DcpConsumer::~DcpConsumer() {
-    closeAllStreams();
-    delete[] streams;
+    cancelTask();
+}
+
+
+void DcpConsumer::cancelTask() {
+    bool inverse = false;
+    if (taskAlreadyCancelled.compare_exchange_strong(inverse, true)) {
+        ExecutorPool::get()->cancel(processorTaskId);
+    }
+}
+
+void DcpConsumer::taskCancelled() {
+    bool inverse = false;
+    taskAlreadyCancelled.compare_exchange_strong(inverse, true);
 }
 
 ENGINE_ERROR_CODE DcpConsumer::addStream(uint32_t opaque, uint16_t vbucket,
                                          uint32_t flags) {
-    LockHolder lh(streamMutex);
+    lastMessageTime = ep_current_time();
+    LockHolder lh(readyMutex);
     if (doDisconnect()) {
         return ENGINE_DISCONNECT;
     }
 
     RCPtr<VBucket> vb = engine_.getVBucket(vbucket);
     if (!vb) {
-        LOG(EXTENSION_LOG_WARNING, "%s (vb %d) Add stream failed because this "
-            "vbucket doesn't exist", logHeader(), vbucket);
+        logger.log(EXTENSION_LOG_WARNING,
+            "(vb %d) Add stream failed because this vbucket doesn't exist",
+            vbucket);
         return ENGINE_NOT_MY_VBUCKET;
     }
 
     if (vb->getState() == vbucket_state_active) {
-        LOG(EXTENSION_LOG_WARNING, "%s (vb %d) Add stream failed because this "
-            "vbucket happens to be in active state", logHeader(), vbucket);
+        logger.log(EXTENSION_LOG_WARNING,
+            "(vb %d) Add stream failed because this vbucket happens to be in "
+            "active state", vbucket);
         return ENGINE_NOT_MY_VBUCKET;
     }
 
@@ -130,18 +184,26 @@ ENGINE_ERROR_CODE DcpConsumer::addStream(uint32_t opaque, uint16_t vbucket,
     uint64_t vbucket_uuid = entry.vb_uuid;
     uint64_t snap_start_seqno = info.range.start;
     uint64_t snap_end_seqno = info.range.end;
+    uint64_t high_seqno = vb->getHighSeqno();
 
-    passive_stream_t stream = streams[vbucket];
-    if (stream && stream->isActive()) {
-        LOG(EXTENSION_LOG_WARNING, "%s (vb %d) Cannot add stream because one "
-            "already exists", logHeader(), vbucket);
-        return ENGINE_KEY_EEXISTS;
+    auto stream = findStream(vbucket);
+    if (stream) {
+        if(stream->isActive()) {
+            LOG(EXTENSION_LOG_WARNING, "%s (vb %d) Cannot add stream because "
+                "one already exists", logHeader(), vbucket);
+            return ENGINE_KEY_EEXISTS;
+        } else {
+            streams.erase(vbucket);
+        }
     }
 
-    streams[vbucket] = new PassiveStream(&engine_, this, getName(), flags,
-                                         new_opaque, vbucket, start_seqno,
-                                         end_seqno, vbucket_uuid,
-                                         snap_start_seqno, snap_end_seqno);
+    streams.insert({vbucket,
+                    SingleThreadedRCPtr<PassiveStream>(
+                           new PassiveStream(&engine_, this, getName(), flags,
+                                             new_opaque, vbucket, start_seqno,
+                                             end_seqno, vbucket_uuid,
+                                             snap_start_seqno, snap_end_seqno,
+                                             high_seqno))});
     ready.push_back(vbucket);
     opaqueMap_[new_opaque] = std::make_pair(opaque, vbucket);
 
@@ -149,8 +211,9 @@ ENGINE_ERROR_CODE DcpConsumer::addStream(uint32_t opaque, uint16_t vbucket,
 }
 
 ENGINE_ERROR_CODE DcpConsumer::closeStream(uint32_t opaque, uint16_t vbucket) {
-    LockHolder lh(streamMutex);
+    lastMessageTime = ep_current_time();
     if (doDisconnect()) {
+        streams.erase(vbucket);
         return ENGINE_DISCONNECT;
     }
 
@@ -159,7 +222,7 @@ ENGINE_ERROR_CODE DcpConsumer::closeStream(uint32_t opaque, uint16_t vbucket) {
         opaqueMap_.erase(oitr);
     }
 
-    passive_stream_t stream = streams[vbucket];
+    auto stream = findStream(vbucket);
     if (!stream) {
         LOG(EXTENSION_LOG_WARNING, "%s (vb %d) Cannot close stream because no "
             "stream exists for this vbucket", logHeader(), vbucket);
@@ -167,29 +230,36 @@ ENGINE_ERROR_CODE DcpConsumer::closeStream(uint32_t opaque, uint16_t vbucket) {
     }
 
     uint32_t bytesCleared = stream->setDead(END_STREAM_CLOSED);
-    flowControl.freedBytes.fetch_add(bytesCleared);
+    flowControl.incrFreedBytes(bytesCleared);
+    streams.erase(vbucket);
+    notifyConsumerIfNecessary(true/*schedule*/);
+
     return ENGINE_SUCCESS;
 }
 
 ENGINE_ERROR_CODE DcpConsumer::streamEnd(uint32_t opaque, uint16_t vbucket,
                                          uint32_t flags) {
+    lastMessageTime = ep_current_time();
     if (doDisconnect()) {
         return ENGINE_DISCONNECT;
     }
 
     ENGINE_ERROR_CODE err = ENGINE_KEY_ENOENT;
-    passive_stream_t stream = streams[vbucket];
+    auto stream = findStream(vbucket);
     if (stream && stream->getOpaque() == opaque && stream->isActive()) {
         LOG(EXTENSION_LOG_INFO, "%s (vb %d) End stream received with reason %d",
             logHeader(), vbucket, flags);
-        StreamEndResponse* response = new StreamEndResponse(opaque, flags,
-                                                            vbucket);
-        err = stream->messageReceived(response);
 
-        bool disable = false;
-        if (err == ENGINE_TMPFAIL &&
-            itemsToProcess.compare_exchange_strong(disable, true)) {
-            ExecutorPool::get()->wake(processTaskId);
+        try {
+            err = stream->messageReceived(make_unique<StreamEndResponse>(opaque,
+                                                                         flags,
+                                                                         vbucket));
+        } catch (const std::bad_alloc&) {
+            return ENGINE_ENOMEM;
+        }
+
+        if (err == ENGINE_TMPFAIL) {
+            notifyVbucketReady(vbucket);
         }
     }
 
@@ -203,7 +273,9 @@ ENGINE_ERROR_CODE DcpConsumer::streamEnd(uint32_t opaque, uint16_t vbucket,
             "%d but does not exist", logHeader(), vbucket, opaque);
     }
 
-    flowControl.freedBytes.fetch_add(StreamEndResponse::baseMsgBytes);
+    flowControl.incrFreedBytes(StreamEndResponse::baseMsgBytes);
+    notifyConsumerIfNecessary(true/*schedule*/);
+
     return err;
 }
 
@@ -215,16 +287,23 @@ ENGINE_ERROR_CODE DcpConsumer::mutation(uint32_t opaque, const void* key,
                                         uint64_t bySeqno, uint64_t revSeqno,
                                         uint32_t exptime, uint8_t nru,
                                         const void* meta, uint16_t nmeta) {
+    lastMessageTime = ep_current_time();
     if (doDisconnect()) {
         return ENGINE_DISCONNECT;
     }
 
+    if (bySeqno == 0) {
+        LOG(EXTENSION_LOG_WARNING, "%s (vb %d) Invalid sequence number(0) "
+            "for mutation!", logHeader(), vbucket);
+        return ENGINE_EINVAL;
+    }
+
     ENGINE_ERROR_CODE err = ENGINE_KEY_ENOENT;
-    passive_stream_t stream = streams[vbucket];
+    auto stream = findStream(vbucket);
     if (stream && stream->getOpaque() == opaque && stream->isActive()) {
-        Item *item = new Item(key, nkey, flags, exptime, value, nvalue,
-                              &datatype, EXT_META_LEN, cas, bySeqno,
-                              vbucket, revSeqno);
+        queued_item item(new Item(key, nkey, flags, exptime, value, nvalue,
+                                  &datatype, EXT_META_LEN, cas, bySeqno,
+                                  vbucket, revSeqno));
 
         ExtendedMetaData *emd = NULL;
         if (nmeta > 0) {
@@ -239,14 +318,18 @@ ENGINE_ERROR_CODE DcpConsumer::mutation(uint32_t opaque, const void* key,
             }
         }
 
-        MutationResponse* response = new MutationResponse(item, opaque,
-                                                          emd);
-        err = stream->messageReceived(response);
+        try {
+            err = stream->messageReceived(make_unique<MutationResponse>(item,
+                                                                        opaque,
+                                                                        emd));
+        } catch (const std::bad_alloc&) {
+            delete emd;
+            return ENGINE_ENOMEM;
+        }
 
-        bool disable = false;
-        if (err == ENGINE_TMPFAIL &&
-            itemsToProcess.compare_exchange_strong(disable, true)) {
-            ExecutorPool::get()->wake(processTaskId);
+
+        if (err == ENGINE_TMPFAIL) {
+            notifyVbucketReady(vbucket);
         }
     }
 
@@ -257,7 +340,8 @@ ENGINE_ERROR_CODE DcpConsumer::mutation(uint32_t opaque, const void* key,
 
     uint32_t bytes =
         MutationResponse::mutationBaseMsgBytes + nkey + nmeta + nvalue;
-    flowControl.freedBytes.fetch_add(bytes);
+    flowControl.incrFreedBytes(bytes);
+    notifyConsumerIfNecessary(true/*schedule*/);
 
     return err;
 }
@@ -267,15 +351,22 @@ ENGINE_ERROR_CODE DcpConsumer::deletion(uint32_t opaque, const void* key,
                                         uint16_t vbucket, uint64_t bySeqno,
                                         uint64_t revSeqno, const void* meta,
                                         uint16_t nmeta) {
+    lastMessageTime = ep_current_time();
     if (doDisconnect()) {
         return ENGINE_DISCONNECT;
     }
 
+    if (bySeqno == 0) {
+        LOG(EXTENSION_LOG_WARNING, "%s (vb %d) Invalid sequence number(0)"
+            "for deletion!", logHeader(), vbucket);
+        return ENGINE_EINVAL;
+    }
+
     ENGINE_ERROR_CODE err = ENGINE_KEY_ENOENT;
-    passive_stream_t stream = streams[vbucket];
+    auto stream = findStream(vbucket);
     if (stream && stream->getOpaque() == opaque && stream->isActive()) {
-        Item* item = new Item(key, nkey, 0, 0, NULL, 0, NULL, 0, cas, bySeqno,
-                              vbucket, revSeqno);
+        queued_item item(new Item(key, nkey, 0, 0, NULL, 0, NULL, 0, cas, bySeqno,
+                                  vbucket, revSeqno));
         item->setDeleted();
 
         ExtendedMetaData *emd = NULL;
@@ -291,14 +382,17 @@ ENGINE_ERROR_CODE DcpConsumer::deletion(uint32_t opaque, const void* key,
             }
         }
 
-        MutationResponse* response = new MutationResponse(item, opaque,
-                                                          emd);
-        err = stream->messageReceived(response);
+        try {
+            err = stream->messageReceived(make_unique<MutationResponse>(item,
+                                                                        opaque,
+                                                                        emd));
+        } catch (const std::bad_alloc&) {
+            delete emd;
+            return ENGINE_ENOMEM;
+        }
 
-        bool disable = false;
-        if (err == ENGINE_TMPFAIL &&
-            itemsToProcess.compare_exchange_strong(disable, true)) {
-            ExecutorPool::get()->wake(processTaskId);
+        if (err == ENGINE_TMPFAIL) {
+            notifyVbucketReady(vbucket);
         }
     }
 
@@ -308,7 +402,8 @@ ENGINE_ERROR_CODE DcpConsumer::deletion(uint32_t opaque, const void* key,
     }
 
     uint32_t bytes = MutationResponse::deletionBaseMsgBytes + nkey + nmeta;
-    flowControl.freedBytes.fetch_add(bytes);
+    flowControl.incrFreedBytes(bytes);
+    notifyConsumerIfNecessary(true/*schedule*/);
 
     return err;
 }
@@ -318,6 +413,7 @@ ENGINE_ERROR_CODE DcpConsumer::expiration(uint32_t opaque, const void* key,
                                           uint16_t vbucket, uint64_t bySeqno,
                                           uint64_t revSeqno, const void* meta,
                                           uint16_t nmeta) {
+    // lastMessageTime is set in deletion function
     return deletion(opaque, key, nkey, cas, vbucket, bySeqno, revSeqno, meta,
                     nmeta);
 }
@@ -327,22 +423,35 @@ ENGINE_ERROR_CODE DcpConsumer::snapshotMarker(uint32_t opaque,
                                               uint64_t start_seqno,
                                               uint64_t end_seqno,
                                               uint32_t flags) {
+    lastMessageTime = ep_current_time();
     if (doDisconnect()) {
         return ENGINE_DISCONNECT;
     }
 
-    ENGINE_ERROR_CODE err = ENGINE_KEY_ENOENT;
-    passive_stream_t stream = streams[vbucket];
-    if (stream && stream->getOpaque() == opaque && stream->isActive()) {
-        SnapshotMarker* response = new SnapshotMarker(opaque, vbucket,
-                                                      start_seqno, end_seqno,
-                                                      flags);
-        err = stream->messageReceived(response);
+    if (start_seqno > end_seqno) {
+        LOG(EXTENSION_LOG_WARNING, "%s (vb %d) Invalid snapshot marker "
+            "received, snap_start (%" PRIu64 ") <= snap_end (%" PRIu64 ")",
+            logHeader(), vbucket, start_seqno, end_seqno);
+        return ENGINE_EINVAL;
+    }
 
-        bool disable = false;
-        if (err == ENGINE_TMPFAIL &&
-            itemsToProcess.compare_exchange_strong(disable, true)) {
-            ExecutorPool::get()->wake(processTaskId);
+    ENGINE_ERROR_CODE err = ENGINE_KEY_ENOENT;
+    auto stream = findStream(vbucket);
+    if (stream && stream->getOpaque() == opaque && stream->isActive()) {
+        try {
+            err = stream->messageReceived(make_unique<SnapshotMarker>(opaque,
+                                                                      vbucket,
+                                                                      start_seqno,
+                                                                      end_seqno,
+                                                                      flags));
+
+        } catch (const std::bad_alloc&) {
+            return ENGINE_ENOMEM;
+        }
+
+
+        if (err == ENGINE_TMPFAIL) {
+            notifyVbucketReady(vbucket);
         }
     }
 
@@ -351,17 +460,19 @@ ENGINE_ERROR_CODE DcpConsumer::snapshotMarker(uint32_t opaque,
         return ENGINE_SUCCESS;
     }
 
-    flowControl.freedBytes.fetch_add(SnapshotMarker::baseMsgBytes);
+    flowControl.incrFreedBytes(SnapshotMarker::baseMsgBytes);
+    notifyConsumerIfNecessary(true/*schedule*/);
 
     return err;
 }
 
 ENGINE_ERROR_CODE DcpConsumer::noop(uint32_t opaque) {
-    lastNoopTime = ep_current_time();
+    lastMessageTime = ep_current_time();
     return ENGINE_SUCCESS;
 }
 
 ENGINE_ERROR_CODE DcpConsumer::flush(uint32_t opaque, uint16_t vbucket) {
+    lastMessageTime = ep_current_time();
     if (doDisconnect()) {
         return ENGINE_DISCONNECT;
     }
@@ -372,20 +483,24 @@ ENGINE_ERROR_CODE DcpConsumer::flush(uint32_t opaque, uint16_t vbucket) {
 ENGINE_ERROR_CODE DcpConsumer::setVBucketState(uint32_t opaque,
                                                uint16_t vbucket,
                                                vbucket_state_t state) {
+    lastMessageTime = ep_current_time();
     if (doDisconnect()) {
         return ENGINE_DISCONNECT;
     }
 
     ENGINE_ERROR_CODE err = ENGINE_KEY_ENOENT;
-    passive_stream_t stream = streams[vbucket];
+    auto stream = findStream(vbucket);
     if (stream && stream->getOpaque() == opaque && stream->isActive()) {
-        SetVBucketState* response = new SetVBucketState(opaque, vbucket, state);
-        err = stream->messageReceived(response);
+        try {
+            err = stream->messageReceived(make_unique<SetVBucketState>(opaque,
+                                                                       vbucket,
+                                                                       state));
+        } catch (const std::bad_alloc&) {
+            return ENGINE_ENOMEM;
+        }
 
-        bool disable = false;
-        if (err == ENGINE_TMPFAIL &&
-            itemsToProcess.compare_exchange_strong(disable, true)) {
-            ExecutorPool::get()->wake(processTaskId);
+        if (err == ENGINE_TMPFAIL) {
+            notifyVbucketReady(vbucket);
         }
     }
 
@@ -394,7 +509,8 @@ ENGINE_ERROR_CODE DcpConsumer::setVBucketState(uint32_t opaque,
         return ENGINE_SUCCESS;
     }
 
-    flowControl.freedBytes.fetch_add(SetVBucketState::baseMsgBytes);
+    flowControl.incrFreedBytes(SetVBucketState::baseMsgBytes);
+    notifyConsumerIfNecessary(true/*schedule*/);
 
     return err;
 }
@@ -407,7 +523,7 @@ ENGINE_ERROR_CODE DcpConsumer::step(struct dcp_message_producers* producers) {
     }
 
     ENGINE_ERROR_CODE ret;
-    if ((ret = handleFlowCtl(producers)) != ENGINE_FAILED) {
+    if ((ret = flowControl.handleFlowCtl(producers)) != ENGINE_FAILED) {
         if (ret == ENGINE_SUCCESS) {
             ret = ENGINE_WANT_MORE;
         }
@@ -435,12 +551,25 @@ ENGINE_ERROR_CODE DcpConsumer::step(struct dcp_message_producers* producers) {
         return ret;
     }
 
+    if ((ret = handleValueCompression(producers)) != ENGINE_FAILED) {
+        if (ret == ENGINE_SUCCESS) {
+            ret = ENGINE_WANT_MORE;
+        }
+        return ret;
+    }
+
+    if ((ret = supportCursorDropping(producers)) != ENGINE_FAILED) {
+        if (ret == ENGINE_SUCCESS) {
+            ret = ENGINE_WANT_MORE;
+        }
+        return ret;
+    }
+
     DcpResponse *resp = getNextItem();
     if (resp == NULL) {
         return ENGINE_SUCCESS;
     }
 
-    ret = ENGINE_SUCCESS;
     EventuallyPersistentEngine *epe = ObjectRegistry::onSwitchThread(NULL, true);
     switch (resp->getEvent()) {
         case DCP_ADD_STREAM:
@@ -493,6 +622,10 @@ ENGINE_ERROR_CODE DcpConsumer::step(struct dcp_message_producers* producers) {
 }
 
 bool RollbackTask::run() {
+    TRACE_EVENT0("ep-engine/task", "RollbackTask");
+    if (cons->doDisconnect()) {
+        return false;
+    }
     if (cons->doRollback(opaque, vbid, rollbackSeqno)) {
         return true;
     }
@@ -517,8 +650,9 @@ ENGINE_ERROR_CODE DcpConsumer::handleResponse(
     }
 
     if (!validOpaque) {
-        LOG(EXTENSION_LOG_WARNING, "%s Received response with opaque %ld and "
-            "that stream no longer exists", logHeader());
+        logger.log(EXTENSION_LOG_WARNING,
+            "Received response with opaque %" PRIu32 " and that stream no "
+                    "longer exists", opaque);
         return ENGINE_KEY_ENOENT;
     }
 
@@ -532,25 +666,29 @@ ENGINE_ERROR_CODE DcpConsumer::handleResponse(
         uint8_t* body = pkt->bytes + sizeof(protocol_binary_response_header);
 
         if (status == PROTOCOL_BINARY_RESPONSE_ROLLBACK) {
-            cb_assert(bodylen == sizeof(uint64_t));
+            if (bodylen != sizeof(uint64_t)) {
+                LOG(EXTENSION_LOG_WARNING, "%s (vb %d) Received rollback "
+                    "request with incorrect bodylen of %" PRIu64 ", disconnecting",
+                    logHeader(), vbid, bodylen);
+                return ENGINE_DISCONNECT;
+            }
             uint64_t rollbackSeqno = 0;
             memcpy(&rollbackSeqno, body, sizeof(uint64_t));
             rollbackSeqno = ntohll(rollbackSeqno);
 
-            LOG(EXTENSION_LOG_WARNING, "%s (vb %d) Received rollback request "
-                "to rollback seq no. %llu", logHeader(), vbid, rollbackSeqno);
+            LOG(EXTENSION_LOG_NOTICE, "%s (vb %d) Received rollback request "
+                "to rollback seq no. %" PRIu64, logHeader(), vbid, rollbackSeqno);
 
             ExTask task = new RollbackTask(&engine_, opaque, vbid,
-                                           rollbackSeqno, this,
-                                           Priority::TapBgFetcherPriority);
+                                           rollbackSeqno, this);
             ExecutorPool::get()->schedule(task, WRITER_TASK_IDX);
             return ENGINE_SUCCESS;
         }
 
         if (((bodylen % 16) != 0 || bodylen == 0) && status == ENGINE_SUCCESS) {
             LOG(EXTENSION_LOG_WARNING, "%s (vb %d)Got a stream response with a "
-                "bad failover log (length %llu), disconnecting", logHeader(),
-                vbid, bodylen);
+                "bad failover log (length %" PRIu64 "), disconnecting",
+                logHeader(), vbid, bodylen);
             return ENGINE_DISCONNECT;
         }
 
@@ -571,19 +709,29 @@ bool DcpConsumer::doRollback(uint32_t opaque, uint16_t vbid,
                              uint64_t rollbackSeqno) {
     ENGINE_ERROR_CODE err = engine_.getEpStore()->rollback(vbid, rollbackSeqno);
 
-    if (err == ENGINE_NOT_MY_VBUCKET) {
+    switch (err) {
+    case ENGINE_NOT_MY_VBUCKET:
         LOG(EXTENSION_LOG_WARNING, "%s (vb %d) Rollback failed because the "
                 "vbucket was not found", logHeader(), vbid);
         return false;
-    } else if (err == ENGINE_TMPFAIL) {
+
+    case ENGINE_TMPFAIL:
         return true; // Reschedule the rollback.
+
+    case ENGINE_SUCCESS:
+        // expected
+        break;
+
+    default:
+        throw std::logic_error("DcpConsumer::doRollback: Unexpected error "
+                "code from EpStore::rollback: " + std::to_string(err));
     }
 
-    cb_assert(err == ENGINE_SUCCESS);
-
-    LockHolder lh(streamMutex);
     RCPtr<VBucket> vb = engine_.getVBucket(vbid);
-    streams[vbid]->reconnectStream(vb, opaque, vb->getHighSeqno());
+    auto stream = findStream(vbid);
+    if (stream) {
+        stream->reconnectStream(vb, opaque, vb->getHighSeqno());
+    }
 
     return false;
 }
@@ -591,66 +739,135 @@ bool DcpConsumer::doRollback(uint32_t opaque, uint16_t vbid,
 void DcpConsumer::addStats(ADD_STAT add_stat, const void *c) {
     ConnHandler::addStats(add_stat, c);
 
-    int max_vbuckets = engine_.getConfiguration().getMaxVbuckets();
-    for (int vbucket = 0; vbucket < max_vbuckets; vbucket++) {
-        passive_stream_t stream = streams[vbucket];
-        if (stream) {
-            stream->addStats(add_stat, c);
+    // Make a copy of all valid streams (under lock), and then call addStats
+    // for each one. (Done in two stages to minmise how long we have the
+    // streams map locked for).
+    std::vector<PassiveStreamMap::mapped_type> valid_streams;
+
+    streams.for_each(
+        [&valid_streams](const PassiveStreamMap::value_type& element) {
+            valid_streams.push_back(element.second);
         }
+    );
+    for (const auto& stream : valid_streams) {
+        stream->addStats(add_stat, c);
     }
 
     addStat("total_backoffs", backoffs, add_stat, c);
-    if (flowControl.enabled) {
-        addStat("total_acked_bytes", flowControl.ackedBytes, add_stat, c);
-    }
+    addStat("processor_task_state", getProcessorTaskStatusStr(), add_stat, c);
+    flowControl.addStats(add_stat, c);
 }
 
-void DcpConsumer::aggregateQueueStats(ConnCounter* aggregator) {
-    aggregator->conn_queueBackoff += backoffs;
+void DcpConsumer::aggregateQueueStats(ConnCounter& aggregator) {
+    aggregator.conn_queueBackoff += backoffs;
+}
+
+
+process_items_error_t DcpConsumer::drainStreamsBufferedItems(SingleThreadedRCPtr<PassiveStream>& stream,
+                                                             size_t yieldThreshold) {
+    process_items_error_t rval = all_processed;
+    uint32_t bytesProcessed = 0;
+    size_t iterations = 0;
+    do {
+        if (!engine_.getReplicationThrottle().shouldProcess()) {
+            backoffs++;
+            vbReady.pushUnique(stream->getVBucket());
+            return cannot_process;
+        }
+
+        bytesProcessed = 0;
+        rval = stream->processBufferedMessages(bytesProcessed,
+                                               processBufferedMessagesBatchSize);
+        flowControl.incrFreedBytes(bytesProcessed);
+
+        // Notifying memcached on clearing items for flow control
+        notifyConsumerIfNecessary(false/*schedule*/);
+
+        iterations++;
+    } while (bytesProcessed > 0 &&
+             rval == all_processed &&
+             iterations <= yieldThreshold);
+
+    // The stream may not be done yet so must go back in the ready queue
+    if (bytesProcessed > 0) {
+        vbReady.pushUnique(stream->getVBucket());
+        rval = more_to_process; // Return more_to_process to force a snooze(0.0)
+    }
+
+    return rval;
 }
 
 process_items_error_t DcpConsumer::processBufferedItems() {
-    itemsToProcess.store(false);
     process_items_error_t process_ret = all_processed;
+    uint16_t vbucket = 0;
+    while (vbReady.popFront(vbucket)) {
+        auto stream = findStream(vbucket);
 
-    int max_vbuckets = engine_.getConfiguration().getMaxVbuckets();
-    for (int vbucket = 0; vbucket < max_vbuckets; vbucket++) {
-
-        passive_stream_t stream = streams[vbucket];
         if (!stream) {
             continue;
         }
 
-        uint32_t bytes_processed;
+        process_ret = drainStreamsBufferedItems(stream,
+                                                processBufferedMessagesYieldThreshold);
 
-        do {
-            if (!engine_.getReplicationThrottle().shouldProcess()) {
-                backoffs++;
-                return cannot_process;
+        if (process_ret == all_processed) {
+            return more_to_process;
+        }
+
+        if (process_ret == cannot_process) {
+            // If items for current vbucket weren't processed,
+            // re-add current vbucket
+            if (vbReady.size() > 0) {
+                // If there are more vbuckets in queue, sleep(0).
+                process_ret = more_to_process;
             }
+            vbReady.pushUnique(vbucket);
+        }
 
-            bytes_processed = 0;
-            process_ret = stream->processBufferedMessages(bytes_processed);
-            flowControl.freedBytes.fetch_add(bytes_processed);
-        } while (bytes_processed > 0 && process_ret != cannot_process);
-    }
-
-    if (process_ret == all_processed && itemsToProcess.load()) {
-        return more_to_process;
+        return process_ret;
     }
 
     return process_ret;
 }
 
+void DcpConsumer::notifyVbucketReady(uint16_t vbucket) {
+    if (vbReady.pushUnique(vbucket) &&
+        notifiedProcessor(true)) {
+        ExecutorPool::get()->wake(processorTaskId);
+    }
+}
+
+bool DcpConsumer::notifiedProcessor(bool to) {
+    bool inverse = !to;
+    return processorNotification.compare_exchange_strong(inverse, to);
+}
+
+void DcpConsumer::setProcessorTaskState(enum process_items_error_t to) {
+    processorTaskState = to;
+}
+
+std::string DcpConsumer::getProcessorTaskStatusStr() {
+    switch (processorTaskState.load()) {
+        case all_processed:
+            return "ALL_PROCESSED";
+        case more_to_process:
+            return "MORE_TO_PROCESS";
+        case cannot_process:
+            return "CANNOT_PROCESS";
+    }
+
+    return "UNKNOWN";
+}
+
 DcpResponse* DcpConsumer::getNextItem() {
-    LockHolder lh(streamMutex);
+    LockHolder lh(readyMutex);
 
     setPaused(false);
     while (!ready.empty()) {
         uint16_t vbucket = ready.front();
         ready.pop_front();
 
-        passive_stream_t stream = streams[vbucket];
+        auto stream = findStream(vbucket);
         if (!stream) {
             continue;
         }
@@ -666,9 +883,10 @@ DcpResponse* DcpConsumer::getNextItem() {
             case DCP_SNAPSHOT_MARKER:
                 break;
             default:
-                LOG(EXTENSION_LOG_WARNING, "%s Consumer is attempting to write"
-                    " an unexpected event %d", logHeader(), op->getEvent());
-                abort();
+                throw std::logic_error(
+                        std::string("DcpConsumer::getNextItem: ") + logHeader() +
+                        " is attempting to write an unexpected event: " +
+                        std::to_string(op->getEvent()));
         }
 
         ready.push_back(vbucket);
@@ -680,6 +898,7 @@ DcpResponse* DcpConsumer::getNextItem() {
 }
 
 void DcpConsumer::notifyStreamReady(uint16_t vbucket) {
+    LockHolder lh(readyMutex);
     std::list<uint16_t>::iterator iter =
         std::find(ready.begin(), ready.end(), vbucket);
     if (iter != ready.end()) {
@@ -687,147 +906,127 @@ void DcpConsumer::notifyStreamReady(uint16_t vbucket) {
     }
 
     ready.push_back(vbucket);
+    lh.unlock();
 
     engine_.getDcpConnMap().notifyPausedConnection(this, true);
 }
 
 void DcpConsumer::streamAccepted(uint32_t opaque, uint16_t status, uint8_t* body,
                                  uint32_t bodylen) {
-    LockHolder lh(streamMutex);
 
     opaque_map::iterator oitr = opaqueMap_.find(opaque);
     if (oitr != opaqueMap_.end()) {
         uint32_t add_opaque = oitr->second.first;
         uint16_t vbucket = oitr->second.second;
 
-        passive_stream_t stream = streams[vbucket];
+        auto stream = findStream(vbucket);
         if (stream && stream->getOpaque() == opaque &&
             stream->getState() == STREAM_PENDING) {
             if (status == ENGINE_SUCCESS) {
                 RCPtr<VBucket> vb = engine_.getVBucket(vbucket);
                 vb->failovers->replaceFailoverLog(body, bodylen);
                 EventuallyPersistentStore* st = engine_.getEpStore();
-                st->scheduleVBSnapshot(Priority::VBucketPersistHighPriority,
-                                st->getVBuckets().getShard(vbucket)->getId());
+                st->scheduleVBSnapshot(VBSnapshotTask::Priority::HIGH,
+                                st->getVBuckets().getShardByVbId(vbucket)->getId());
             }
-            LOG(EXTENSION_LOG_INFO, "%s (vb %d) Add stream for opaque %ld"
+            LOG(EXTENSION_LOG_INFO, "%s (vb %d) Add stream for opaque %" PRIu32
                 " %s with error code %d", logHeader(), vbucket, opaque,
                 status == ENGINE_SUCCESS ? "succeeded" : "failed", status);
             stream->acceptStream(status, add_opaque);
         } else {
             LOG(EXTENSION_LOG_WARNING, "%s (vb %d) Trying to add stream, but "
-                "none exists (opaque: %d, add_opaque: %d)", logHeader(),
-                vbucket, opaque, add_opaque);
+                "none exists (opaque: %" PRIu32 ", add_opaque: %" PRIu32 ")",
+                logHeader(), vbucket, opaque, add_opaque);
         }
         opaqueMap_.erase(opaque);
     } else {
         LOG(EXTENSION_LOG_WARNING, "%s No opaque found for add stream response "
-            "with opaque %ld", logHeader(), opaque);
+            "with opaque %" PRIu32, logHeader(), opaque);
     }
 }
 
 bool DcpConsumer::isValidOpaque(uint32_t opaque, uint16_t vbucket) {
-    LockHolder lh(streamMutex);
-    passive_stream_t stream = streams[vbucket];
+    auto stream = findStream(vbucket);
     return stream && stream->getOpaque() == opaque;
 }
 
 void DcpConsumer::closeAllStreams() {
-    int max_vbuckets = engine_.getConfiguration().getMaxVbuckets();
-    for (int vbucket = 0; vbucket < max_vbuckets; vbucket++) {
-        passive_stream_t stream = streams[vbucket];
-        if (stream) {
-            stream->setDead(END_STREAM_DISCONNECTED);
-        }
+
+    // Need to synchronise the disconnect and clear, therefore use
+    // external locking here.
+    std::lock_guard<PassiveStreamMap> guard(streams);
+
+    streams.for_each(
+        [](PassiveStreamMap::value_type& iter) {
+            iter.second->setDead(END_STREAM_DISCONNECTED);
+        },
+        guard);
+    streams.clear(guard);
+}
+
+void DcpConsumer::vbucketStateChanged(uint16_t vbucket, vbucket_state_t state) {
+    auto it = streams.erase(vbucket);
+    if (it.second) {
+        LOG(EXTENSION_LOG_INFO, "%s (vb %" PRIu16 ") State changed to "
+            "%s, closing passive stream!",
+            logHeader(), vbucket, VBucket::toString(state));
+        auto& stream = it.first;
+        uint32_t bytesCleared = stream->setDead(END_STREAM_STATE);
+        flowControl.incrFreedBytes(bytesCleared);
+        notifyConsumerIfNecessary(true/*schedule*/);
     }
 }
 
 ENGINE_ERROR_CODE DcpConsumer::handleNoop(struct dcp_message_producers* producers) {
-    if (enableNoop) {
+    if (pendingEnableNoop) {
         ENGINE_ERROR_CODE ret;
         uint32_t opaque = ++opaqueCounter;
+        std::string val("true");
         EventuallyPersistentEngine *epe = ObjectRegistry::onSwitchThread(NULL, true);
-        ret = producers->control(getCookie(), opaque, "enable_noop", 11,
-                                 "true", 4);
+        ret = producers->control(getCookie(), opaque,
+                                 noopCtrlMsg.c_str(), noopCtrlMsg.size(),
+                                 val.c_str(), val.size());
         ObjectRegistry::onSwitchThread(epe);
-        enableNoop = false;
+        pendingEnableNoop = false;
         return ret;
     }
 
-    if (sendNoopInterval) {
+    if (pendingSendNoopInterval) {
         ENGINE_ERROR_CODE ret;
         uint32_t opaque = ++opaqueCounter;
-        char buf_size[10];
-        snprintf(buf_size, 10, "%u", noopInterval);
+        std::string interval = std::to_string(dcpNoopTxInterval.count());
         EventuallyPersistentEngine *epe = ObjectRegistry::onSwitchThread(NULL, true);
-        ret = producers->control(getCookie(), opaque, "set_noop_interval", 17,
-                                 buf_size, strlen(buf_size));
+        ret = producers->control(getCookie(), opaque,
+                                 noopIntervalCtrlMsg.c_str(),
+                                 noopIntervalCtrlMsg.size(),
+                                 interval.c_str(), interval.size());
         ObjectRegistry::onSwitchThread(epe);
-        sendNoopInterval = false;
+        pendingSendNoopInterval = false;
         return ret;
     }
 
-    if ((ep_current_time() - lastNoopTime) > (noopInterval * 2)) {
-        LOG(EXTENSION_LOG_WARNING, "%s Disconnecting because noop message has "
-            "not been received for %u seconds", logHeader(), (noopInterval * 2));
+    if ((ep_current_time() - lastMessageTime) > dcpIdleTimeout.count()) {
+        LOG(EXTENSION_LOG_NOTICE, "%s Disconnecting because a message has not been "
+            "received for %" PRIu64 " seconds. lastMessageTime was %u seconds ago.",
+            logHeader(), uint64_t(dcpIdleTimeout.count()),
+            (ep_current_time() - lastMessageTime));
         return ENGINE_DISCONNECT;
     }
 
     return ENGINE_FAILED;
 }
 
-ENGINE_ERROR_CODE DcpConsumer::handleFlowCtl(struct dcp_message_producers* producers) {
-    if (flowControl.enabled) {
-        ENGINE_ERROR_CODE ret;
-        uint32_t ackable_bytes = flowControl.freedBytes;
-        if (flowControl.pendingControl) {
-            uint32_t opaque = ++opaqueCounter;
-            char buf_size[10];
-            snprintf(buf_size, 10, "%u", flowControl.bufferSize);
-            EventuallyPersistentEngine *epe = ObjectRegistry::onSwitchThread(NULL, true);
-            ret = producers->control(getCookie(), opaque,
-                                     "connection_buffer_size", 22, buf_size,
-                                     strlen(buf_size));
-            ObjectRegistry::onSwitchThread(epe);
-            flowControl.pendingControl = false;
-            return (ret == ENGINE_SUCCESS) ? ENGINE_WANT_MORE : ret;
-        } else if (ackable_bytes > (flowControl.bufferSize * .2)) {
-            // Send a buffer ack when at least 20% of the buffer is drained
-            uint32_t opaque = ++opaqueCounter;
-            EventuallyPersistentEngine *epe = ObjectRegistry::onSwitchThread(NULL, true);
-            ret = producers->buffer_acknowledgement(getCookie(), opaque, 0,
-                                                    ackable_bytes);
-            ObjectRegistry::onSwitchThread(epe);
-            flowControl.lastBufferAck = ep_current_time();
-            flowControl.ackedBytes.fetch_add(ackable_bytes);
-            flowControl.freedBytes.fetch_sub(ackable_bytes);
-            return (ret == ENGINE_SUCCESS) ? ENGINE_WANT_MORE : ret;
-        } else if (ackable_bytes > 0 &&
-                   (ep_current_time() - flowControl.lastBufferAck) > 5) {
-            // Ack at least every 5 seconds
-            uint32_t opaque = ++opaqueCounter;
-            EventuallyPersistentEngine *epe = ObjectRegistry::onSwitchThread(NULL, true);
-            ret = producers->buffer_acknowledgement(getCookie(), opaque, 0,
-                                                    ackable_bytes);
-            ObjectRegistry::onSwitchThread(epe);
-            flowControl.lastBufferAck = ep_current_time();
-            flowControl.ackedBytes.fetch_add(ackable_bytes);
-            flowControl.freedBytes.fetch_sub(ackable_bytes);
-            return (ret == ENGINE_SUCCESS) ? ENGINE_WANT_MORE : ret;
-        }
-    }
-    return ENGINE_FAILED;
-}
-
 ENGINE_ERROR_CODE DcpConsumer::handlePriority(struct dcp_message_producers* producers) {
-    if (setPriority) {
+    if (pendingSetPriority) {
         ENGINE_ERROR_CODE ret;
         uint32_t opaque = ++opaqueCounter;
+        std::string val("high");
         EventuallyPersistentEngine *epe = ObjectRegistry::onSwitchThread(NULL, true);
-        ret = producers->control(getCookie(), opaque, "set_priority", 12,
-                                 "high", 4);
+        ret = producers->control(getCookie(), opaque,
+                                 priorityCtrlMsg.c_str(), priorityCtrlMsg.size(),
+                                 val.c_str(), val.size());
         ObjectRegistry::onSwitchThread(epe);
-        setPriority = false;
+        pendingSetPriority = false;
         return ret;
     }
 
@@ -835,16 +1034,102 @@ ENGINE_ERROR_CODE DcpConsumer::handlePriority(struct dcp_message_producers* prod
 }
 
 ENGINE_ERROR_CODE DcpConsumer::handleExtMetaData(struct dcp_message_producers* producers) {
-    if (enableExtMetaData) {
+    if (pendingEnableExtMetaData) {
         ENGINE_ERROR_CODE ret;
         uint32_t opaque = ++opaqueCounter;
+        std::string val("true");
         EventuallyPersistentEngine *epe = ObjectRegistry::onSwitchThread(NULL, true);
-        ret = producers->control(getCookie(), opaque, "enable_ext_metadata", 19,
-                                 "true", 4);
+        ret = producers->control(getCookie(), opaque,
+                                 extMetadataCtrlMsg.c_str(),
+                                 extMetadataCtrlMsg.size(),
+                                 val.c_str(), val.size());
         ObjectRegistry::onSwitchThread(epe);
-        enableExtMetaData = false;
+        pendingEnableExtMetaData = false;
         return ret;
     }
 
     return ENGINE_FAILED;
+}
+
+ENGINE_ERROR_CODE DcpConsumer::handleValueCompression(struct dcp_message_producers* producers) {
+    if (pendingEnableValueCompression) {
+        ENGINE_ERROR_CODE ret;
+        uint32_t opaque = ++opaqueCounter;
+        std::string val("true");
+        EventuallyPersistentEngine *epe = ObjectRegistry::onSwitchThread(NULL, true);
+        ret = producers->control(getCookie(), opaque,
+                                 valueCompressionCtrlMsg.c_str(),
+                                 valueCompressionCtrlMsg.size(),
+                                 val.c_str(), val.size());
+        ObjectRegistry::onSwitchThread(epe);
+        pendingEnableValueCompression = false;
+        return ret;
+    }
+
+    return ENGINE_FAILED;
+}
+
+ENGINE_ERROR_CODE DcpConsumer::supportCursorDropping(struct dcp_message_producers* producers) {
+    if (pendingSupportCursorDropping) {
+        ENGINE_ERROR_CODE ret;
+        uint32_t opaque = ++opaqueCounter;
+        std::string val("true");
+        EventuallyPersistentEngine *epe = ObjectRegistry::onSwitchThread(NULL, true);
+        ret = producers->control(getCookie(), opaque,
+                                 cursorDroppingCtrlMsg.c_str(),
+                                 cursorDroppingCtrlMsg.size(),
+                                 val.c_str(), val.size());
+        ObjectRegistry::onSwitchThread(epe);
+        pendingSupportCursorDropping = false;
+        return ret;
+    }
+
+    return ENGINE_FAILED;
+}
+
+uint64_t DcpConsumer::incrOpaqueCounter()
+{
+    return (++opaqueCounter);
+}
+
+uint32_t DcpConsumer::getFlowControlBufSize()
+{
+    return flowControl.getFlowControlBufSize();
+}
+
+void DcpConsumer::setFlowControlBufSize(uint32_t newSize)
+{
+    flowControl.setFlowControlBufSize(newSize);
+}
+
+const std::string& DcpConsumer::getControlMsgKey(void)
+{
+    return connBufferCtrlMsg;
+}
+
+bool DcpConsumer::isStreamPresent(uint16_t vbucket)
+{
+    auto stream = findStream(vbucket);
+    return stream && stream->isActive();
+}
+
+void DcpConsumer::notifyConsumerIfNecessary(bool schedule) {
+    if (flowControl.isBufferSufficientlyDrained()) {
+        /**
+         * Notify memcached to get flow control buffer ack out.
+         * We cannot wait till the ConnManager daemon task notifies
+         * the memcached as it would cause delay in buffer ack being
+         * sent out to the producer.
+         */
+        engine_.getDcpConnMap().notifyPausedConnection(this, schedule);
+    }
+}
+
+SingleThreadedRCPtr<PassiveStream> DcpConsumer::findStream(uint16_t vbid) {
+    auto it = streams.find(vbid);
+    if (it.second) {
+        return it.first;
+    } else {
+        return SingleThreadedRCPtr<PassiveStream>();
+    }
 }

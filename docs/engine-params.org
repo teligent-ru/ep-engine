@@ -53,6 +53,7 @@ memcached like this:
 | tap_backoff_period             | float  | Number of seconds the tap connection       |
 |                                |        | should back off after receiving ETMPFAIL   |
 | warmup                         | bool   | Whether to load existing data at startup.  |
+| ep_exp_pager_enabled           | bool   | Whether the expiry pager is enabled.       |
 | exp_pager_stime                | int    | Sleep time for the pager that purges       |
 |                                |        | expired objects from memory and disk       |
 | failpartialwarmup              | bool   | If false, continue running after failing   |
@@ -98,6 +99,12 @@ memcached like this:
 | compaction_write_queue_cap     | int    | The maximum size of the disk write queue   |
 |                                |        | after which compaction tasks would snooze, |
 |                                |        | if there are already pending tasks.        |
+| dcp_min_compression_ratio      | float  | Minimum compression ratio for compressed   |
+|                                |        | doc against original doc. If compressed doc|
+|                                |        | is greater than this percentage of the     |
+|                                |        | original doc, then the doc will be shipped |
+|                                |        | as is by the DCP producer if value         |
+|                                |        | compression were enabled by the consumer.  |
 | replication_throttle_queue_cap | int    | The maximum size of the disk write queue   |
 |                                |        | to throttle down tap-based replication. -1 |
 |                                |        | means don't throttle.                      |
@@ -114,6 +121,8 @@ memcached like this:
 | alog_sleep_time                | int    | Interval of access scanner task in (min)   |
 | alog_task_time                 | int    | Hour (0~23) in GMT time at which access    |
 |                                |        | scanner will be scheduled to run.          |
+| alog_resident_ratio_threshold  | int    | Resident ratio percentage above which we   |
+|                                |        | do not generate access log.                |
 | pager_active_vb_pcnt           | int    | Percentage of active vbucket items among   |
 |                                |        | all evicted items by item pager.           |
 | warmup_min_memory_threshold    | int    | Memory threshold (%) during warmup to      |
@@ -124,3 +133,6 @@ memcached like this:
 |                                |        | resolution to use                          |
 | item_eviction_policy           | string | Item eviction policy used by the item      |
 |                                |        | pager (value_only or full_eviction)        |
+| time_synchronization           | string | Time synchronization setting for the bucket|
+|                                |        | (disabled, enabled_without_drift,          |
+|                                |        |  enabled_with_drift)                       |

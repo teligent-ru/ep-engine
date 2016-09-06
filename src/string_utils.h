@@ -1,6 +1,6 @@
 /* -*- Mode: C++; tab-width: 4; c-basic-offset: 4; indent-tabs-mode: nil -*- */
 /*
- *     Copyright 2011 Couchbase, Inc.
+ *     Copyright 2016 Couchbase, Inc
  *
  *   Licensed under the Apache License, Version 2.0 (the "License");
  *   you may not use this file except in compliance with the License.
@@ -14,19 +14,29 @@
  *   See the License for the specific language governing permissions and
  *   limitations under the License.
  */
-#ifndef EP_ENGINE_COMMAND_IDS_H
-#define EP_ENGINE_COMMAND_IDS_H 1
 
-#include <memcached/protocol_binary.h>
+/*
+ * High level, generic string utility functions.
+ */
+
+#pragma once
+
+#include <stdexcept>
+#include <string>
 
 /**
- * Command to get all keys
+ * Converts a string to a boolean if viable, otherwise throws an exception
+ *
+ * Valid strings are 'true' and 'false' (Case-sensitive)
+ *
+ * @param s String to convert
+ * @return Converted string
+ * @throws std::invalid_argument_bool if argument is not true or false
  */
-#define CMD_GET_KEYS 0xb8
+bool cb_stob(const std::string& s);
 
-/**
- * Message format for CMD_GET_KEYS
- */
-typedef protocol_binary_request_no_extras protocol_binary_request_get_keys;
-
-#endif /* EP_ENGINE_COMMAND_IDS_H */
+class invalid_argument_bool : public std::invalid_argument {
+public:
+    invalid_argument_bool(const std::string& msg) : std::invalid_argument(msg) {
+    }
+};

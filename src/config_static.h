@@ -97,7 +97,9 @@
 */
 
 #define sched_yield() SwitchToThread()
+#if _MSC_VER < 1900
 #define snprintf _snprintf
+#endif
 #define sleep(a) Sleep(a * 1000)
 #define random() (long)rand()
 
@@ -115,14 +117,6 @@ typedef unsigned int useconds_t;
 #undef ntohl
 #undef htons
 #undef htonl
-#endif
-
-#if __cplusplus >= 201103L || _MSC_VER >= 1800
-#define HAVE_CXX11_SUPPORT 1
-#endif
-
-#if !defined(HAVE_UNORDERED_MAP) || !defined(HAVE_ATOMIC) || !defined(HAVE_THREAD)
-#undef HAVE_CXX11_SUPPORT
 #endif
 
 #ifdef HAVE_SCHED_H

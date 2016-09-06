@@ -23,10 +23,11 @@
 #include <set>
 #include <vector>
 
-#include "assert.h"
 #include "checkpoint.h"
 #include "stats.h"
 #include "vbucket.h"
+
+#include <gtest/gtest.h>
 
 #ifdef _MSC_VER
 #define alarm(a)
@@ -34,18 +35,11 @@
 
 #define NUM_TAP_THREADS 3
 #define NUM_SET_THREADS 4
-#ifdef _MSC_VER
-// The test takes way too long time using 50k items on my windows
-// builder (22 minutes). Reduce this to 5k for now until we've
-// figured out why it runs so much slower on windows than the
-// other platforms.
-#define NUM_ITEMS 10000
-#else
-#define NUM_ITEMS 50000
-#endif
 
-EPStats global_stats;
-CheckpointConfig checkpoint_config;
+#define NUM_ITEMS 10000
+
+#define DCP_CURSOR_PREFIX "dcp-client-"
+#define TAP_CURSOR_PREFIX "tap-client-"
 
 struct thread_args {
     SyncObject *mutex;
@@ -79,14 +73,44 @@ public:
     }
 };
 
+// Test fixture for Checkpoint tests. Once constructed provides a checkpoint
+// manager and single vBucket (VBID 0).
+class CheckpointTest : public ::testing::Test {
+protected:
+    CheckpointTest()
+        : callback(new DummyCB()),
+          vbucket(new VBucket(0, vbucket_state_active, global_stats,
+                              checkpoint_config, /*kvshard*/NULL,
+                              /*lastSeqno*/1000, /*lastSnapStart*/0,
+                              /*lastSnapEnd*/0, /*table*/NULL,
+                              callback)) {
+        createManager();
+    }
+
+    void createManager() {
+        manager.reset(new CheckpointManager(global_stats, vbucket->getId(),
+                                            checkpoint_config,
+                                            /*lastSeqno*/1000,
+                                            /*lastSnapStart*/0,/*lastSnapEnd*/0,
+                                            callback));
+    }
+
+    EPStats global_stats;
+    CheckpointConfig checkpoint_config;
+
+    std::shared_ptr<Callback<uint16_t> > callback;
+    RCPtr<VBucket> vbucket;
+    std::unique_ptr<CheckpointManager> manager;
+};
+
 static void launch_persistence_thread(void *arg) {
     struct thread_args *args = static_cast<struct thread_args *>(arg);
-    LockHolder lh(*(args->mutex));
-    LockHolder lhg(*(args->gate));
+    std::unique_lock<std::mutex> lh(*(args->mutex));
+    std::unique_lock<std::mutex> lhg(*(args->gate));
     ++(*(args->counter));
     lhg.unlock();
-    args->gate->notify();
-    args->mutex->wait();
+    args->gate->notify_all();
+    args->mutex->wait(lh);
     lh.unlock();
 
     bool flush = false;
@@ -108,23 +132,24 @@ static void launch_persistence_thread(void *arg) {
             // these. Anything else will be considered an error.
             for(size_t i = itemPos + 1; i < items.size(); ++i) {
                 queued_item qi = items.at(i);
-                cb_assert(queue_op_checkpoint_start == qi->getOperation() ||
-                       queue_op_checkpoint_end == qi->getOperation());
+                EXPECT_TRUE(queue_op_checkpoint_start == qi->getOperation() ||
+                            queue_op_checkpoint_end == qi->getOperation())
+                    << "Unexpected operation:" << qi->getOperation();
             }
             break;
         }
     }
-    cb_assert(flush == true);
+    EXPECT_TRUE(flush);
 }
 
 static void launch_tap_client_thread(void *arg) {
     struct thread_args *args = static_cast<struct thread_args *>(arg);
-    LockHolder lh(*(args->mutex));
-    LockHolder lhg(*(args->gate));
+    std::unique_lock<std::mutex> lh(*(args->mutex));
+    std::unique_lock<std::mutex> lhg(*(args->gate));
     ++(*(args->counter));
     lhg.unlock();
-    args->gate->notify();
-    args->mutex->wait();
+    args->gate->notify_all();
+    args->mutex->wait(lh);
     lh.unlock();
 
     bool flush = false;
@@ -137,17 +162,17 @@ static void launch_tap_client_thread(void *arg) {
             break;
         }
     }
-    cb_assert(flush == true);
+    EXPECT_TRUE(flush);
 }
 
 static void launch_checkpoint_cleanup_thread(void *arg) {
     struct thread_args *args = static_cast<struct thread_args *>(arg);
-    LockHolder lh(*(args->mutex));
-    LockHolder lhg(*(args->gate));
+    std::unique_lock<std::mutex> lh(*(args->mutex));
+    std::unique_lock<std::mutex> lhg(*(args->gate));
     ++(*(args->counter));
     lhg.unlock();
-    args->gate->notify();
-    args->mutex->wait();
+    args->gate->notify_all();
+    args->mutex->wait(lh);
     lh.unlock();
 
     while (args->checkpoint_manager->getNumOfCursors() > 1) {
@@ -159,12 +184,12 @@ static void launch_checkpoint_cleanup_thread(void *arg) {
 
 static void launch_set_thread(void *arg) {
     struct thread_args *args = static_cast<struct thread_args *>(arg);
-    LockHolder lh(*(args->mutex));
-    LockHolder lhg(*(args->gate));
+    std::unique_lock<std::mutex> lh(*(args->mutex));
+    std::unique_lock<std::mutex> lhg(*(args->gate));
     ++(*(args->counter));
     lhg.unlock();
-    args->gate->notify();
-    args->mutex->wait();
+    args->gate->notify_all();
+    args->mutex->wait(lh);
     lh.unlock();
 
     int i(0);
@@ -178,10 +203,8 @@ static void launch_set_thread(void *arg) {
 }
 }
 
-void basic_chk_test() {
-    HashTable::setDefaultNumBuckets(5);
-    HashTable::setDefaultNumLocks(1);
-    shared_ptr<Callback<uint16_t> > cb(new DummyCB());
+TEST_F(CheckpointTest, basic_chk_test) {
+    std::shared_ptr<Callback<uint16_t> > cb(new DummyCB());
     RCPtr<VBucket> vbucket(new VBucket(0, vbucket_state_active, global_stats,
                                        checkpoint_config, NULL, 0, 0, 0, NULL,
                                        cb));
@@ -209,15 +232,15 @@ void basic_chk_test() {
 
     struct thread_args tap_t_args[NUM_TAP_THREADS];
     for (i = 0; i < NUM_TAP_THREADS; ++i) {
-        std::stringstream name;
-        name << "tap-client-" << i;
+        std::string name(TAP_CURSOR_PREFIX + std::to_string(i));
         tap_t_args[i].checkpoint_manager = checkpoint_manager;
         tap_t_args[i].vbucket = vbucket;
         tap_t_args[i].mutex = mutex;
         tap_t_args[i].gate = gate;
         tap_t_args[i].counter = counter;
-        tap_t_args[i].name = name.str();
-        checkpoint_manager->registerCursor(name.str());
+        tap_t_args[i].name = name;
+        checkpoint_manager->registerCursor(name, 1, false,
+                                           MustSendCheckpointEnd::YES);
     }
 
     // Start a timer so that the test can be killed if it doesn't finish in a
@@ -225,36 +248,36 @@ void basic_chk_test() {
     alarm(60);
 
     rc = cb_create_thread(&persistence_thread, launch_persistence_thread, &t_args, 0);
-    cb_assert(rc == 0);
+    EXPECT_EQ(0, rc);
 
     rc = cb_create_thread(&checkpoint_cleanup_thread,
                         launch_checkpoint_cleanup_thread, &t_args, 0);
-    cb_assert(rc == 0);
+    EXPECT_EQ(0, rc);
 
     for (i = 0; i < NUM_TAP_THREADS; ++i) {
         rc = cb_create_thread(&tap_threads[i], launch_tap_client_thread, &tap_t_args[i], 0);
-        cb_assert(rc == 0);
+        EXPECT_EQ(0, rc);
     }
 
     for (i = 0; i < NUM_SET_THREADS; ++i) {
         rc = cb_create_thread(&set_threads[i], launch_set_thread, &t_args, 0);
-        cb_assert(rc == 0);
+        EXPECT_EQ(0, rc);
     }
 
     // Wait for all threads to reach the starting gate
     while (true) {
-        LockHolder lh(*gate);
+        std::unique_lock<std::mutex> lh(*gate);
         if (*counter == (NUM_TAP_THREADS + NUM_SET_THREADS + 2)) {
             break;
         }
-        gate->wait();
+        gate->wait(lh);
     }
     sleep(1);
-    mutex->notify();
+    mutex->notify_all();
 
     for (i = 0; i < NUM_SET_THREADS; ++i) {
         rc = cb_join_thread(set_threads[i]);
-        cb_assert(rc == 0);
+        EXPECT_EQ(0, rc);
     }
 
     // Push the flush command into the queue so that all other threads can be terminated.
@@ -263,18 +286,18 @@ void basic_chk_test() {
     checkpoint_manager->queueDirty(vbucket, qi, true);
 
     rc = cb_join_thread(persistence_thread);
-    cb_assert(rc == 0);
+    EXPECT_EQ(0, rc);
 
     for (i = 0; i < NUM_TAP_THREADS; ++i) {
         rc = cb_join_thread(tap_threads[i]);
-        cb_assert(rc == 0);
+        EXPECT_EQ(0, rc);
         std::stringstream name;
         name << "tap-client-" << i;
         checkpoint_manager->removeCursor(name.str());
     }
 
     rc = cb_join_thread(checkpoint_cleanup_thread);
-    cb_assert(rc == 0);
+    EXPECT_EQ(0, rc);
 
     delete checkpoint_manager;
     delete gate;
@@ -282,8 +305,8 @@ void basic_chk_test() {
     delete counter;
 }
 
-void test_reset_checkpoint_id() {
-    shared_ptr<Callback<uint16_t> > cb(new DummyCB());
+TEST_F(CheckpointTest, reset_checkpoint_id) {
+    std::shared_ptr<Callback<uint16_t> > cb(new DummyCB());
     RCPtr<VBucket> vbucket(new VBucket(0, vbucket_state_active, global_stats,
                                        checkpoint_config, NULL, 0, 0, 0, NULL,
                                        cb));
@@ -311,31 +334,440 @@ void test_reset_checkpoint_id() {
         if (qi->getOperation() != queue_op_checkpoint_start &&
             qi->getOperation() != queue_op_checkpoint_end) {
             size_t mid = qi->getBySeqno();
-            cb_assert(mid > lastMutationId);
+            EXPECT_GT(mid, lastMutationId);
             lastMutationId = qi->getBySeqno();
         }
         if (itemPos == 0 || itemPos == (items.size() - 1)) {
-            cb_assert(qi->getOperation() == queue_op_checkpoint_start);
+            EXPECT_EQ(queue_op_checkpoint_start, qi->getOperation()) << "For itemPos:" << itemPos;
         } else if (itemPos == (items.size() - 2)) {
-            cb_assert(qi->getOperation() == queue_op_checkpoint_end);
+            EXPECT_EQ(queue_op_checkpoint_end, qi->getOperation()) << "For itemPos:" << itemPos;
             chk++;
         } else {
-            cb_assert(qi->getOperation() == queue_op_set);
+            EXPECT_EQ(queue_op_set, qi->getOperation()) << "For itemPos:" << itemPos;
         }
     }
-    cb_assert(items.size() == 13);
+    EXPECT_EQ(13, items.size());
     items.clear();
 
-    chk = 1;
-    lastMutationId = 0;
     manager->checkAndAddNewCheckpoint(1, vbucket);
     manager->getAllItemsForCursor(cursor, items);
-    cb_assert(items.size() == 0);
+    EXPECT_EQ(0, items.size());
+
+    delete manager;
 }
 
+// Sanity check test fixture
+TEST_F(CheckpointTest, CheckFixture) {
+
+    // Should intially have a single cursor (persistence).
+    EXPECT_EQ(1, manager->getNumOfCursors());
+    EXPECT_EQ(1, manager->getNumOpenChkItems());
+    for (auto& cursor : manager->getAllCursors()) {
+        EXPECT_EQ(CheckpointManager::pCursorName, cursor.first);
+    }
+    // Should initially be zero items to persist.
+    EXPECT_EQ(0, manager->getNumItemsForCursor(CheckpointManager::pCursorName));
+}
+
+// Basic test of a single, open checkpoint.
+TEST_F(CheckpointTest, OneOpenCkpt) {
+
+    // Queue a set operation.
+    queued_item qi(new Item("key1", vbucket->getId(), queue_op_set,
+                            /*revSeq*/20, /*bySeq*/0));
+
+    // No set_ops in queue, expect queueDirty to return true (increase
+    // persistence queue size).
+    EXPECT_TRUE(manager->queueDirty(vbucket, qi, true));
+    EXPECT_EQ(1, manager->getNumCheckpoints());  // Single open checkpoint.
+    EXPECT_EQ(2, manager->getNumOpenChkItems()); // 1x op_checkpoint_start, 1x op_set
+    EXPECT_EQ(1001, qi->getBySeqno());
+    EXPECT_EQ(20, qi->getRevSeqno());
+    EXPECT_EQ(1, manager->getNumItemsForCursor(CheckpointManager::pCursorName));
+
+    // Adding the same key again shouldn't increase the size.
+    queued_item qi2(new Item("key1", vbucket->getId(), queue_op_set,
+                            /*revSeq*/21, /*bySeq*/0));
+    EXPECT_FALSE(manager->queueDirty(vbucket, qi2, true));
+    EXPECT_EQ(1, manager->getNumCheckpoints());
+    EXPECT_EQ(2, manager->getNumOpenChkItems());
+    EXPECT_EQ(1002, qi2->getBySeqno());
+    EXPECT_EQ(21, qi2->getRevSeqno());
+    EXPECT_EQ(1, manager->getNumItemsForCursor(CheckpointManager::pCursorName));
+
+    // Adding a different key should increase size.
+    queued_item qi3(new Item("key2", vbucket->getId(), queue_op_set,
+                            /*revSeq*/0, /*bySeq*/0));
+    EXPECT_TRUE(manager->queueDirty(vbucket, qi3, true));
+    EXPECT_EQ(1, manager->getNumCheckpoints());
+    EXPECT_EQ(3, manager->getNumOpenChkItems());
+    EXPECT_EQ(1003, qi3->getBySeqno());
+    EXPECT_EQ(0, qi3->getRevSeqno());
+    EXPECT_EQ(2, manager->getNumItemsForCursor(CheckpointManager::pCursorName));
+}
+
+// Test with one open and one closed checkpoint.
+TEST_F(CheckpointTest, OneOpenOneClosed) {
+
+    // Add some items to the initial (open) checkpoint.
+    for (auto i : {1,2}) {
+        queued_item qi(new Item("key" + std::to_string(i), vbucket->getId(),
+                                queue_op_set, /*revSeq*/0, /*bySeq*/0));
+        EXPECT_TRUE(manager->queueDirty(vbucket, qi, true));
+    }
+    EXPECT_EQ(1, manager->getNumCheckpoints());
+    EXPECT_EQ(3, manager->getNumOpenChkItems()); // 1x op_checkpoint_start, 2x op_set
+    EXPECT_EQ(3, manager->getNumItems());
+    const uint64_t ckpt_id1 = manager->getOpenCheckpointId();
+
+    // Create a new checkpoint (closing the current open one).
+    const uint64_t ckpt_id2 = manager->createNewCheckpoint();
+    EXPECT_NE(ckpt_id1, ckpt_id2) << "New checkpoint ID should differ from old";
+    EXPECT_EQ(ckpt_id1, manager->getLastClosedCheckpointId());
+    EXPECT_EQ(1, manager->getNumOpenChkItems()); // 1x op_checkpoint_start
+
+    // Add some items to the newly-opened checkpoint (note same keys as 1st
+    // ckpt).
+    for (auto ii : {1,2}) {
+        queued_item qi(new Item("key" + std::to_string(ii), vbucket->getId(),
+                                queue_op_set, /*revSeq*/1, /*bySeq*/0));
+        EXPECT_TRUE(manager->queueDirty(vbucket, qi, true));
+    }
+    EXPECT_EQ(2, manager->getNumCheckpoints());
+    EXPECT_EQ(3, manager->getNumOpenChkItems()); // 1x op_checkpoint_start, 2x op_set
+    EXPECT_EQ(3 + 4,
+              manager->getNumItems()); // open items + 1x op_ckpt_start, 2x op_set, 1x op_ckpt_end
+
+    // Examine the items - should be 2 lots of two keys.
+    EXPECT_EQ(4, manager->getNumItemsForCursor(CheckpointManager::pCursorName));
+}
+
+// Test the automatic creation of checkpoints based on the number of items.
+TEST_F(CheckpointTest, ItemBasedCheckpointCreation) {
+
+    // Size down the default number of items to create a new checkpoint and
+    // recreate the manager
+    checkpoint_config = CheckpointConfig(DEFAULT_CHECKPOINT_PERIOD,
+                                         MIN_CHECKPOINT_ITEMS,
+                                         /*numCheckpoints*/2,
+                                         /*itemBased*/true,
+                                         /*keepClosed*/false,
+                                         /*enableMerge*/false);
+    createManager();
+
+    // Sanity check initial state.
+    EXPECT_EQ(1, manager->getNumOfCursors());
+    EXPECT_EQ(1, manager->getNumOpenChkItems());
+    EXPECT_EQ(1, manager->getNumCheckpoints());
+
+    // Create one less than the number required to create a new checkpoint.
+    queued_item qi;
+    for (unsigned int ii = 0; ii < MIN_CHECKPOINT_ITEMS; ii++) {
+        EXPECT_EQ(ii + 1, manager->getNumOpenChkItems()); /* +1 for op_ckpt_start */
+
+        qi.reset(new Item("key" + std::to_string(ii), vbucket->getId(),
+                          queue_op_set, /*revSeq*/0, /*bySeq*/0));
+        EXPECT_TRUE(manager->queueDirty(vbucket, qi, true));
+        EXPECT_EQ(1, manager->getNumCheckpoints());
+
+    }
+
+    // Add one more - should create a new checkpoint.
+    qi.reset(new Item("key_epoch", vbucket->getId(), queue_op_set, /*revSeq*/0,
+                      /*bySeq*/0));
+    EXPECT_TRUE(manager->queueDirty(vbucket, qi, true));
+    EXPECT_EQ(2, manager->getNumCheckpoints());
+    EXPECT_EQ(2, manager->getNumOpenChkItems()); // 1x op_ckpt_start, 1x op_set
+
+    // Fill up this checkpoint also - note loop for MIN_CHECKPOINT_ITEMS - 1
+    for (unsigned int ii = 0; ii < MIN_CHECKPOINT_ITEMS - 1; ii++) {
+        EXPECT_EQ(ii + 2, manager->getNumOpenChkItems()); /* +2 op_ckpt_start, key_epoch */
+
+        qi.reset(new Item("key" + std::to_string(ii), vbucket->getId(),
+                                queue_op_set, /*revSeq*/1, /*bySeq*/0));
+        EXPECT_TRUE(manager->queueDirty(vbucket, qi, true));
+        EXPECT_EQ(2, manager->getNumCheckpoints());
+    }
+
+    // Add one more - as we have hit maximum checkpoints should *not* create a
+    // new one.
+    qi.reset(new Item("key_epoch2", vbucket->getId(), queue_op_set,
+                      /*revSeq*/1, /*bySeq*/0));
+    EXPECT_TRUE(manager->queueDirty(vbucket, qi, true));
+    EXPECT_EQ(2, manager->getNumCheckpoints());
+    EXPECT_EQ(12, // 1x op_ckpt_start, 1x key_epoch, 9x key_X, 1x key_epoch2
+              manager->getNumOpenChkItems());
+
+    // Fetch the items associated with the persistence cursor. This
+    // moves the single cursor registered outside of the initial checkpoint,
+    // allowing a new open checkpoint to be created.
+    EXPECT_EQ(1, manager->getNumOfCursors());
+    snapshot_range_t range;
+    std::vector<queued_item> items;
+    range = manager->getAllItemsForCursor(CheckpointManager::pCursorName,
+                                         items);
+    // Should still have the same number of checkpoints and open items.
+    EXPECT_EQ(2, manager->getNumCheckpoints());
+    EXPECT_EQ(12, manager->getNumOpenChkItems());
+
+    // But adding a new item will create a new one.
+    qi.reset(new Item("key_epoch3", vbucket->getId(), queue_op_set,
+                      /*revSeq*/1, /*bySeq*/0));
+    EXPECT_TRUE(manager->queueDirty(vbucket, qi, true));
+    EXPECT_EQ(3, manager->getNumCheckpoints());
+    EXPECT_EQ(2, manager->getNumOpenChkItems()); // 1x op_ckpt_start, 1x op_set
+}
+
+// Test checkpoint and cursor accounting - when checkpoints are closed the
+// offset of cursors is updated as appropriate.
+TEST_F(CheckpointTest, CursorOffsetOnCheckpointClose) {
+
+    // Add two items to the initial (open) checkpoint.
+    for (auto i : {1,2}) {
+        queued_item qi(new Item("key" + std::to_string(i), vbucket->getId(),
+                                queue_op_set, /*revSeq*/0, /*bySeq*/0));
+        EXPECT_TRUE(manager->queueDirty(vbucket, qi, true));
+    }
+    EXPECT_EQ(1, manager->getNumCheckpoints());
+    EXPECT_EQ(3, manager->getNumOpenChkItems()); // 1x op_checkpoint_start, 2x op_set
+    EXPECT_EQ(3, manager->getNumItems());
+
+    // Use the existing persistence cursor for this test:
+    EXPECT_EQ(2, manager->getNumItemsForCursor(CheckpointManager::pCursorName))
+        << "Cursor should initially have two items pending";
+
+    // Check de-dupe counting - after adding another item with the same key,
+    // should still see two items.
+    queued_item qi(new Item("key1", vbucket->getId(),
+                            queue_op_set, /*revSeq*/0, /*bySeq*/0));
+    EXPECT_FALSE(manager->queueDirty(vbucket, qi, true))
+        << "Adding a duplicate key to open checkpoint should not increase queue size";
+
+    EXPECT_EQ(2, manager->getNumItemsForCursor(CheckpointManager::pCursorName))
+        << "Expected 2 items for cursor (2x op_set) after adding a duplicate.";
+
+    // Create a new checkpoint (closing the current open one).
+    manager->createNewCheckpoint();
+    EXPECT_EQ(1, manager->getNumOpenChkItems())
+        << "Expected 1 item (1x op_checkpoint_start)";
+    EXPECT_EQ(2, manager->getNumCheckpoints());
+
+    // Advance cursor - first to get the 'checkpoint_start' meta item,
+    // and a second time to get the a 'proper' mutation.
+    bool isLastMutationItem;
+    auto item = manager->nextItem(CheckpointManager::pCursorName, isLastMutationItem);
+    EXPECT_TRUE(item->isCheckPointMetaItem());
+    EXPECT_FALSE(isLastMutationItem);
+
+    item = manager->nextItem(CheckpointManager::pCursorName, isLastMutationItem);
+    EXPECT_FALSE(item->isCheckPointMetaItem());
+    EXPECT_FALSE(isLastMutationItem);
+    EXPECT_EQ(1, manager->getNumItemsForCursor(CheckpointManager::pCursorName))
+        << "Expected 1 item for cursor after advancing by 1";
+
+    // Add two items to the newly-opened checkpoint. Same keys as 1st ckpt,
+    // but cannot de-dupe across checkpoints.
+    for (auto ii : {1,2}) {
+        queued_item qi(new Item("key" + std::to_string(ii), vbucket->getId(),
+                                queue_op_set, /*revSeq*/1, /*bySeq*/0));
+        EXPECT_TRUE(manager->queueDirty(vbucket, qi, true));
+    }
+
+    EXPECT_EQ(3, manager->getNumItemsForCursor(CheckpointManager::pCursorName))
+        << "Expected 3 items for cursor after adding 2 more to new checkpoint";
+
+    // Advance the cursor 'out' of the first checkpoint.
+    item = manager->nextItem(CheckpointManager::pCursorName, isLastMutationItem);
+    EXPECT_FALSE(item->isCheckPointMetaItem());
+    EXPECT_TRUE(isLastMutationItem);
+
+    // Now at the end of the first checkpoint, move into the next checkpoint.
+    item = manager->nextItem(CheckpointManager::pCursorName, isLastMutationItem);
+    EXPECT_TRUE(item->isCheckPointMetaItem());
+    EXPECT_TRUE(isLastMutationItem);
+    item = manager->nextItem(CheckpointManager::pCursorName, isLastMutationItem);
+    EXPECT_TRUE(item->isCheckPointMetaItem());
+    EXPECT_FALSE(isLastMutationItem);
+
+    // Tell Checkpoint manager the items have been persisted, so it advances
+    // pCursorPreCheckpointId, which will allow us to remove the closed
+    // unreferenced checkpoints.
+    manager->itemsPersisted();
+
+    // Both previous checkpoints are unreferenced. Close them. This will
+    // cause the offset of this cursor to be recalculated.
+    bool new_open_ckpt_created;
+    EXPECT_EQ(2, manager->removeClosedUnrefCheckpoints(vbucket,
+                                                           new_open_ckpt_created));
+
+    EXPECT_EQ(1, manager->getNumCheckpoints());
+
+    EXPECT_EQ(2, manager->getNumItemsForCursor(CheckpointManager::pCursorName));
+
+    // Drain the remaining items.
+    item = manager->nextItem(CheckpointManager::pCursorName, isLastMutationItem);
+    EXPECT_FALSE(item->isCheckPointMetaItem());
+    EXPECT_FALSE(isLastMutationItem);
+    item = manager->nextItem(CheckpointManager::pCursorName, isLastMutationItem);
+    EXPECT_FALSE(item->isCheckPointMetaItem());
+    EXPECT_TRUE(isLastMutationItem);
+
+    EXPECT_EQ(0, manager->getNumItemsForCursor(CheckpointManager::pCursorName));
+}
+
+// Test the getAllItemsForCursor()
+TEST_F(CheckpointTest, ItemsForCheckpointCursor) {
+    /* We want to have items across 2 checkpoints. Size down the default number
+       of items to create a new checkpoint and recreate the manager */
+    checkpoint_config = CheckpointConfig(DEFAULT_CHECKPOINT_PERIOD,
+                                         MIN_CHECKPOINT_ITEMS,
+                                         /*numCheckpoints*/2,
+                                         /*itemBased*/true,
+                                         /*keepClosed*/false,
+                                         /*enableMerge*/false);
+    createManager();
+
+    /* Sanity check initial state */
+    EXPECT_EQ(1, manager->getNumOfCursors());
+    EXPECT_EQ(1, manager->getNumOpenChkItems());
+    EXPECT_EQ(1, manager->getNumCheckpoints());
+
+    /* Add items such that we have 2 checkpoints */
+    queued_item qi;
+    for (unsigned int ii = 0; ii < 2 * MIN_CHECKPOINT_ITEMS; ii++) {
+        qi.reset(new Item("key" + std::to_string(ii), vbucket->getId(),
+                          queue_op_set, /*revSeq*/0, /*bySeq*/0));
+        EXPECT_TRUE(manager->queueDirty(vbucket, qi, true));
+    }
+
+    /* Check if we have desired number of checkpoints and desired number of
+       items */
+    EXPECT_EQ(2, manager->getNumCheckpoints());
+    EXPECT_EQ(MIN_CHECKPOINT_ITEMS + 1, manager->getNumOpenChkItems());
+    /* MIN_CHECKPOINT_ITEMS items + op_ckpt_start */
+
+    /* Register DCP replication cursor */
+    std::string dcp_cursor(DCP_CURSOR_PREFIX + std::to_string(1));
+    manager->registerCursorBySeqno(dcp_cursor.c_str(), 0,
+                                   MustSendCheckpointEnd::NO);
+
+    /* Get items for persistence*/
+    std::vector<queued_item> items;
+    manager->getAllItemsForCursor(CheckpointManager::pCursorName, items);
+
+    /* We should have got (2 * MIN_CHECKPOINT_ITEMS + 3) items. 3 additional are
+       op_ckpt_start, op_ckpt_end and op_ckpt_start */
+    EXPECT_EQ(2 * MIN_CHECKPOINT_ITEMS + 3, items.size());
+
+    /* Get items for DCP replication cursor */
+    items.clear();
+    manager->getAllItemsForCursor(dcp_cursor.c_str(), items);
+    EXPECT_EQ(2 * MIN_CHECKPOINT_ITEMS + 3, items.size());
+}
+
+// Test the checkpoint cursor movement
+TEST_F(CheckpointTest, CursorMovement) {
+    /* We want to have items across 2 checkpoints. Size down the default number
+     of items to create a new checkpoint and recreate the manager */
+    checkpoint_config = CheckpointConfig(DEFAULT_CHECKPOINT_PERIOD,
+                                         MIN_CHECKPOINT_ITEMS,
+                                         /*numCheckpoints*/2,
+                                         /*itemBased*/true,
+                                         /*keepClosed*/false,
+                                         /*enableMerge*/false);
+    createManager();
+
+    /* Sanity check initial state */
+    EXPECT_EQ(1, manager->getNumOfCursors());
+    EXPECT_EQ(1, manager->getNumOpenChkItems());
+    EXPECT_EQ(1, manager->getNumCheckpoints());
+
+    /* Add items such that we have 1 full (max items as per config) checkpoint.
+       Adding another would open new checkpoint */
+    queued_item qi;
+    for (unsigned int ii = 0; ii < MIN_CHECKPOINT_ITEMS; ii++) {
+        qi.reset(new Item("key" + std::to_string(ii), vbucket->getId(),
+                          queue_op_set, /*revSeq*/0, /*bySeq*/0));
+        EXPECT_TRUE(manager->queueDirty(vbucket, qi, true));
+    }
+
+    /* Check if we have desired number of checkpoints and desired number of
+       items */
+    EXPECT_EQ(1, manager->getNumCheckpoints());
+    EXPECT_EQ(MIN_CHECKPOINT_ITEMS + 1, manager->getNumOpenChkItems());
+    /* MIN_CHECKPOINT_ITEMS items + op_ckpt_start */
+
+    /* Register DCP replication cursor */
+    std::string dcp_cursor(DCP_CURSOR_PREFIX + std::to_string(1));
+    manager->registerCursorBySeqno(dcp_cursor.c_str(), 0,
+                                   MustSendCheckpointEnd::NO);
+
+    /* Registor TAP cursor */
+    std::string tap_cursor(TAP_CURSOR_PREFIX + std::to_string(1));
+    manager->registerCursor(tap_cursor, 1, false, MustSendCheckpointEnd::YES);
+
+    /* Get items for persistence cursor */
+    std::vector<queued_item> items;
+    manager->getAllItemsForCursor(CheckpointManager::pCursorName, items);
+
+    /* We should have got (MIN_CHECKPOINT_ITEMS + op_ckpt_start) items. */
+    EXPECT_EQ(MIN_CHECKPOINT_ITEMS + 1, items.size());
+
+    /* Get items for DCP replication cursor */
+    items.clear();
+    manager->getAllItemsForCursor(dcp_cursor.c_str(), items);
+    EXPECT_EQ(MIN_CHECKPOINT_ITEMS + 1, items.size());
+
+    /* Get items for TAP cursor */
+    int num_items = 0;
+    while(true) {
+        bool isLastItem = false;
+        qi = manager->nextItem(tap_cursor, isLastItem);
+        num_items++;
+        if (isLastItem) {
+            break;
+        }
+    }
+    EXPECT_EQ(MIN_CHECKPOINT_ITEMS + 1, num_items);
+
+    uint64_t curr_open_chkpt_id = manager->getOpenCheckpointId_UNLOCKED();
+
+    /* Run the checkpoint remover so that new open checkpoint is created */
+    bool newCheckpointCreated;
+    manager->removeClosedUnrefCheckpoints(vbucket, newCheckpointCreated);
+    EXPECT_EQ(curr_open_chkpt_id + 1, manager->getOpenCheckpointId_UNLOCKED());
+
+    /* Get items for persistence cursor */
+    items.clear();
+    manager->getAllItemsForCursor(CheckpointManager::pCursorName, items);
+
+    /* We should have got op_ckpt_start item */
+    EXPECT_EQ(1, items.size());
+
+    /* Get items for DCP replication cursor */
+    items.clear();
+    manager->getAllItemsForCursor(dcp_cursor.c_str(), items);
+    /* Expecting only 1 op_ckpt_start item */
+    EXPECT_EQ(1, items.size());
+
+    /* Get item for TAP cursor. We expect TAP to send op_ckpt_end of last
+       checkpoint. TAP unlike DCP cannot skip the op_ckpt_end message */
+    bool isLastItem = false;
+    qi = manager->nextItem(tap_cursor, isLastItem);
+    EXPECT_EQ(queue_op_checkpoint_end, qi->getOperation());
+    EXPECT_EQ(true, isLastItem);
+
+}
+
+/* static storage for environment variable set by putenv(). */
+static char allow_no_stats_env[] = "ALLOW_NO_STATS_UPDATE=yeah";
+
 int main(int argc, char **argv) {
-    (void)argc; (void)argv;
-    putenv(strdup("ALLOW_NO_STATS_UPDATE=yeah"));
-    basic_chk_test();
-    test_reset_checkpoint_id();
+    ::testing::InitGoogleTest(&argc, argv);
+    putenv(allow_no_stats_env);
+
+    HashTable::setDefaultNumBuckets(5);
+    HashTable::setDefaultNumLocks(1);
+
+    return RUN_ALL_TESTS();
 }

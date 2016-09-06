@@ -17,11 +17,15 @@
 
 #include "config.h"
 
+#include <phosphor/phosphor.h>
+
 #include "checkpoint_remover.h"
+#include "dcp/dcpconnmap.h"
 #include "ep.h"
 #include "ep_engine.h"
 #include "vbucket.h"
 #include "connmap.h"
+#include "tapconnmap.h"
 
 /**
  * Remove all the closed unreferenced checkpoints for each vbucket.
@@ -32,8 +36,9 @@ public:
     /**
      * Construct a CheckpointVisitor.
      */
-    CheckpointVisitor(EventuallyPersistentStore *s, EPStats &st, bool *sfin)
-        : store(s), stats(st), removed(0),
+    CheckpointVisitor(EventuallyPersistentStore *s, EPStats &st,
+                      std::atomic<bool> &sfin)
+        : store(s), stats(st), removed(0), taskStart(gethrtime()),
           wasHighMemoryUsage(s->isMemoryUsageTooHigh()), stateFinalizer(sfin) {}
 
     bool visitBucket(RCPtr<VBucket> &vb) {
@@ -65,9 +70,10 @@ public:
     }
 
     void complete() {
-        if (stateFinalizer) {
-            *stateFinalizer = true;
-        }
+        bool inverse = false;
+        stateFinalizer.compare_exchange_strong(inverse, true);
+
+        stats.checkpointRemoverHisto.add((gethrtime() - taskStart) / 1000);
 
         // Wake up any sleeping backfill tasks if the memory usage is lowered
         // below the high watermark as a result of checkpoint removal.
@@ -80,18 +86,70 @@ private:
     EventuallyPersistentStore *store;
     EPStats                   &stats;
     size_t                     removed;
+    hrtime_t                   taskStart;
     bool                       wasHighMemoryUsage;
-    bool                      *stateFinalizer;
+    std::atomic<bool>         &stateFinalizer;
 };
 
-bool ClosedUnrefCheckpointRemoverTask::run(void) {
-    if (available) {
-        available = false;
+void ClosedUnrefCheckpointRemoverTask::cursorDroppingIfNeeded(void) {
+    /**
+     * Cursor dropping will commence only if the total memory used is
+     * greater than the upper threshold which is a percentage of the
+     * quota, specified by cursor_dropping_upper_mark. Once cursor
+     * dropping starts, it will continue until memory usage is projected
+     * to go under the lower threshold which is a percentage of the quota,
+     * specified by cursor_dropping_lower_mark.
+     */
+    if (stats.getTotalMemoryUsed() > stats.cursorDroppingUThreshold.load()) {
+        size_t amountOfMemoryToClear = stats.getTotalMemoryUsed() -
+                                          stats.cursorDroppingLThreshold.load();
+        size_t memoryCleared = 0;
         EventuallyPersistentStore *store = engine->getEpStore();
-        shared_ptr<CheckpointVisitor> pv(new CheckpointVisitor(store, stats,
-                    &available));
+        // Get a list of active vbuckets sorted by memory usage
+        // of their respective checkpoint managers.
+        auto vbuckets = store->getVBuckets().getActiveVBucketsSortedByChkMgrMem();
+        for (const auto& it: vbuckets) {
+            if (memoryCleared < amountOfMemoryToClear) {
+                uint16_t vbid = it.first;
+                RCPtr<VBucket> vb = store->getVBucket(vbid);
+                if (vb) {
+                    // Get a list of cursors that can be dropped from the
+                    // vbucket's checkpoint manager, so as to unreference
+                    // an estimated number of checkpoints.
+                    std::vector<std::string> cursors =
+                                vb->checkpointManager.getListOfCursorsToDrop();
+                    std::vector<std::string>::iterator itr = cursors.begin();
+                    for (; itr != cursors.end(); ++itr) {
+                        if (memoryCleared < amountOfMemoryToClear) {
+                            if (engine->getDcpConnMap().handleSlowStream(vbid,
+                                                                        *itr))
+                            {
+                                ++stats.cursorsDropped;
+                                memoryCleared +=
+                                      vb->getChkMgrMemUsageOfUnrefCheckpoints();
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            } else {    // memoryCleared >= amountOfMemoryToClear
+                break;
+            }
+        }
+    }
+}
+
+bool ClosedUnrefCheckpointRemoverTask::run(void) {
+    TRACE_EVENT0("ep-engine/task", "ClosedUnrefCheckpointRemoverTask");
+    bool inverse = true;
+    if (available.compare_exchange_strong(inverse, false)) {
+        cursorDroppingIfNeeded();
+        EventuallyPersistentStore *store = engine->getEpStore();
+        std::shared_ptr<CheckpointVisitor> pv(new CheckpointVisitor(store, stats,
+                                                               available));
         store->visit(pv, "Checkpoint Remover", NONIO_TASK_IDX,
-                     Priority::CheckpointRemoverPriority);
+                     TaskId::ClosedUnrefCheckpointRemoverVisitorTask);
     }
     snooze(sleepTime);
     return true;

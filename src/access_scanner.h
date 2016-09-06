@@ -1,6 +1,6 @@
 /* -*- Mode: C++; tab-width: 4; c-basic-offset: 4; indent-tabs-mode: nil -*- */
 /*
- *     Copyright 2012 Couchbase, Inc
+ *     Copyright 2015 Couchbase, Inc
  *
  *   Licensed under the Apache License, Version 2.0 (the "License");
  *   you may not use this file except in compliance with the License.
@@ -22,8 +22,6 @@
 
 #include <string>
 
-#include "common.h"
-#include "ep_engine.h"
 #include "tasks.h"
 
 // Forward declaration.
@@ -34,21 +32,24 @@ class AccessScanner : public GlobalTask {
     friend class AccessScannerValueChangeListener;
 public:
     AccessScanner(EventuallyPersistentStore &_store, EPStats &st,
-                  const Priority &p, double sleeptime = 0)
-        : GlobalTask(&_store.getEPEngine(), p, sleeptime),
-          completedCount(0), store(_store), stats(st), sleepTime(sleeptime),
-          available(true) { }
+                  double sleeptime = 0,
+                  bool useStartTime = false,
+                  bool completeBeforeShutdown = false);
 
     bool run();
     std::string getDescription();
-    size_t startTime();
-    AtomicValue<size_t> completedCount;
+    std::atomic<size_t> completedCount;
 
 private:
+    void updateAlogTime(double sleepSecs);
+    void deleteAlogFile(const std::string& fileName);
+
     EventuallyPersistentStore &store;
     EPStats &stats;
     double sleepTime;
-    bool available;
+    std::string alogPath;
+    std::atomic<bool> available;
+    uint8_t residentRatioThreshold;
 };
 
 #endif  // SRC_ACCESS_SCANNER_H_

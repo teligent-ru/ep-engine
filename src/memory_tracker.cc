@@ -24,25 +24,52 @@
 
 #include "memory_tracker.h"
 #include "objectregistry.h"
+#include "utility.h"
 
 bool MemoryTracker::tracking = false;
-MemoryTracker *MemoryTracker::instance = NULL;
+std::atomic<MemoryTracker*> MemoryTracker::instance;
+std::mutex MemoryTracker::instance_mutex;
 
-extern "C" {
-    static void updateStatsThread(void* arg) {
-        MemoryTracker* tracker = static_cast<MemoryTracker*>(arg);
-        while (tracker->trackingMemoryAllocations()) {
+void MemoryTracker::statsThreadMainLoop(void* arg) {
+    MemoryTracker* tracker = static_cast<MemoryTracker*>(arg);
+    while (true) {
+        // Wait for either the shutdown condvar to be notified, or for
+        // 250ms. If we hit the timeout then time to update the stats.
+        std::unique_lock<std::mutex> lock(tracker->mutex);
+        if (tracker->shutdown_cv.wait_for(
+                lock,
+                std::chrono::milliseconds(250),
+                [tracker]{return !tracker->trackingMemoryAllocations();})) {
+            // No longer tracking - exit.
+            return;
+        } else {
             tracker->updateStats();
-            usleep(250000);
         }
     }
 }
 
-MemoryTracker *MemoryTracker::getInstance() {
-    if (!instance) {
-        instance = new MemoryTracker();
+MemoryTracker* MemoryTracker::getInstance() {
+    MemoryTracker* tmp = instance.load();
+    if (tmp == nullptr) {
+        // Double-checked locking if instance is null - ensure two threads
+        // don't both create an instance.
+        std::lock_guard<std::mutex> lock(instance_mutex);
+        tmp = instance.load();
+        if (tmp == nullptr) {
+            tmp = new MemoryTracker();
+            instance.store(tmp);
+        }
     }
-    return instance;
+    return tmp;
+}
+
+void MemoryTracker::destroyInstance() {
+    std::lock_guard<std::mutex> lock(instance_mutex);
+    MemoryTracker* tmp = instance.load();
+    if (tmp != nullptr) {
+        delete tmp;
+        instance = nullptr;
+    }
 }
 
 extern "C" {
@@ -65,7 +92,7 @@ extern "C" {
 
 MemoryTracker::MemoryTracker() {
     if (getenv("EP_NO_MEMACCOUNT") != NULL) {
-        LOG(EXTENSION_LOG_WARNING, "Memory allocation tracking disabled");
+        LOG(EXTENSION_LOG_NOTICE, "Memory allocation tracking disabled");
         return;
     }
     stats.ext_stats_size = getHooksApi()->get_extra_stats_size();
@@ -75,17 +102,16 @@ MemoryTracker::MemoryTracker() {
         LOG(EXTENSION_LOG_DEBUG, "Registered add hook");
         if (getHooksApi()->add_delete_hook(&DeleteHook)) {
             LOG(EXTENSION_LOG_DEBUG, "Registered delete hook");
-            std::cout.flush();
             tracking = true;
             updateStats();
-            if (cb_create_thread(&statsThreadId, updateStatsThread, this, 0)
-                != 0) {
+            if (cb_create_named_thread(&statsThreadId,
+                                       statsThreadMainLoop,
+                                           this, 0, "mc:mem stats") != 0) {
                 throw std::runtime_error(
                                       "Error creating thread to update stats");
             }
             return;
         }
-        std::cout.flush();
         getHooksApi()->remove_new_hook(&NewHook);
     }
     LOG(EXTENSION_LOG_WARNING, "Failed to register allocator hooks");
@@ -96,8 +122,10 @@ MemoryTracker::~MemoryTracker() {
     getHooksApi()->remove_delete_hook(&DeleteHook);
     if (tracking) {
         tracking = false;
+        shutdown_cv.notify_all();
         cb_join_thread(statsThreadId);
     }
+    free(stats.ext_stats);
     instance = NULL;
 }
 

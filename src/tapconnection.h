@@ -1,6 +1,6 @@
 /* -*- Mode: C++; tab-width: 4; c-basic-offset: 4; indent-tabs-mode: nil -*- */
 /*
- *     Copyright 2013 Couchbase, Inc
+ *     Copyright 2015 Couchbase, Inc
  *
  *   Licensed under the Apache License, Version 2.0 (the "License");
  *   you may not use this file except in compliance with the License.
@@ -27,11 +27,10 @@
 #include <string>
 #include <vector>
 
-#include "atomic.h"
-#include "common.h"
-#include "locks.h"
-#include "mutex.h"
+#include "logger.h"
 #include "statwriter.h"
+#include "vbucket.h"
+#include "utility.h"
 
 // forward decl
 class ConnHandler;
@@ -170,10 +169,10 @@ public:
     queued_item item_;
 };
 
-typedef enum {
+enum conn_type_t {
     TAP_CONN, //!< TAP connnection
     DCP_CONN  //!< DCP connection
-} conn_type_t;
+};
 
 class ConnHandler : public RCValue {
 public:
@@ -256,21 +255,23 @@ public:
     }
 
     const char* logHeader() {
-        return logString.c_str();
+        return logger.prefix.c_str();
     }
 
     void setLogHeader(const std::string &header) {
-        logString = header;
+        logger.prefix = header;
     }
+
+    const Logger& getLogger() const;
 
     void releaseReference(bool force = false);
 
     void setSupportAck(bool ack) {
-        supportAck = ack;
+        supportAck.store(ack);
     }
 
     bool supportsAck() const {
-        return supportAck;
+        return supportAck.load();
     }
 
     void setSupportCheckpointSync(bool checkpointSync) {
@@ -284,7 +285,7 @@ public:
     virtual const char *getType() const = 0;
 
     template <typename T>
-    void addStat(const char *nm, const T &val, ADD_STAT add_stat, const void *c) {
+    void addStat(const char *nm, const T &val, ADD_STAT add_stat, const void *c) const {
         std::stringstream tap;
         tap << name << ":" << nm;
         std::stringstream value;
@@ -293,16 +294,16 @@ public:
         add_casted_stat(n.data(), value.str().data(), add_stat, c);
     }
 
-    void addStat(const char *nm, bool val, ADD_STAT add_stat, const void *c) {
+    void addStat(const char *nm, bool val, ADD_STAT add_stat, const void *c) const {
         addStat(nm, val ? "true" : "false", add_stat, c);
     }
 
     virtual void addStats(ADD_STAT add_stat, const void *c) {
         addStat("type", getType(), add_stat, c);
-        addStat("created", created, add_stat, c);
-        addStat("connected", connected, add_stat, c);
-        addStat("pending_disconnect", disconnect, add_stat, c);
-        addStat("supports_ack", supportAck, add_stat, c);
+        addStat("created", created.load(), add_stat, c);
+        addStat("connected", connected.load(), add_stat, c);
+        addStat("pending_disconnect", disconnect.load(), add_stat, c);
+        addStat("supports_ack", supportAck.load(), add_stat, c);
         addStat("reserved", reserved.load(), add_stat, c);
 
         if (numDisconnects > 0) {
@@ -310,7 +311,7 @@ public:
         }
     }
 
-    virtual void aggregateQueueStats(ConnCounter* stats_aggregator) {
+    virtual void aggregateQueueStats(ConnCounter& stats_aggregator) {
         // Empty
     }
 
@@ -337,11 +338,11 @@ public:
     }
 
     const void *getCookie() const {
-        return cookie;
+        return cookie.load();
     }
 
     void setCookie(const void *c) {
-        cookie = c;
+        cookie.store(const_cast<void*>(c));
     }
 
     void setExpiryTime(rel_time_t t) {
@@ -353,30 +354,30 @@ public:
     }
 
     void setLastWalkTime() {
-        lastWalkTime = ep_current_time();
+        lastWalkTime.store(ep_current_time());
     }
 
     rel_time_t getLastWalkTime() {
-        return lastWalkTime;
+        return lastWalkTime.load();
     }
 
     void setConnected(bool s) {
         if (!s) {
             ++numDisconnects;
         }
-        connected = s;
+        connected.store(s);
     }
 
     bool isConnected() {
-        return connected;
+        return connected.load();
     }
 
     bool doDisconnect() {
-        return disconnect;
+        return disconnect.load();
     }
 
     virtual void setDisconnect(bool val) {
-        disconnect = val;
+        disconnect.store(val);
     }
 
     static std::string getAnonName() {
@@ -396,54 +397,54 @@ protected:
     EPStats &stats;
     bool supportCheckpointSync_;
 
+    //! The logger for this connection
+    Logger logger;
+
 private:
 
      //! The name for this connection
     std::string name;
 
-    //! The string used to prefix all log messages for this connection
-    std::string logString;
-
     //! The cookie representing this connection (provided by the memcached code)
-    const void* cookie;
+    std::atomic<void*> cookie;
 
     //! Whether or not the connection is reserved in the memcached layer
-    AtomicValue<bool> reserved;
+    std::atomic<bool> reserved;
 
     //! Connection token created at connection instantiation time
     hrtime_t connToken;
 
     //! Connection creation time
-    rel_time_t created;
+    std::atomic<rel_time_t> created;
 
     //! The last time this connection's step function was called
-    rel_time_t lastWalkTime;
+    std::atomic<rel_time_t> lastWalkTime;
 
     //! Should we disconnect as soon as possible?
-    bool disconnect;
+    std::atomic<bool> disconnect;
 
     //! Is this tap conenction connected?
-    bool connected;
+    std::atomic<bool> connected;
 
     //! Number of times this connection was disconnected
-    AtomicValue<size_t> numDisconnects;
+    std::atomic<size_t> numDisconnects;
 
     //! when this tap conneciton expires.
     rel_time_t expiryTime;
 
     //! Whether or not this connection supports acking
-    bool supportAck;
+    std::atomic<bool> supportAck;
 
     //! A counter used to generate unique names
-    static AtomicValue<uint64_t> counter_;
+    static std::atomic<uint64_t> counter_;
 };
 
-typedef enum {
+enum proto_checkpoint_state {
     backfill,
     checkpoint_start,
     checkpoint_end,
     checkpoint_end_synced
-} proto_checkpoint_state;
+};
 
 
 /**
@@ -637,21 +638,21 @@ public:
  */
 class Consumer : public ConnHandler {
 private:
-    AtomicValue<size_t> numDelete;
-    AtomicValue<size_t> numDeleteFailed;
-    AtomicValue<size_t> numFlush;
-    AtomicValue<size_t> numFlushFailed;
-    AtomicValue<size_t> numMutation;
-    AtomicValue<size_t> numMutationFailed;
-    AtomicValue<size_t> numOpaque;
-    AtomicValue<size_t> numOpaqueFailed;
-    AtomicValue<size_t> numVbucketSet;
-    AtomicValue<size_t> numVbucketSetFailed;
-    AtomicValue<size_t> numCheckpointStart;
-    AtomicValue<size_t> numCheckpointStartFailed;
-    AtomicValue<size_t> numCheckpointEnd;
-    AtomicValue<size_t> numCheckpointEndFailed;
-    AtomicValue<size_t> numUnknown;
+    std::atomic<size_t> numDelete;
+    std::atomic<size_t> numDeleteFailed;
+    std::atomic<size_t> numFlush;
+    std::atomic<size_t> numFlushFailed;
+    std::atomic<size_t> numMutation;
+    std::atomic<size_t> numMutationFailed;
+    std::atomic<size_t> numOpaque;
+    std::atomic<size_t> numOpaqueFailed;
+    std::atomic<size_t> numVbucketSet;
+    std::atomic<size_t> numVbucketSetFailed;
+    std::atomic<size_t> numCheckpointStart;
+    std::atomic<size_t> numCheckpointStartFailed;
+    std::atomic<size_t> numCheckpointEnd;
+    std::atomic<size_t> numCheckpointEndFailed;
+    std::atomic<size_t> numUnknown;
 
 public:
     Consumer(EventuallyPersistentEngine &theEngine, const void* cookie,
@@ -673,14 +674,16 @@ public:
  */
 class BGFetchCallback : public GlobalTask {
 public:
-    BGFetchCallback(EventuallyPersistentEngine *e, const std::string &n,
+    BGFetchCallback(EventuallyPersistentEngine& e, const std::string &n,
                     const std::string &k, uint16_t vbid, hrtime_t token,
-                    const Priority &p, double sleeptime = 0) :
-        GlobalTask(e, p, sleeptime, false), name(n), key(k), epe(e),
-        init(gethrtime()), connToken(token), vbucket(vbid)
-    {
-        cb_assert(epe);
-    }
+                    double sleeptime = 0)
+        : GlobalTask(&e, TaskId::BGFetchCallback, sleeptime, false),
+          name(n),
+          key(k),
+          epe(e),
+          init(gethrtime()),
+          connToken(token),
+          vbucket(vbid) {}
 
     bool run();
 
@@ -693,7 +696,7 @@ public:
 private:
     const std::string name;
     const std::string key;
-    EventuallyPersistentEngine *epe;
+    EventuallyPersistentEngine& epe;
     hrtime_t init;
     hrtime_t connToken;
     uint16_t vbucket;
@@ -758,8 +761,9 @@ public:
         return notifySent;
     }
 
-    virtual void setSuspended(bool value) {
-        suspended = value;
+    bool setSuspended(bool val) {
+        bool inverse = !val;
+        return suspended.compare_exchange_strong(inverse, val);
     }
 
     bool isSuspended() {
@@ -768,13 +772,13 @@ public:
 
 private:
     //! Is this tap connection in a suspended state
-    bool suspended;
+    std::atomic<bool> suspended;
     //! Connection is temporarily paused?
-    AtomicValue<bool> paused;
+    std::atomic<bool> paused;
     //! Flag indicating if the notification event is scheduled
-    AtomicValue<bool> notificationScheduled;
+    std::atomic<bool> notificationScheduled;
         //! Flag indicating if the pending memcached connection is notified
-    AtomicValue<bool> notifySent;
+    std::atomic<bool> notifySent;
 };
 
 class Producer : public ConnHandler, public Notifiable {
@@ -805,8 +809,6 @@ public:
 
     virtual void clearQueues() = 0;
 
-    virtual void appendQueue(std::list<queued_item> *q) = 0;
-
     virtual size_t getBackfillQueueSize() = 0;
 
     void incrBackfillRemaining(size_t incr) {
@@ -829,7 +831,7 @@ protected:
     friend class ConnMap;
 
     //! Lock held during queue operations.
-    Mutex queueLock;
+    std::mutex queueLock;
     //! Filter for the vbuckets we want.
     VBucketFilter vbucketFilter;
     //! Total backfill backlogs
@@ -855,13 +857,12 @@ public:
         delete queue;
         delete []specificData;
         delete []transmitted;
-        cb_assert(!isReserved());
     }
 
     virtual void addStats(ADD_STAT add_stat, const void *c);
     virtual void processedEvent(uint16_t event, ENGINE_ERROR_CODE ret);
 
-    void aggregateQueueStats(ConnCounter* stats_aggregator);
+    void aggregateQueueStats(ConnCounter& stats_aggregator);
 
     void suspendedConnection_UNLOCKED(bool value);
     void suspendedConnection(bool value);
@@ -940,6 +941,11 @@ public:
         clearQueues_UNLOCKED();
     }
 
+    bool shouldDisconnect(rel_time_t now) {
+        LockHolder lh(queueLock);
+        return supportsAck() && (getExpiryTime() < now) && windowIsFull();
+    }
+
     static const char* opaqueCmdToString(uint32_t opaque_code);
 
 protected:
@@ -993,7 +999,6 @@ protected:
             TapLogElement log(seqno, qi);
             ackLog_.push_back(log);
             stats.memOverhead.fetch_add(sizeof(TapLogElement));
-            cb_assert(stats.memOverhead.load() < GIGANTOR);
         }
     }
 
@@ -1008,7 +1013,6 @@ protected:
             TapLogElement log(seqno, e);
             ackLog_.push_back(log);
             stats.memOverhead.fetch_add(sizeof(TapLogElement));
-            cb_assert(stats.memOverhead.load() < GIGANTOR);
         }
     }
 
@@ -1327,7 +1331,7 @@ protected:
     std::list<TapLogElement> ackLog_;
 
     //! Keeps track of items transmitted per VBucket
-    AtomicValue<size_t> *transmitted;
+    std::atomic<size_t> *transmitted;
 
     //! VBucket status messages immediately (before userdata)
     std::queue<VBucketEvent> vBucketHighPriority;
@@ -1346,7 +1350,7 @@ protected:
     //! Number of records fetched from this stream since the
     size_t recordsFetched;
     //! Number of records skipped due to changing the filter on the connection
-    AtomicValue<size_t> recordsSkipped;
+    std::atomic<size_t> recordsSkipped;
     //! Do we have a pending flush command?
     bool pendingFlush;
     //! Backfill age for the connection
@@ -1371,15 +1375,15 @@ protected:
     //! vbuckets that are being backfilled by the current backfill session
     std::set<uint16_t> backfillVBuckets;
 
-    AtomicValue<size_t> bgResultSize;
-    AtomicValue<size_t> bgJobIssued;
-    AtomicValue<size_t> bgJobCompleted;
-    AtomicValue<size_t> numTapNack;
-    AtomicValue<size_t> queueMemSize;
-    AtomicValue<size_t> queueFill;
-    AtomicValue<size_t> queueDrain;
-    AtomicValue<size_t> checkpointMsgCounter;
-    AtomicValue<size_t> opaqueMsgCounter;
+    std::atomic<size_t> bgResultSize;
+    std::atomic<size_t> bgJobIssued;
+    std::atomic<size_t> bgJobCompleted;
+    std::atomic<size_t> numTapNack;
+    std::atomic<size_t> queueMemSize;
+    std::atomic<size_t> queueFill;
+    std::atomic<size_t> queueDrain;
+    std::atomic<size_t> checkpointMsgCounter;
+    std::atomic<size_t> opaqueMsgCounter;
 
     //! Current tap sequence number (for ack's)
     uint32_t seqno;
@@ -1396,13 +1400,13 @@ protected:
     //! Textual representation of the flags..
     std::string flagsText;
 
-    AtomicValue<rel_time_t> lastMsgTime;
+    std::atomic<rel_time_t> lastMsgTime;
 
     bool isLastAckSucceed;
     bool isSeqNumRotated;
 
     //! Should we send a NOOP message now?
-    AtomicValue<bool> noop;
+    std::atomic<bool> noop;
     size_t numNoops;
 
     //! Does the Tap Consumer know about the byteorder bug for the flags

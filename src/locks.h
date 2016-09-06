@@ -1,6 +1,6 @@
 /* -*- Mode: C++; tab-width: 4; c-basic-offset: 4; indent-tabs-mode: nil -*- */
 /*
- *     Copyright 2010 Couchbase, Inc
+ *     Copyright 2015 Couchbase, Inc
  *
  *   Licensed under the Apache License, Version 2.0 (the "License");
  *   you may not use this file except in compliance with the License.
@@ -21,13 +21,13 @@
 #include "config.h"
 
 #include <functional>
+#include <mutex>
 #include <iostream>
 #include <sstream>
 #include <stdexcept>
 
-#include "common.h"
-#include "mutex.h"
-#include "syncobject.h"
+#include "rwlock.h"
+#include "utility.h"
 
 /**
  * RAII lock holder to guarantee release of the lock.
@@ -37,10 +37,13 @@
  */
 class LockHolder {
 public:
+
+    typedef std::mutex mutex_type;
+
     /**
      * Acquire the lock in the given mutex.
      */
-    LockHolder(Mutex &m, bool tryLock = false) : mutex(m), locked(false) {
+    LockHolder(std::mutex &m, bool tryLock = false) : mutex(m), locked(false) {
         if (tryLock) {
             trylock();
         } else {
@@ -67,7 +70,7 @@ public:
      * Relock a lock that was manually unlocked.
      */
     void lock() {
-        mutex.acquire();
+        mutex.lock();
         locked = true;
     }
 
@@ -75,7 +78,7 @@ public:
      * Retry to acquire a lock due to initial failure or manual unlock.
      */
     bool trylock() {
-        locked = mutex.tryAcquire();
+        locked = mutex.try_lock();
         return locked;
     }
 
@@ -92,16 +95,18 @@ public:
     void unlock() {
         if (locked) {
             locked = false;
-            mutex.release();
+            mutex.unlock();
         }
     }
 
 private:
-    Mutex &mutex;
+    std::mutex &mutex;
     bool locked;
 
     void operator=(const LockHolder&);
 };
+#define LockHolder(x) \
+    static_assert(false, "LockHolder: missing variable name for scoped lock.")
 
 /**
  * RAII lock holder over multiple locks.
@@ -115,7 +120,7 @@ public:
      * @param m beginning of an array of locks
      * @param n the number of locks to lock
      */
-    MultiLockHolder(Mutex *m, size_t n) : mutexes(m),
+    MultiLockHolder(std::mutex *m, size_t n) : mutexes(m),
                                           locked(new bool[n]),
                                           n_locks(n) {
         std::fill_n(locked, n_locks, false);
@@ -132,8 +137,12 @@ public:
      */
     void lock() {
         for (size_t i = 0; i < n_locks; i++) {
-            cb_assert(!locked[i]);
-            mutexes[i].acquire();
+            if (locked[i]) {
+                throw std::logic_error("MultiLockHolder::lock: mutex " +
+                                       std::to_string(i) +
+                                       " is already locked");
+            }
+            mutexes[i].lock();
             locked[i] = true;
         }
     }
@@ -145,17 +154,176 @@ public:
         for (size_t i = 0; i < n_locks; i++) {
             if (locked[i]) {
                 locked[i] = false;
-                mutexes[i].release();
+                mutexes[i].unlock();
             }
         }
     }
 
 private:
-    Mutex  *mutexes;
+    std::mutex  *mutexes;
     bool   *locked;
     size_t  n_locks;
 
     DISALLOW_COPY_AND_ASSIGN(MultiLockHolder);
+};
+#define MultiLockHolder(x) \
+    static_assert(false, "MultiLockHolder: missing variable name for scoped lock.")
+
+// RAII Reader lock
+class ReaderLockHolder {
+public:
+    typedef RWLock mutex_type;
+
+    ReaderLockHolder(RWLock& lock)
+      :  rwLock(lock) {
+        int locked = rwLock.readerLock();
+        if (locked != 0) {
+            char exceptionMsg[64];
+            snprintf(exceptionMsg, sizeof(exceptionMsg),
+                     "%d returned by readerLock()", locked);
+            throw std::runtime_error(exceptionMsg);
+        }
+    }
+
+    ~ReaderLockHolder() {
+        int unlocked = rwLock.readerUnlock();
+        if (unlocked != 0) {
+            char exceptionMsg[64];
+            snprintf(exceptionMsg, sizeof(exceptionMsg),
+                     "%d returned by readerUnlock()", unlocked);
+            throw std::runtime_error(exceptionMsg);
+        }
+    }
+
+private:
+    RWLock& rwLock;
+
+    DISALLOW_COPY_AND_ASSIGN(ReaderLockHolder);
+};
+#define ReaderLockHolder(x) \
+    static_assert(false, "ReaderLockHolder: missing variable name for scoped lock.")
+
+// RAII Writer lock
+class WriterLockHolder {
+public:
+    typedef RWLock mutex_type;
+
+    WriterLockHolder(RWLock& lock)
+      :  rwLock(lock) {
+        int locked = rwLock.writerLock();
+        if (locked != 0) {
+            char exceptionMsg[64];
+            snprintf(exceptionMsg, sizeof(exceptionMsg),
+                     "%d returned by writerLock()", locked);
+            throw std::runtime_error(exceptionMsg);
+        }
+    }
+
+    ~WriterLockHolder() {
+        int unlocked = rwLock.writerUnlock();
+        if (unlocked != 0) {
+            char exceptionMsg[64];
+            snprintf(exceptionMsg, sizeof(exceptionMsg),
+                     "%d returned by writerUnlock()", unlocked);
+            throw std::runtime_error(exceptionMsg);
+        }
+    }
+
+private:
+    RWLock& rwLock;
+
+    DISALLOW_COPY_AND_ASSIGN(WriterLockHolder);
+};
+#define WriterLockHolder(x) \
+    static_assert(false, "WriterLockHolder: missing variable name for scoped lock.")
+
+/**
+ * Lock holder wrapper to assist to debugging locking issues - Logs when the
+ * time taken to acquire a lock, or the duration a lock is held exceeds the
+ * specified thresholds.
+ *
+ * Implemented as a template class around a RAII-style lock holder:
+ *
+ *   T - underlying lock holder type (LockHolder, ReaderLockHolder etc).
+ *   ACQUIRE_MS - Report instances when it takes longer than this to acquire a
+ *                lock.
+ *   HELD_MS - Report instance when a lock is held (locked) for longer than
+ *             this.
+ *
+ * Usage:
+ * To debug a single lock holder - wrap the class with a LockTimer<>, adding
+ * a lock name as an additional argument - e.g.
+ *
+ *   LockHolder lh(mutex)
+ *
+ * becomes:
+ *
+ *   LockTimer<LockHolder> lh(mutex, "my_func_lockholder")
+ *
+ */
+template <typename T,
+          size_t ACQUIRE_MS = 100,
+          size_t HELD_MS = 100>
+class LockTimer {
+public:
+
+    /** Create a new LockTimer, acquiring the underlying lock.
+     *  If it takes longer than ACQUIRE_MS to acquire the lock then report to
+     *  the log file.
+     *  @param m underlying mutex to acquire
+     *  @param name_ A name for this mutex, used in log messages.
+     */
+    LockTimer(typename T::mutex_type& m, const char* name_)
+        : name(name_),
+          start(gethrtime()),
+          lock_holder(m) {
+
+        acquired = gethrtime();
+        const uint64_t msec = (acquired - start) / 1000000;
+        if (msec > ACQUIRE_MS) {
+            LOG(EXTENSION_LOG_WARNING,
+                "LockHolder<%s> Took too long to acquire lock: %" PRIu64 " ms",
+                name, msec);
+        }
+    }
+
+    /** Destroy the DebugLockHolder releasing the underlying lock.
+     *  If the lock was held for longer than HELS_MS to then report to the
+     *  log file.
+     */
+    ~LockTimer() {
+        check_held_duration();
+        // upon destruction the lock_holder will also be destroyed and hence
+        // unlocked...
+    }
+
+    /* explicitly unlock the lock */
+    void unlock() {
+        check_held_duration();
+        lock_holder.unlock();
+    }
+
+private:
+
+    void check_held_duration() {
+        const hrtime_t released = gethrtime();
+        const uint64_t msec = (released - acquired) / 1000000;
+        if (msec > HELD_MS) {
+            LOG(EXTENSION_LOG_WARNING, "LockHolder<%s> Held lock for too long: "
+                    "%" PRIu64 " ms", name, msec);
+        }
+    }
+
+    const char* name;
+
+    // Time when lock acquisition started.
+    hrtime_t start;
+
+    // Time when we completed acquiring the lock.
+    hrtime_t acquired;
+
+    // The underlying 'real' lock holder we are wrapping.
+    T lock_holder;
 };
 
 #endif  // SRC_LOCKS_H_

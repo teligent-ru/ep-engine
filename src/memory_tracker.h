@@ -20,11 +20,15 @@
 
 #include "config.h"
 
+#include <atomic>
+#include <condition_variable>
 #include <map>
+#include <mutex>
 #include <string>
 
-#include "atomic.h"
-#include "common.h"
+#include <memcached/allocator_hooks.h>
+
+#include <atomic>
 
 /**
  * This class is used by ep-engine to hook into memcached's memory tracking
@@ -34,7 +38,8 @@ class MemoryTracker {
 public:
     ~MemoryTracker();
 
-    static MemoryTracker *getInstance();
+    static MemoryTracker* getInstance();
+    static void destroyInstance();
 
     void getAllocatorStats(std::map<std::string, size_t> &alloc_stats);
 
@@ -53,12 +58,22 @@ public:
 private:
     MemoryTracker();
 
+    // Function for the stats updater main loop.
+    static void statsThreadMainLoop(void* arg);
+
     // Wheter or not we have the ability to accurately track memory allocations
     static bool tracking;
-    // Singleton memory tracker
-    static MemoryTracker *instance;
+    // Singleton memory tracker and mutex guarding it's creation.
+    static std::atomic<MemoryTracker*> instance;
+    static std::mutex instance_mutex;
+
     cb_thread_t statsThreadId;
     allocator_stats stats;
+
+    // Mutex guarding the shutdown condvar.
+    std::mutex mutex;
+    // Condition variable used to signal shutdown to the stats thread.
+    std::condition_variable shutdown_cv;
 };
 
 #endif  // SRC_MEMORY_TRACKER_H_

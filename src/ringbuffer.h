@@ -23,7 +23,7 @@
 #include <algorithm>
 #include <vector>
 
-#include "common.h"
+#include "utility.h"
 
 /**
  * A RingBuffer holds a fixed number of elements of type T.
@@ -42,6 +42,9 @@ public:
     ~RingBuffer() {
         delete[] storage;
     }
+
+    RingBuffer(const RingBuffer&) = delete;
+    RingBuffer& operator=(const RingBuffer&) = delete;
 
     /**
      * How many elements are currently stored in this ring buffer?
@@ -66,7 +69,7 @@ public:
      */
     void reset() {
         pos = 0;
-        wrapped = 0;
+        wrapped = false;
     }
 
     /**
@@ -74,16 +77,14 @@ public:
      */
     std::vector<T> contents() {
         std::vector<T> rv;
-        size_t lpos = pos; // snapshot the position, wrapped for consistency
-        size_t lwrapped = wrapped;
-        size_t lsize = lwrapped ? max : lpos;
+        size_t lsize = wrapped ? max : pos;
         rv.resize(lsize);
         size_t copied(0);
-        if (lwrapped && lpos != max) {
-            std::copy(storage + lpos, storage + max, rv.begin());
-            copied = max - lpos;
+        if (wrapped && pos != max) {
+            std::copy(storage + pos, storage + max, rv.begin());
+            copied = max - pos;
         }
-        std::copy(storage, storage + lpos, rv.begin() + copied);
+        std::copy(storage, storage + pos, rv.begin() + copied);
         return rv;
     }
 
@@ -92,8 +93,6 @@ private:
     size_t pos;
     size_t max;
     bool wrapped;
-
-    DISALLOW_COPY_AND_ASSIGN(RingBuffer);
 };
 
 #endif  // SRC_RINGBUFFER_H_

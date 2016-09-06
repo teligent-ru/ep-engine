@@ -18,20 +18,24 @@
 #include "config.h"
 
 #include <algorithm>
+#include <platform/checked_snprintf.h>
 #include <queue>
 #include <sstream>
 
+#include "ep_engine.h"
 #include "statwriter.h"
 #include "taskqueue.h"
 #include "executorpool.h"
 #include "executorthread.h"
 
-Mutex ExecutorPool::initGuard;
-ExecutorPool *ExecutorPool::instance = NULL;
+std::mutex ExecutorPool::initGuard;
+std::atomic<ExecutorPool*> ExecutorPool::instance;
 
 static const size_t EP_MIN_NUM_THREADS    = 10;
 static const size_t EP_MIN_READER_THREADS = 4;
 static const size_t EP_MIN_WRITER_THREADS = 4;
+static const size_t EP_MIN_NONIO_THREADS = 2;
+
 
 static const size_t EP_MAX_READER_THREADS = 12;
 static const size_t EP_MAX_WRITER_THREADS = 8;
@@ -52,15 +56,13 @@ size_t ExecutorPool::getNumCPU(void) {
 }
 
 size_t ExecutorPool::getNumNonIO(void) {
-    // 1. compute: ceil of 10% of total threads
-    size_t count = maxGlobalThreads / 10;
-    if (!count || maxGlobalThreads % 10) {
-        count++;
-    }
+    // 1. compute: 30% of total threads
+    size_t count = maxGlobalThreads * 0.3;
+
     // 2. adjust computed value to be within range
-    if (count > EP_MAX_NONIO_THREADS) {
-        count = EP_MAX_NONIO_THREADS;
-    }
+    count = std::min(EP_MAX_NONIO_THREADS,
+                     std::max(EP_MIN_NONIO_THREADS, count));
+
     // 3. pick user's value if specified
     if (maxWorkers[NONIO_TASK_IDX]) {
         count = maxWorkers[NONIO_TASK_IDX];
@@ -127,21 +129,36 @@ size_t ExecutorPool::getNumReaders(void) {
 }
 
 ExecutorPool *ExecutorPool::get(void) {
-    if (!instance) {
+    auto* tmp = instance.load();
+    if (tmp == nullptr) {
         LockHolder lh(initGuard);
-        if (!instance) {
+        tmp = instance.load();
+        if (tmp == nullptr) {
+            // Double-checked locking if instance is null - ensure two threads
+            // don't both create an instance.
+
             Configuration &config =
                 ObjectRegistry::getCurrentEngine()->getConfiguration();
             EventuallyPersistentEngine *epe =
                                    ObjectRegistry::onSwitchThread(NULL, true);
-            instance = new ExecutorPool(config.getMaxThreads(),
+            tmp = new ExecutorPool(config.getMaxThreads(),
                     NUM_TASK_GROUPS, config.getMaxNumReaders(),
                     config.getMaxNumWriters(), config.getMaxNumAuxio(),
                     config.getMaxNumNonio());
             ObjectRegistry::onSwitchThread(epe);
+            instance.store(tmp);
         }
     }
-    return instance;
+    return tmp;
+}
+
+void ExecutorPool::shutdown(void) {
+    std::lock_guard<std::mutex> lock(initGuard);
+    auto* tmp = instance.load();
+    if (tmp != nullptr) {
+        delete tmp;
+        instance = nullptr;
+    }
 }
 
 ExecutorPool::ExecutorPool(size_t maxThreads, size_t nTaskSets,
@@ -155,9 +172,9 @@ ExecutorPool::ExecutorPool(size_t maxThreads, size_t nTaskSets,
     numThreads = (numThreads < EP_MIN_NUM_THREADS) ?
                         EP_MIN_NUM_THREADS : numThreads;
     maxGlobalThreads = maxThreads ? maxThreads : numThreads;
-    curWorkers  = new AtomicValue<uint16_t>[nTaskSets];
-    maxWorkers  = new AtomicValue<uint16_t>[nTaskSets];
-    numReadyTasks  = new AtomicValue<size_t>[nTaskSets];
+    curWorkers  = new std::atomic<uint16_t>[nTaskSets];
+    maxWorkers  = new std::atomic<uint16_t>[nTaskSets];
+    numReadyTasks  = new std::atomic<size_t>[nTaskSets];
     for (size_t i = 0; i < nTaskSets; i++) {
         curWorkers[i] = 0;
         numReadyTasks[i] = 0;
@@ -169,8 +186,12 @@ ExecutorPool::ExecutorPool(size_t maxThreads, size_t nTaskSets,
 }
 
 ExecutorPool::~ExecutorPool(void) {
+    _stopAndJoinThreads();
+
     delete [] curWorkers;
-    free(maxWorkers);
+    delete[] maxWorkers;
+    delete[] numReadyTasks;
+
     if (isHiPrioQset) {
         for (size_t i = 0; i < numTaskSets; i++) {
             delete hpTaskQ[i];
@@ -240,7 +261,10 @@ void ExecutorPool::addWork(size_t newWork, task_type_t qType) {
 }
 
 void ExecutorPool::lessWork(task_type_t qType) {
-    cb_assert(numReadyTasks[qType].load());
+    if (numReadyTasks[qType].load() == 0) {
+        throw std::logic_error("ExecutorPool::lessWork: number of ready "
+                "tasks on qType " + std::to_string(qType) + " is zero");
+    }
     numReadyTasks[qType]--;
     totReadyTasks--;
 }
@@ -250,6 +274,10 @@ void ExecutorPool::doneWork(task_type_t &curTaskType) {
         // Record that a thread is done working on a particular queue type
         LOG(EXTENSION_LOG_DEBUG, "Done with Task Type %d capacity = %d",
                 curTaskType, curWorkers[curTaskType].load());
+        if (!curWorkers[curTaskType].load()) {
+            throw std::logic_error("ExecutorPool::doneWork: underflow in "
+                "queue " + std::to_string(curTaskType));
+        }
         curWorkers[curTaskType]--;
         curTaskType = NO_TASK_TYPE;
     }
@@ -281,23 +309,28 @@ bool ExecutorPool::_cancel(size_t taskId, bool eraseTask) {
     LockHolder lh(tMutex);
     std::map<size_t, TaskQpair>::iterator itr = taskLocator.find(taskId);
     if (itr == taskLocator.end()) {
-        LOG(EXTENSION_LOG_DEBUG, "Task id %d not found");
+        LOG(EXTENSION_LOG_DEBUG, "Task id %" PRIu64 " not found",
+            uint64_t(taskId));
         return false;
     }
 
     ExTask task = itr->second.first;
-    LOG(EXTENSION_LOG_DEBUG, "Cancel task %s id %d on bucket %s %s",
-            task->getDescription().c_str(), task->getId(),
-            task->getEngine()->getName(), eraseTask ? "final erase" : "!");
+    LOG(EXTENSION_LOG_DEBUG, "Cancel task %s id %" PRIu64 " on bucket %s %s",
+            task->getDescription().c_str(), uint64_t(task->getId()),
+            task->getTaskable().getName().c_str(), eraseTask ? "final erase" : "!");
 
     task->cancel(); // must be idempotent, just set state to dead
 
     if (eraseTask) { // only internal threads can erase tasks
-        cb_assert(task->isdead());
+        if (!task->isdead()) {
+            throw std::logic_error("ExecutorPool::_cancel: task '"
+                    + task->getDescription() + "' is not dead after calling "
+                            "cancel() on it");
+        }
         taskLocator.erase(itr);
-        tMutex.notify();
+        tMutex.notify_all();
     } else { // wake up the task from the TaskQ so a thread can safely erase it
-             // otherwise we may race with unregisterBucket where a unlocated
+             // otherwise we may race with unregisterTaskable where a unlocated
              // task runs in spite of its bucket getting unregistered
         itr->second.second->wake(task);
     }
@@ -328,36 +361,41 @@ bool ExecutorPool::wake(size_t taskId) {
     return rv;
 }
 
-bool ExecutorPool::_snooze(size_t taskId, double tosleep) {
+bool ExecutorPool::_snooze(size_t taskId, double toSleep) {
     LockHolder lh(tMutex);
     std::map<size_t, TaskQpair>::iterator itr = taskLocator.find(taskId);
     if (itr != taskLocator.end()) {
-        itr->second.first->snooze(tosleep);
+        itr->second.second->snooze(itr->second.first, toSleep);
         return true;
     }
     return false;
 }
 
-bool ExecutorPool::snooze(size_t taskId, double tosleep) {
+bool ExecutorPool::snooze(size_t taskId, double toSleep) {
     EventuallyPersistentEngine *epe = ObjectRegistry::onSwitchThread(NULL, true);
-    bool rv = _snooze(taskId, tosleep);
+    bool rv = _snooze(taskId, toSleep);
     ObjectRegistry::onSwitchThread(epe);
     return rv;
 }
 
-TaskQueue* ExecutorPool::_getTaskQueue(EventuallyPersistentEngine *e,
+TaskQueue* ExecutorPool::_getTaskQueue(const Taskable& t,
                                        task_type_t qidx) {
     TaskQueue         *q             = NULL;
     size_t            curNumThreads  = 0;
-    bucket_priority_t bucketPriority = e->getWorkloadPriority();
 
-    cb_assert(0 <= (int)qidx && (size_t)qidx < numTaskSets);
+    bucket_priority_t bucketPriority = t.getWorkloadPriority();
+
+    if (qidx < 0 || static_cast<size_t>(qidx) >= numTaskSets) {
+        throw std::invalid_argument("ExecutorPool::_getTaskQueue: qidx "
+                "(which is " + std::to_string(qidx) + ") is outside the range [0,"
+                + std::to_string(numTaskSets) + ")");
+    }
 
     curNumThreads = threadQ.size();
 
     if (!bucketPriority) {
         LOG(EXTENSION_LOG_WARNING, "Trying to schedule task for unregistered "
-            "bucket %s", e->getName());
+            "bucket %s", t.getName().c_str());
         return q;
     }
 
@@ -368,12 +406,30 @@ TaskQueue* ExecutorPool::_getTaskQueue(EventuallyPersistentEngine *e,
             q = lpTaskQ[qidx];
         }
     } else { // Max capacity Mode scheduling ...
-        if (bucketPriority == LOW_BUCKET_PRIORITY) {
-            cb_assert(lpTaskQ.size() == numTaskSets);
+        switch (bucketPriority) {
+        case LOW_BUCKET_PRIORITY:
+            if (lpTaskQ.size() != numTaskSets) {
+                throw std::logic_error("ExecutorPool::_getTaskQueue: At "
+                        "maximum capacity but low-priority taskQ size "
+                        "(which is " + std::to_string(lpTaskQ.size()) +
+                        ") is not " + std::to_string(numTaskSets));
+            }
             q = lpTaskQ[qidx];
-        } else {
-            cb_assert(hpTaskQ.size() == numTaskSets);
+            break;
+
+        case HIGH_BUCKET_PRIORITY:
+            if (hpTaskQ.size() != numTaskSets) {
+                throw std::logic_error("ExecutorPool::_getTaskQueue: At "
+                        "maximum capacity but high-priority taskQ size "
+                        "(which is " + std::to_string(lpTaskQ.size()) +
+                        ") is not " + std::to_string(numTaskSets));
+            }
             q = hpTaskQ[qidx];
+            break;
+
+        default:
+            throw std::logic_error("ExecutorPool::_getTaskQueue: Invalid "
+                    "bucketPriority " + std::to_string(bucketPriority));
         }
     }
     return q;
@@ -381,7 +437,7 @@ TaskQueue* ExecutorPool::_getTaskQueue(EventuallyPersistentEngine *e,
 
 size_t ExecutorPool::_schedule(ExTask task, task_type_t qidx) {
     LockHolder lh(tMutex);
-    TaskQueue *q = _getTaskQueue(task->getEngine(), qidx);
+    TaskQueue *q = _getTaskQueue(task->getTaskable(), qidx);
     TaskQpair tqp(task, q);
     taskLocator[task->getId()] = tqp;
 
@@ -397,27 +453,27 @@ size_t ExecutorPool::schedule(ExTask task, task_type_t qidx) {
     return rv;
 }
 
-void ExecutorPool::_registerBucket(EventuallyPersistentEngine *engine) {
+void ExecutorPool::_registerTaskable(Taskable& taskable) {
     TaskQ *taskQ;
     bool *whichQset;
     const char *queueName;
-    WorkLoadPolicy &workload = engine->getWorkLoadPolicy();
+    WorkLoadPolicy &workload = taskable.getWorkLoadPolicy();
     bucket_priority_t priority = workload.getBucketPriority();
 
     if (priority < HIGH_BUCKET_PRIORITY) {
-        engine->setWorkloadPriority(LOW_BUCKET_PRIORITY);
+        taskable.setWorkloadPriority(LOW_BUCKET_PRIORITY);
         taskQ = &lpTaskQ;
         whichQset = &isLowPrioQset;
         queueName = "LowPrioQ_";
-        LOG(EXTENSION_LOG_WARNING, "Bucket %s registered with low priority",
-            engine->getName());
+        LOG(EXTENSION_LOG_NOTICE, "Taskable %s registered with low priority",
+            taskable.getName().c_str());
     } else {
-        engine->setWorkloadPriority(HIGH_BUCKET_PRIORITY);
+        taskable.setWorkloadPriority(HIGH_BUCKET_PRIORITY);
         taskQ = &hpTaskQ;
         whichQset = &isHiPrioQset;
         queueName = "HiPrioQ_";
-        LOG(EXTENSION_LOG_WARNING, "Bucket %s registered with high priority",
-            engine->getName());
+        LOG(EXTENSION_LOG_NOTICE, "Taskable %s registered with high priority",
+            taskable.getName().c_str());
     }
 
     LockHolder lh(tMutex);
@@ -430,15 +486,15 @@ void ExecutorPool::_registerBucket(EventuallyPersistentEngine *engine) {
         *whichQset = true;
     }
 
-    buckets.insert(engine);
+    taskOwners.insert(&taskable);
     numBuckets++;
 
     _startWorkers();
 }
 
-void ExecutorPool::registerBucket(EventuallyPersistentEngine *engine) {
+void ExecutorPool::registerTaskable(Taskable& taskable) {
     EventuallyPersistentEngine *epe = ObjectRegistry::onSwitchThread(NULL, true);
-    _registerBucket(engine);
+    _registerTaskable(taskable);
     ObjectRegistry::onSwitchThread(epe);
 }
 
@@ -455,7 +511,7 @@ bool ExecutorPool::_startWorkers(void) {
     std::stringstream ss;
     ss << "Spawning " << numReaders << " readers, " << numWriters <<
     " writers, " << numAuxIO << " auxIO, " << numNonIO << " nonIO threads";
-    LOG(EXTENSION_LOG_WARNING, ss.str().c_str());
+    LOG(EXTENSION_LOG_NOTICE, "%s", ss.str().c_str());
 
     for (size_t tidx = 0; tidx < numReaders; ++tidx) {
         std::stringstream ss;
@@ -498,26 +554,29 @@ bool ExecutorPool::_startWorkers(void) {
     return true;
 }
 
-bool ExecutorPool::_stopTaskGroup(EventuallyPersistentEngine *e,
-                                  task_type_t taskType) {
+bool ExecutorPool::_stopTaskGroup(task_gid_t taskGID,
+                                  task_type_t taskType,
+                                  bool force) {
     bool unfinishedTask;
     bool retVal = false;
     std::map<size_t, TaskQpair>::iterator itr;
 
-    LockHolder lh(tMutex);
-    LOG(EXTENSION_LOG_DEBUG, "Stopping %d type tasks in bucket %s", taskType,
-            e->getName());
+    std::unique_lock<std::mutex> lh(tMutex);
     do {
         ExTask task;
         unfinishedTask = false;
         for (itr = taskLocator.begin(); itr != taskLocator.end(); itr++) {
             task = itr->second.first;
             TaskQueue *q = itr->second.second;
-            if (task->getEngine() == e &&
+            if (task->getTaskable().getGID() == taskGID &&
                 (taskType == NO_TASK_TYPE || q->queueType == taskType)) {
-                LOG(EXTENSION_LOG_DEBUG, "Stopping Task id %d %s ",
-                        task->getId(), task->getDescription().c_str());
-                if (!task->blockShutdown) {
+                LOG(EXTENSION_LOG_WARNING, "Stopping Task id %" PRIu64 " %s %s ",
+                    uint64_t(task->getId()),
+                    task->getTaskable().getName().c_str(),
+                    task->getDescription().c_str());
+                // If force flag is set during shutdown, cancel all tasks
+                // without considering the blockShutdown status of the task.
+                if (force || !task->blockShutdown) {
                     task->cancel(); // Must be idempotent
                 }
                 q->wake(task);
@@ -526,36 +585,37 @@ bool ExecutorPool::_stopTaskGroup(EventuallyPersistentEngine *e,
             }
         }
         if (unfinishedTask) {
-            struct timeval waktime;
-            gettimeofday(&waktime, NULL);
-            advance_tv(waktime, MIN_SLEEP_TIME);
-            tMutex.wait(waktime); // Wait till task gets cancelled
+            tMutex.wait_for(lh, MIN_SLEEP_TIME); // Wait till task gets cancelled
         }
     } while (unfinishedTask);
 
     return retVal;
 }
 
-bool ExecutorPool::stopTaskGroup(EventuallyPersistentEngine *e,
-                                 task_type_t taskType) {
+bool ExecutorPool::stopTaskGroup(task_gid_t taskGID,
+                                 task_type_t taskType,
+                                 bool force) {
     EventuallyPersistentEngine *epe = ObjectRegistry::onSwitchThread(NULL, true);
-    bool rv = _stopTaskGroup(e, taskType);
+    bool rv = _stopTaskGroup(taskGID, taskType, force);
     ObjectRegistry::onSwitchThread(epe);
     return rv;
 }
 
-void ExecutorPool::_unregisterBucket(EventuallyPersistentEngine *engine) {
+void ExecutorPool::_unregisterTaskable(Taskable& taskable, bool force) {
 
-    LOG(EXTENSION_LOG_WARNING, "Unregistering %s bucket %s",
-            (numBuckets == 1)? "last" : "", engine->getName());
+    LOG(EXTENSION_LOG_NOTICE, "Unregistering %s taskable %s",
+            (numBuckets == 1)? "last" : "", taskable.getName().c_str());
 
-    _stopTaskGroup(engine, NO_TASK_TYPE);
+    _stopTaskGroup(taskable.getGID(), NO_TASK_TYPE, force);
 
     LockHolder lh(tMutex);
-
-    buckets.erase(engine);
+    taskOwners.erase(&taskable);
     if (!(--numBuckets)) {
-        assert (!taskLocator.size());
+        if (taskLocator.size()) {
+            throw std::logic_error("ExecutorPool::_unregisterTaskable: "
+                    "Attempting to unregister taskable '" +
+                    taskable.getName() + "' but taskLocator is not empty");
+        }
         for (unsigned int idx = 0; idx < numTaskSets; idx++) {
             TaskQueue *sleepQ = getSleepQ(idx);
             size_t wakeAll = threadQ.size();
@@ -598,10 +658,11 @@ void ExecutorPool::_unregisterBucket(EventuallyPersistentEngine *engine) {
     }
 }
 
-void ExecutorPool::unregisterBucket(EventuallyPersistentEngine *engine) {
-    EventuallyPersistentEngine *epe = ObjectRegistry::onSwitchThread(NULL, true);
-    _unregisterBucket(engine);
-    ObjectRegistry::onSwitchThread(epe);
+void ExecutorPool::unregisterTaskable(Taskable& taskable, bool force) {
+    // Note: unregistering a bucket is special - any memory allocations /
+    // deallocations made while unregistering *should* be accounted to the
+    // bucket in question - hence no `onSwitchThread(NULL)` call.
+    _unregisterTaskable(taskable, force);
 }
 
 void ExecutorPool::doTaskQStat(EventuallyPersistentEngine *engine,
@@ -611,42 +672,58 @@ void ExecutorPool::doTaskQStat(EventuallyPersistentEngine *engine,
     }
 
     EventuallyPersistentEngine *epe = ObjectRegistry::onSwitchThread(NULL, true);
-    char statname[80] = {0};
-    if (isHiPrioQset) {
-        for (size_t i = 0; i < numTaskSets; i++) {
-            snprintf(statname, sizeof(statname), "ep_workload:%s:InQsize",
-                     hpTaskQ[i]->getName().c_str());
-            add_casted_stat(statname, hpTaskQ[i]->getFutureQueueSize(), add_stat,
-                            cookie);
-            snprintf(statname, sizeof(statname), "ep_workload:%s:OutQsize",
-                     hpTaskQ[i]->getName().c_str());
-            add_casted_stat(statname, hpTaskQ[i]->getReadyQueueSize(), add_stat,
-                            cookie);
-            size_t pendingQsize = hpTaskQ[i]->getPendingQueueSize();
-            if (pendingQsize > 0) {
-                snprintf(statname, sizeof(statname), "ep_workload:%s:PendingQ",
-                        hpTaskQ[i]->getName().c_str());
-                add_casted_stat(statname, pendingQsize, add_stat, cookie);
+    try {
+        char statname[80] = {0};
+        if (isHiPrioQset) {
+            for (size_t i = 0; i < numTaskSets; i++) {
+                checked_snprintf(statname, sizeof(statname),
+                                 "ep_workload:%s:InQsize",
+                                 hpTaskQ[i]->getName().c_str());
+                add_casted_stat(statname, hpTaskQ[i]->getFutureQueueSize(),
+                                add_stat,
+                                cookie);
+                checked_snprintf(statname, sizeof(statname),
+                                 "ep_workload:%s:OutQsize",
+                                 hpTaskQ[i]->getName().c_str());
+                add_casted_stat(statname, hpTaskQ[i]->getReadyQueueSize(),
+                                add_stat,
+                                cookie);
+                size_t pendingQsize = hpTaskQ[i]->getPendingQueueSize();
+                if (pendingQsize > 0) {
+                    checked_snprintf(statname, sizeof(statname),
+                                     "ep_workload:%s:PendingQ",
+                                     hpTaskQ[i]->getName().c_str());
+                    add_casted_stat(statname, pendingQsize, add_stat, cookie);
+                }
             }
         }
-    }
-    if (isLowPrioQset) {
-        for (size_t i = 0; i < numTaskSets; i++) {
-            snprintf(statname, sizeof(statname), "ep_workload:%s:InQsize",
-                     lpTaskQ[i]->getName().c_str());
-            add_casted_stat(statname, lpTaskQ[i]->getFutureQueueSize(), add_stat,
-                            cookie);
-            snprintf(statname, sizeof(statname), "ep_workload:%s:OutQsize",
-                     lpTaskQ[i]->getName().c_str());
-            add_casted_stat(statname, lpTaskQ[i]->getReadyQueueSize(), add_stat,
-                            cookie);
-            size_t pendingQsize = lpTaskQ[i]->getPendingQueueSize();
-            if (pendingQsize > 0) {
-                snprintf(statname, sizeof(statname), "ep_workload:%s:PendingQ",
-                        lpTaskQ[i]->getName().c_str());
-                add_casted_stat(statname, pendingQsize, add_stat, cookie);
+        if (isLowPrioQset) {
+            for (size_t i = 0; i < numTaskSets; i++) {
+                checked_snprintf(statname, sizeof(statname),
+                                 "ep_workload:%s:InQsize",
+                                 lpTaskQ[i]->getName().c_str());
+                add_casted_stat(statname, lpTaskQ[i]->getFutureQueueSize(),
+                                add_stat,
+                                cookie);
+                checked_snprintf(statname, sizeof(statname),
+                                 "ep_workload:%s:OutQsize",
+                                 lpTaskQ[i]->getName().c_str());
+                add_casted_stat(statname, lpTaskQ[i]->getReadyQueueSize(),
+                                add_stat,
+                                cookie);
+                size_t pendingQsize = lpTaskQ[i]->getPendingQueueSize();
+                if (pendingQsize > 0) {
+                    checked_snprintf(statname, sizeof(statname),
+                                     "ep_workload:%s:PendingQ",
+                                     lpTaskQ[i]->getName().c_str());
+                    add_casted_stat(statname, pendingQsize, add_stat, cookie);
+                }
             }
         }
+    } catch (std::exception& error) {
+        LOG(EXTENSION_LOG_WARNING,
+            "ExecutorPool::doTaskQStat: Failed to build stats: %s",
+            error.what());
     }
     ObjectRegistry::onSwitchThread(epe);
 }
@@ -656,47 +733,64 @@ static void showJobLog(const char *logname, const char *prefix,
                        const void *cookie, ADD_STAT add_stat) {
     char statname[80] = {0};
     for (size_t i = 0;i < log.size(); ++i) {
-        snprintf(statname, sizeof(statname), "%s:%s:%d:task", prefix,
-                logname, static_cast<int>(i));
-        add_casted_stat(statname, log[i].getName().c_str(), add_stat,
-                        cookie);
-        snprintf(statname, sizeof(statname), "%s:%s:%d:type", prefix,
-                logname, static_cast<int>(i));
-        add_casted_stat(statname,
-                        TaskQueue::taskType2Str(log[i].getTaskType()).c_str(),
-                        add_stat, cookie);
-        snprintf(statname, sizeof(statname), "%s:%s:%d:starttime",
-                prefix, logname, static_cast<int>(i));
-        add_casted_stat(statname, log[i].getTimestamp(), add_stat,
-                cookie);
-        snprintf(statname, sizeof(statname), "%s:%s:%d:runtime",
-                prefix, logname, static_cast<int>(i));
-        add_casted_stat(statname, log[i].getDuration(), add_stat,
-                cookie);
+        try {
+            checked_snprintf(statname, sizeof(statname), "%s:%s:%d:task",
+                             prefix,
+                             logname, static_cast<int>(i));
+            add_casted_stat(statname, log[i].getName().c_str(), add_stat,
+                            cookie);
+            checked_snprintf(statname, sizeof(statname), "%s:%s:%d:type",
+                             prefix,
+                             logname, static_cast<int>(i));
+            add_casted_stat(statname,
+                            TaskQueue::taskType2Str(
+                                log[i].getTaskType()).c_str(),
+                            add_stat, cookie);
+            checked_snprintf(statname, sizeof(statname), "%s:%s:%d:starttime",
+                             prefix, logname, static_cast<int>(i));
+            add_casted_stat(statname, log[i].getTimestamp(), add_stat,
+                            cookie);
+            checked_snprintf(statname, sizeof(statname), "%s:%s:%d:runtime",
+                             prefix, logname, static_cast<int>(i));
+            add_casted_stat(statname, log[i].getDuration(), add_stat,
+                            cookie);
+        } catch (std::exception& error) {
+            LOG(EXTENSION_LOG_WARNING,
+                "showJobLog: Failed to build stats: %s", error.what());
+        }
     }
 }
 
 static void addWorkerStats(const char *prefix, ExecutorThread *t,
                            const void *cookie, ADD_STAT add_stat) {
     char statname[80] = {0};
-    snprintf(statname, sizeof(statname), "%s:state", prefix);
-    add_casted_stat(statname, t->getStateName().c_str(), add_stat, cookie);
-    snprintf(statname, sizeof(statname), "%s:task", prefix);
-    add_casted_stat(statname, t->getTaskName().c_str(), add_stat, cookie);
 
-    if (strcmp(t->getStateName().c_str(), "running") == 0) {
-        snprintf(statname, sizeof(statname), "%s:runtime", prefix);
-        add_casted_stat(statname,
-                (gethrtime() - t->getTaskStart()) / 1000, add_stat, cookie);
+    try {
+        std::string bucketName = t->getTaskableName();
+        if (!bucketName.empty()) {
+            checked_snprintf(statname, sizeof(statname), "%s:bucket", prefix);
+            add_casted_stat(statname, bucketName.c_str(), add_stat, cookie);
+        }
+
+        checked_snprintf(statname, sizeof(statname), "%s:state", prefix);
+        add_casted_stat(statname, t->getStateName().c_str(), add_stat, cookie);
+        checked_snprintf(statname, sizeof(statname), "%s:task", prefix);
+        add_casted_stat(statname, t->getTaskName().c_str(), add_stat, cookie);
+
+        if (strcmp(t->getStateName().c_str(), "running") == 0) {
+            checked_snprintf(statname, sizeof(statname), "%s:runtime", prefix);
+            add_casted_stat(statname,
+                            (gethrtime() - t->getTaskStart()) / 1000, add_stat,
+                            cookie);
+        }
+        checked_snprintf(statname, sizeof(statname), "%s:waketime", prefix);
+        add_casted_stat(statname, t->getWaketime(), add_stat, cookie);
+        checked_snprintf(statname, sizeof(statname), "%s:cur_time", prefix);
+        add_casted_stat(statname, t->getCurTime(), add_stat, cookie);
+    } catch (std::exception& error) {
+        LOG(EXTENSION_LOG_WARNING,
+            "addWorkerStats: Failed to build stats: %s", error.what());
     }
-    snprintf(statname, sizeof(statname), "%s:waketime", prefix);
-    uint64_t abstime = t->getWaketime().tv_sec*1000000 +
-                       t->getWaketime().tv_usec;
-    add_casted_stat(statname, abstime, add_stat, cookie);
-    snprintf(statname, sizeof(statname), "%s:cur_time", prefix);
-    abstime = t->getCurTime().tv_sec*1000000 +
-              t->getCurTime().tv_usec;
-    add_casted_stat(statname, abstime, add_stat, cookie);
 }
 
 void ExecutorPool::doWorkerStat(EventuallyPersistentEngine *engine,
@@ -716,4 +810,27 @@ void ExecutorPool::doWorkerStat(EventuallyPersistentEngine *engine,
                    threadQ[tidx]->getSlowLog(), cookie, add_stat);
     }
     ObjectRegistry::onSwitchThread(epe);
+}
+
+void ExecutorPool::_stopAndJoinThreads() {
+
+    // Ask all threads to stop (but don't wait)
+    for (auto thread : threadQ) {
+        thread->stop(false);
+    }
+
+    // Go over all tasks and wake them up.
+    for (auto tq : lpTaskQ) {
+        size_t wakeAll = threadQ.size();
+        tq->doWake(wakeAll);
+    }
+    for (auto tq : hpTaskQ) {
+        size_t wakeAll = threadQ.size();
+        tq->doWake(wakeAll);
+    }
+
+    // Now reap/join those threads.
+    for (auto thread : threadQ) {
+        thread->stop(true);
+    }
 }

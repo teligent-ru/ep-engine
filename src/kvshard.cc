@@ -19,13 +19,16 @@
 
 #include <functional>
 
+#include "bgfetcher.h"
 #include "ep_engine.h"
 #include "flusher.h"
 #include "kvshard.h"
 
 KVShard::KVShard(uint16_t id, EventuallyPersistentStore &store) :
     shardId(id), highPrioritySnapshot(false),
-    lowPrioritySnapshot(false), highPriorityCount(0)
+    lowPrioritySnapshot(false),
+    kvConfig(store.getEPEngine().getConfiguration(), shardId),
+    highPriorityCount(0)
 {
     EPStats &stats = store.getEPEngine().getEpStats();
     Configuration &config = store.getEPEngine().getConfiguration();
@@ -33,11 +36,19 @@ KVShard::KVShard(uint16_t id, EventuallyPersistentStore &store) :
 
     vbuckets = new RCPtr<VBucket>[maxVbuckets];
 
-    KVStoreConfig kvconfig(config);
-    rwUnderlying = KVStoreFactory::create(kvconfig, false);
-    roUnderlying = KVStoreFactory::create(kvconfig, true);
+    std::string backend = kvConfig.getBackend();
+    uint16_t commitInterval = 1;
 
-    flusher = new Flusher(&store, this);
+    if (backend.compare("couchdb") == 0) {
+        rwUnderlying = KVStoreFactory::create(kvConfig, false);
+        roUnderlying = KVStoreFactory::create(kvConfig, true);
+    } else if (backend.compare("forestdb") == 0) {
+        rwUnderlying = KVStoreFactory::create(kvConfig);
+        roUnderlying = rwUnderlying;
+        commitInterval = config.getMaxVbuckets()/config.getMaxNumShards();
+    }
+
+    flusher = new Flusher(&store, this, commitInterval);
     bgFetcher = new BgFetcher(&store, this, stats);
 }
 
@@ -51,17 +62,16 @@ KVShard::~KVShard() {
     delete bgFetcher;
 
     delete rwUnderlying;
-    delete roUnderlying;
+
+    /* Only couchstore has a read write store and a read only. ForestDB
+     * only has a read write store. Hence delete the read only store only
+     * in the case of couchstore.
+     */
+    if (kvConfig.getBackend().compare("couchdb") == 0) {
+        delete roUnderlying;
+    }
 
     delete[] vbuckets;
-}
-
-KVStore *KVShard::getRWUnderlying() {
-    return rwUnderlying;
-}
-
-KVStore *KVShard::getROUnderlying() {
-    return roUnderlying;
 }
 
 Flusher *KVShard::getFlusher() {
@@ -92,8 +102,8 @@ void KVShard::resetBucket(uint16_t id) {
     vbuckets[id].reset();
 }
 
-std::vector<int> KVShard::getVBucketsSortedByState() {
-    std::vector<int> rv;
+std::vector<VBucket::id_type> KVShard::getVBucketsSortedByState() {
+    std::vector<VBucket::id_type> rv;
     for (int state = vbucket_state_active;
          state <= vbucket_state_dead;
          ++state) {
@@ -107,8 +117,8 @@ std::vector<int> KVShard::getVBucketsSortedByState() {
     return rv;
 }
 
-std::vector<int> KVShard::getVBuckets() {
-    std::vector<int> rv;
+std::vector<VBucket::id_type> KVShard::getVBuckets() {
+    std::vector<VBucket::id_type> rv;
     for (size_t i = 0; i < maxVbuckets; ++i) {
         RCPtr<VBucket> b = vbuckets[i];
         if (b) {
@@ -125,8 +135,7 @@ bool KVShard::setHighPriorityVbSnapshotFlag(bool highPriority) {
 
 bool KVShard::setLowPriorityVbSnapshotFlag(bool lowPriority) {
     bool inverse = !lowPriority;
-    return lowPrioritySnapshot.compare_exchange_strong(inverse,
-                                                       lowPrioritySnapshot);
+    return lowPrioritySnapshot.compare_exchange_strong(inverse, lowPriority);
 }
 
 void NotifyFlusherCB::callback(uint16_t &vb) {

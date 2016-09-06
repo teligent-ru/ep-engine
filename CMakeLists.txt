@@ -11,19 +11,27 @@ INCLUDE(CheckIncludeFiles)
 INCLUDE(CheckLibraryExists)
 INCLUDE(CheckSymbolExists)
 INCLUDE(CheckTypeSize)
+INCLUDE(CTest)
 
 INCLUDE_DIRECTORIES(BEFORE ${CMAKE_INSTALL_PREFIX}/include
-                           ${CMAKE_CURRENT_SOURCE_DIR}/include
                            ${CMAKE_CURRENT_SOURCE_DIR}
                            ${CMAKE_CURRENT_SOURCE_DIR}/src
                            ${CMAKE_CURRENT_BINARY_DIR}/src
                            ${SNAPPY_INCLUDE_DIR}
                            ${Platform_SOURCE_DIR}/include
+                           ${Platform_SOURCE_DIR}/external
+                           ${Memcached_SOURCE_DIR}
                            ${Memcached_SOURCE_DIR}/include
                            ${Couchstore_SOURCE_DIR}/include
                            ${ForestDB_SOURCE_DIR}/include
+                           ${phosphor_SOURCE_DIR}/include
                            ${CMAKE_CURRENT_BINARY_DIR})
 
+INCLUDE_DIRECTORIES(AFTER
+                    ${gtest_SOURCE_DIR}/include
+                    ${gmock_SOURCE_DIR}/include)
+
+CHECK_INCLUDE_FILES("alloca.h" HAVE_ALLOCA_H)
 CHECK_INCLUDE_FILES("arpa/inet.h" HAVE_ARPA_INET_H)
 CHECK_INCLUDE_FILES("unistd.h" HAVE_UNISTD_H)
 CHECK_INCLUDE_FILES("netdb.h" HAVE_NETDB_H)
@@ -36,8 +44,6 @@ CHECK_INCLUDE_FILES("sys/socket.h" HAVE_SYS_SOCKET_H)
 CHECK_INCLUDE_FILES("sys/time.h" HAVE_SYS_TIME_H)
 CHECK_INCLUDE_FILES("netinet/in.h" HAVE_NETINET_IN_H)
 CHECK_INCLUDE_FILES("netinet/tcp.h" HAVE_NETINET_TCP_H)
-CHECK_INCLUDE_FILE_CXX("tr1/memory" HAVE_TR1_MEMORY)
-CHECK_INCLUDE_FILE_CXX("tr1/unordered_map" HAVE_TR1_UNORDERED_MAP)
 CHECK_INCLUDE_FILE_CXX("unordered_map" HAVE_UNORDERED_MAP)
 CHECK_INCLUDE_FILE_CXX("atomic" HAVE_ATOMIC)
 CHECK_INCLUDE_FILE_CXX("thread" HAVE_THREAD)
@@ -47,19 +53,17 @@ CHECK_FUNCTION_EXISTS(mach_absolute_time HAVE_MACH_ABSOLUTE_TIME)
 CHECK_FUNCTION_EXISTS(gettimeofday HAVE_GETTIMEOFDAY)
 CHECK_FUNCTION_EXISTS(getopt_long HAVE_GETOPT_LONG)
 
-# ---- uncomment the lines below ONLY for dev/debugging ---
-#if ("${CMAKE_C_COMPILER_ID}" STREQUAL "Clang")
-#    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g -O0")
-#elseif ("${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU")
-#    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g -O0")
-#endif()
+# For debugging without compiler optimizations uncomment line below..
+#SET (CMAKE_BUILD_TYPE DEBUG)
 
 IF (EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/.git)
-   EXECUTE_PROCESS(COMMAND git describe
+   EXECUTE_PROCESS(COMMAND git rev-parse HEAD
                    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
                    OUTPUT_VARIABLE EP_ENGINE_VERSION
-                   ERROR_QUIET
                    OUTPUT_STRIP_TRAILING_WHITESPACE)
+   IF (EP_ENGINE_VERSION STREQUAL "" OR EP_ENGINE_VERSION STREQUAL "HEAD")
+     MESSAGE (FATAL_ERROR "Failed to determine commit SHA!")
+   ENDIF (EP_ENGINE_VERSION STREQUAL "" OR EP_ENGINE_VERSION STREQUAL "HEAD")
 ELSE (EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/.git)
    SET(EP_ENGINE_VERSION "unknown")
 ENDIF (EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/.git)
@@ -117,116 +121,296 @@ SET(CONFIG_SOURCE src/configuration.cc
   ${CMAKE_CURRENT_BINARY_DIR}/src/generated_configuration.cc)
 
 ADD_LIBRARY(ep SHARED
-            src/access_scanner.cc src/atomic.cc src/backfill.cc
-            src/bgfetcher.cc src/bloomfilter.cc src/checkpoint.cc
-            src/checkpoint_remover.cc src/conflict_resolution.cc
-            src/dcp/backfill-manager.cc src/dcp/backfill.cc
-            src/dcp/consumer.cc src/dcp/producer.cc
-            src/dcp/stream.cc src/dcp/response.cc
+            src/access_scanner.cc
+            src/atomic.cc
+            src/backfill.cc
+            src/bgfetcher.cc
+            src/bloomfilter.cc
+            src/checkpoint.cc
+            src/checkpoint_remover.cc
+            src/compress.cc
+            src/conflict_resolution.cc
+            src/connmap.cc
+            src/dcp/backfill-manager.cc
+            src/dcp/backfill.cc
+            src/dcp/consumer.cc
+            src/dcp/dcpconnmap.cc
+            src/dcp/flow-control.cc
+            src/dcp/flow-control-manager.cc
+            src/dcp/producer.cc
+            src/dcp/response.cc
+            src/dcp/stream.cc
             src/defragmenter.cc
             src/defragmenter_visitor.cc
-            src/ep.cc src/ep_engine.cc src/ep_time.c
-            src/executorpool.cc src/ext_meta_parser.cc
-            src/failover-table.cc src/flusher.cc src/htresizer.cc
-            src/item.cc src/item_pager.cc src/kvshard.cc
-            src/memory_tracker.cc src/murmurhash3.cc
-            src/mutation_log.cc
-            src/mutex.cc src/priority.cc
+            src/ep.cc
+            src/ep_engine.cc
+            src/ep_time.c
+            src/executorpool.cc
             src/executorthread.cc
+            src/ext_meta_parser.cc
+            src/failover-table.cc
+            src/flusher.cc
+            src/globaltask.cc
+            src/hash_table.cc
+            src/htresizer.cc
+            src/item.cc
+            src/item_pager.cc
+            src/logger.cc
+            src/kvshard.cc
+            src/memory_tracker.cc
+            src/murmurhash3.cc
+            src/mutation_log.cc
+            src/replicationthrottle.cc
             src/sizes.cc
             ${CMAKE_CURRENT_BINARY_DIR}/src/stats-info.c
-            src/stored-value.cc src/tapconnection.cc src/connmap.cc
-            src/replicationthrottle.cc src/tasks.cc
-            src/taskqueue.cc src/vbucket.cc
-            src/vbucketmap.cc src/warmup.cc
+            src/string_utils.cc
+            src/stored-value.cc
+            src/tapconnection.cc
+            src/tapconnmap.cc
+            src/tasks.cc
+            src/taskqueue.cc
+            src/vbucket.cc
+            src/vbucketmap.cc
+            src/warmup.cc
             ${KVSTORE_SOURCE} ${COUCH_KVSTORE_SOURCE}
             ${FOREST_KVSTORE_SOURCE} ${OBJECTREGISTRY_SOURCE}
             ${CONFIG_SOURCE})
 
 SET_TARGET_PROPERTIES(ep PROPERTIES PREFIX "")
 TARGET_LINK_LIBRARIES(ep cJSON JSON_checker couchstore forestdb
-  dirutils platform ${LIBEVENT_LIBRARIES})
+  dirutils platform phosphor ${LIBEVENT_LIBRARIES})
+
+# Single executable containing all class-level unit tests involving
+# EventuallyPersistentEngine driven by GoogleTest.
+# (We end up compiling most of the src/ files of ep-engine for these unit tests,
+# so simpler / quicker just to link them into a single executable).
+ADD_EXECUTABLE(ep-engine_ep_unit_tests
+  tests/mock/mock_dcp.cc
+  tests/module_tests/ep_unit_tests_main.cc
+  tests/module_tests/dcp_test.cc
+  tests/module_tests/evp_engine_test.cc
+  tests/module_tests/evp_store_test.cc
+  tests/module_tests/evp_store_single_threaded_test.cc
+  tests/module_tests/futurequeue_test.cc
+  src/access_scanner.cc
+  src/atomic.cc
+  src/backfill.cc
+  src/bgfetcher.cc
+  src/bloomfilter.cc
+  src/checkpoint.cc
+  src/checkpoint_remover.cc
+  src/conflict_resolution.cc
+  src/compress.cc
+  src/connmap.cc
+  src/dcp/backfill.cc
+  src/dcp/backfill-manager.cc
+  src/dcp/consumer.cc
+  src/dcp/dcpconnmap.cc
+  src/dcp/flow-control.cc
+  src/dcp/flow-control-manager.cc
+  src/dcp/producer.cc
+  src/dcp/response.cc
+  src/dcp/stream.cc
+  src/defragmenter.cc
+  src/defragmenter_visitor.cc
+  src/ep.cc
+  src/ep_engine.cc
+  src/ep_time.c
+  src/executorpool.cc
+  src/executorthread.cc
+  src/ext_meta_parser.cc
+  src/failover-table.cc
+  src/flusher.cc
+  src/globaltask.cc
+  src/hash_table.cc
+  src/htresizer.cc
+  src/item.cc
+  src/item_pager.cc
+  src/kvshard.cc
+  src/logger.cc
+  src/memory_tracker.cc
+  src/murmurhash3.cc
+  src/mutation_log.cc
+  src/objectregistry.cc
+  src/tapconnection.cc
+  src/tapconnmap.cc
+  src/replicationthrottle.cc
+  src/stored-value.cc
+  src/string_utils.cc
+  src/tasks.cc
+  src/taskqueue.cc
+  src/vbucket.cc
+  src/vbucketmap.cc
+  src/warmup.cc
+  ${CMAKE_CURRENT_BINARY_DIR}/src/stats-info.c
+  ${CONFIG_SOURCE}
+  ${KVSTORE_SOURCE}
+  ${COUCH_KVSTORE_SOURCE}
+  ${FOREST_KVSTORE_SOURCE}
+  $<TARGET_OBJECTS:memory_tracking>
+  ${Memcached_SOURCE_DIR}/programs/engine_testapp/mock_server.cc)
+TARGET_LINK_LIBRARIES(ep-engine_ep_unit_tests couchstore cJSON dirutils forestdb gtest JSON_checker mcd_util platform
+                      phosphor ${MALLOC_LIBRARIES})
 
 ADD_EXECUTABLE(ep-engine_atomic_ptr_test
   tests/module_tests/atomic_ptr_test.cc
   src/atomic.cc
-  src/testlogger.cc
-  src/mutex.cc)
+  src/testlogger.cc)
 TARGET_LINK_LIBRARIES(ep-engine_atomic_ptr_test platform)
 
 ADD_EXECUTABLE(ep-engine_atomic_test
   tests/module_tests/atomic_test.cc
-  src/testlogger.cc
-  src/mutex.cc)
+  src/testlogger.cc)
 TARGET_LINK_LIBRARIES(ep-engine_atomic_test platform)
 
 ADD_EXECUTABLE(ep-engine_checkpoint_test
   tests/module_tests/checkpoint_test.cc
-  src/bloomfilter.cc src/murmurhash3.cc
-  src/checkpoint.cc src/failover-table.cc
-  src/testlogger.cc src/stored-value.cc
-  src/atomic.cc src/mutex.cc
-  tests/module_tests/test_memory_tracker.cc
-  src/item.cc src/vbucket.cc
+  src/atomic.cc
+  src/bloomfilter.cc
+  src/checkpoint.cc
+  src/compress.cc
+  src/failover-table.cc
+  src/hash_table.cc
+  src/item.cc
+  src/murmurhash3.cc
+  src/stored-value.cc
+  src/testlogger.cc
+  src/vbucket.cc
   ${OBJECTREGISTRY_SOURCE} ${CONFIG_SOURCE})
-TARGET_LINK_LIBRARIES(ep-engine_checkpoint_test ${SNAPPY_LIBRARIES} cJSON platform)
+TARGET_LINK_LIBRARIES(ep-engine_checkpoint_test gtest ${SNAPPY_LIBRARIES} cJSON platform)
 
 ADD_EXECUTABLE(ep-engine_chunk_creation_test
   tests/module_tests/chunk_creation_test.cc)
+TARGET_LINK_LIBRARIES(ep-engine_chunk_creation_test platform)
+
+ADD_EXECUTABLE(ep-engine_compress_test
+  tests/module_tests/compress_test.cc
+  src/compress.cc)
+TARGET_LINK_LIBRARIES(ep-engine_compress_test ${SNAPPY_LIBRARIES} platform)
+
+ADD_EXECUTABLE(ep-engine_configuration_test
+        tests/module_tests/configuration_test.cc
+        src/configuration.cc
+        src/generated_configuration.h
+        src/objectregistry.cc
+        src/testlogger.cc)
+TARGET_LINK_LIBRARIES(ep-engine_configuration_test gtest gtest_main platform)
+
+ADD_EXECUTABLE(ep-engine_couch-fs-stats_test
+        src/couch-kvstore/couch-fs-stats.cc
+        src/generated_configuration.h
+        tests/module_tests/couch-fs-stats_test.cc
+        $<TARGET_OBJECTS:couchstore_wrapped_fileops_test_framework>)
+TARGET_INCLUDE_DIRECTORIES(ep-engine_couch-fs-stats_test
+        PRIVATE
+        ${Couchstore_SOURCE_DIR}
+        ${Couchstore_SOURCE_DIR}/src)
+TARGET_LINK_LIBRARIES(ep-engine_couch-fs-stats_test gtest gtest_main gmock platform)
 
 ADD_EXECUTABLE(ep-engine_hash_table_test
-  tests/module_tests/hash_table_test.cc src/item.cc
+  tests/module_tests/hash_table_test.cc
+  src/atomic.cc
+  src/compress.cc
+  src/hash_table.cc
+  src/item.cc
   src/stored-value.cc
-  src/testlogger.cc src/atomic.cc src/mutex.cc
-  tests/module_tests/test_memory_tracker.cc
+  src/testlogger.cc
   ${OBJECTREGISTRY_SOURCE} ${CONFIG_SOURCE})
-TARGET_LINK_LIBRARIES(ep-engine_hash_table_test ${SNAPPY_LIBRARIES} platform)
+TARGET_LINK_LIBRARIES(ep-engine_hash_table_test gtest ${SNAPPY_LIBRARIES} platform)
 
-ADD_EXECUTABLE(ep-engine_histo_test tests/module_tests/histo_test.cc)
 ADD_EXECUTABLE(ep-engine_hrtime_test tests/module_tests/hrtime_test.cc)
 TARGET_LINK_LIBRARIES(ep-engine_hrtime_test platform)
 
-ADD_EXECUTABLE(ep-engine_misc_test tests/module_tests/misc_test.cc)
-ADD_EXECUTABLE(ep-engine_mutex_test
-  tests/module_tests/mutex_test.cc src/testlogger.cc src/mutex.cc)
-TARGET_LINK_LIBRARIES(ep-engine_mutex_test platform)
+ADD_EXECUTABLE(ep-engine_memory_tracker_test
+  tests/module_tests/memory_tracker_test.cc
+  tests/module_tests/mock_hooks_api.cc
+  src/memory_tracker.cc
+  src/testlogger.cc
+  ${OBJECTREGISTRY_SOURCE}
+  ${CMAKE_CURRENT_BINARY_DIR}/src/generated_configuration.h)
+TARGET_LINK_LIBRARIES(ep-engine_memory_tracker_test gtest gtest_main platform)
 
-ADD_EXECUTABLE(ep-engine_priority_test  tests/module_tests/priority_test.cc
-                        src/priority.cc)
+ADD_EXECUTABLE(ep-engine_misc_test tests/module_tests/misc_test.cc)
+TARGET_LINK_LIBRARIES(ep-engine_misc_test platform)
+ADD_EXECUTABLE(ep-engine_mutex_test
+               tests/module_tests/mutex_test.cc
+               src/testlogger.cc)
+TARGET_LINK_LIBRARIES(ep-engine_mutex_test gtest gtest_main platform)
+
 ADD_EXECUTABLE(ep-engine_ringbuffer_test tests/module_tests/ringbuffer_test.cc)
+TARGET_LINK_LIBRARIES(ep-engine_ringbuffer_test platform)
+
+ADD_EXECUTABLE(ep-engine_string_utils_test
+               tests/module_tests/string_utils_test.cc
+               src/string_utils.cc)
+TARGET_LINK_LIBRARIES(ep-engine_string_utils_test gtest gtest_main platform)
 
 ADD_EXECUTABLE(ep-engine_failover_table_test tests/module_tests/failover_table_test.cc
-                        src/failover-table.cc src/mutex.cc src/testlogger.cc
-                        tests/module_tests/test_memory_tracker.cc
+                        src/failover-table.cc src/testlogger.cc
                         ${OBJECTREGISTRY_SOURCE} ${CONFIG_SOURCE})
 TARGET_LINK_LIBRARIES(ep-engine_failover_table_test cJSON platform)
 
 ADD_EXECUTABLE(ep-engine_kvstore_test
   tests/module_tests/kvstore_test.cc
+  src/compress.cc
+  src/logger.cc
+  src/testlogger.cc
   ${OBJECTREGISTRY_SOURCE} ${KVSTORE_SOURCE} ${COUCH_KVSTORE_SOURCE}
-  ${FOREST_KVSTORE_SOURCE} ${CONFIG_SOURCE} src/mutex.cc src/testlogger.cc)
-TARGET_LINK_LIBRARIES(ep-engine_kvstore_test cJSON JSON_checker couchstore
-  forestdb dirutils platform)
+  ${FOREST_KVSTORE_SOURCE} ${CONFIG_SOURCE}
+  $<TARGET_OBJECTS:couchstore_test_fileops>)
+TARGET_LINK_LIBRARIES(ep-engine_kvstore_test
+                      cJSON JSON_checker couchstore dirutils forestdb gmock gtest platform phosphor)
+TARGET_INCLUDE_DIRECTORIES(ep-engine_kvstore_test
+        PUBLIC
+        ${Couchstore_SOURCE_DIR})
+
+ADD_EXECUTABLE(ep-engine_atomic_unordered_map_test
+  tests/module_tests/atomic_unordered_map_test.cc
+  src/atomic.cc)
+TARGET_LINK_LIBRARIES(ep-engine_atomic_unordered_map_test
+  gtest gtest_main)
+
+ADD_EXECUTABLE(ep-engine_vbucket_test
+  tests/module_tests/vbucket_test.cc
+  src/atomic.cc
+  src/bloomfilter.cc
+  src/checkpoint.cc
+  src/compress.cc
+  src/failover-table.cc
+  src/hash_table.cc
+  src/item.cc
+  src/murmurhash3.cc
+  src/stored-value.cc
+  src/testlogger.cc
+  src/vbucket.cc
+  ${OBJECTREGISTRY_SOURCE} ${CONFIG_SOURCE})
+TARGET_LINK_LIBRARIES(ep-engine_vbucket_test gtest ${SNAPPY_LIBRARIES} cJSON platform)
 
 ADD_TEST(ep-engine_atomic_ptr_test ep-engine_atomic_ptr_test)
 ADD_TEST(ep-engine_atomic_test ep-engine_atomic_test)
 ADD_TEST(ep-engine_checkpoint_test ep-engine_checkpoint_test)
 ADD_TEST(ep-engine_chunk_creation_test ep-engine_chunk_creation_test)
+ADD_TEST(ep-engine_compress_test ep-engine_compress_test)
+ADD_TEST(ep-engine_configuration_test ep-engine_configuration_test)
+ADD_TEST(ep-engine_couch-fs-stats_test ep-engine_couch-fs-stats_test)
+ADD_TEST(ep-engine_ep_unit_tests ep-engine_ep_unit_tests)
 ADD_TEST(ep-engine_failover_table_test ep-engine_failover_table_test)
 ADD_TEST(ep-engine_hash_table_test ep-engine_hash_table_test)
-ADD_TEST(ep-engine_histo_test ep-engine_histo_test)
 ADD_TEST(ep-engine_hrtime_test ep-engine_hrtime_test)
 ADD_TEST(ep-engine_misc_test ep-engine_misc_test)
 ADD_TEST(ep-engine_mutex_test ep-engine_mutex_test)
-ADD_TEST(ep-engine_priority_test ep-engine_priority_test)
 ADD_TEST(ep-engine_ringbuffer_test ep-engine_ringbuffer_test)
 ADD_TEST(ep-engine_kvstore_test ep-engine_kvstore_test)
+ADD_TEST(ep-engine_defragmenter_test ep-engine_defragmenter_test)
+ADD_TEST(ep-engine_memory_tracker_test ep-engine_memory_tracker_test)
+ADD_TEST(ep-engine_atomic_unordered_map_test ep-engine_atomic_unordered_map_test)
+ADD_TEST(ep-engine_vbucket_test ep-engine_vbucket_test)
 
 ADD_LIBRARY(timing_tests SHARED tests/module_tests/timing_tests.cc)
 SET_TARGET_PROPERTIES(timing_tests PROPERTIES PREFIX "")
 TARGET_LINK_LIBRARIES(timing_tests platform)
 
-ADD_EXECUTABLE(ep-engine_sizes src/sizes.cc src/mutex.h src/mutex.cc src/testlogger.cc
+ADD_EXECUTABLE(ep-engine_sizes src/sizes.cc src/testlogger.cc
               ${OBJECTREGISTRY_SOURCE} ${CONFIG_SOURCE})
 TARGET_LINK_LIBRARIES(ep-engine_sizes platform)
 
@@ -234,30 +418,104 @@ ADD_EXECUTABLE(ep-engine_defragmenter_test
                tests/module_tests/defragmenter_test.cc
                src/bloomfilter.cc
                src/checkpoint.cc
+               src/compress.cc
                src/configuration.cc
                src/defragmenter_visitor.cc
                src/ep_time.c
                src/generated_configuration.cc
                src/failover-table.cc
                src/item.cc
+               src/hash_table.cc
+               src/memory_tracker.cc
                src/murmurhash3.cc
-               src/mutex.cc
                src/stored-value.cc
                src/testlogger.cc
                src/vbucket.cc
-               ${OBJECTREGISTRY_SOURCE})
-TARGET_LINK_LIBRARIES(ep-engine_defragmenter_test cJSON platform ${SNAPPY_LIBRARIES})
+               ${OBJECTREGISTRY_SOURCE}
+               ${Memcached_SOURCE_DIR}/utilities/extension_loggers.c
+               $<TARGET_OBJECTS:memory_tracking>)
+TARGET_LINK_LIBRARIES(ep-engine_defragmenter_test
+                      cJSON gtest platform ${MALLOC_LIBRARIES}
+                      ${SNAPPY_LIBRARIES})
 
 ADD_LIBRARY(ep_testsuite SHARED
    tests/ep_testsuite.cc
-   src/atomic.cc src/mutex.cc
-   src/item.cc src/testlogger.cc
-   src/ep_time.c src/ext_meta_parser.cc
+   src/atomic.cc
+   src/compress.cc
+   src/ep_time.c
+   src/ext_meta_parser.cc
+   src/item.cc
+   src/testlogger.cc
+   tests/ep_testsuite_common.cc
+   tests/ep_test_apis.cc
    tests/mock/mock_dcp.cc
-   tests/ep_test_apis.cc ${OBJECTREGISTRY_SOURCE} ${CONFIG_SOURCE})
+   ${OBJECTREGISTRY_SOURCE}
+   ${CONFIG_SOURCE})
 SET_TARGET_PROPERTIES(ep_testsuite PROPERTIES PREFIX "")
-TARGET_LINK_LIBRARIES(ep_testsuite JSON_checker dirutils platform ${LIBEVENT_LIBRARIES} ${SNAPPY_LIBRARIES})
+TARGET_LINK_LIBRARIES(ep_testsuite couchstore dirutils JSON_checker platform
+                      ${LIBEVENT_LIBRARIES} ${SNAPPY_LIBRARIES})
+ADD_DEPENDENCIES(ep_testsuite engine_testapp)
 
+ADD_LIBRARY(ep_testsuite_basic SHARED
+   tests/ep_testsuite_basic.cc
+   src/compress.cc
+   src/ext_meta_parser.cc
+   tests/ep_testsuite_common.cc
+   tests/ep_test_apis.cc
+   tests/mock/mock_dcp.cc
+)
+SET_TARGET_PROPERTIES(ep_testsuite_basic PROPERTIES PREFIX "")
+TARGET_LINK_LIBRARIES(ep_testsuite_basic JSON_checker dirutils platform ${LIBEVENT_LIBRARIES} ${SNAPPY_LIBRARIES})
+ADD_DEPENDENCIES(ep_testsuite engine_testapp)
+
+ADD_LIBRARY(ep_testsuite_dcp SHARED
+tests/ep_testsuite_dcp.cc
+src/compress.cc
+src/ext_meta_parser.cc
+tests/ep_testsuite_common.cc
+tests/ep_test_apis.cc
+tests/mock/mock_dcp.cc
+)
+SET_TARGET_PROPERTIES(ep_testsuite_dcp PROPERTIES PREFIX "")
+TARGET_LINK_LIBRARIES(ep_testsuite_dcp JSON_checker dirutils platform ${LIBEVENT_LIBRARIES} ${SNAPPY_LIBRARIES})
+ADD_DEPENDENCIES(ep_testsuite_dcp engine_testapp)
+
+ADD_LIBRARY(ep_testsuite_tap SHARED
+   tests/ep_testsuite_common.cc
+   tests/ep_testsuite_tap.cc
+   tests/ep_test_apis.cc
+   src/ext_meta_parser.cc)
+SET_TARGET_PROPERTIES(ep_testsuite_tap PROPERTIES PREFIX "")
+TARGET_LINK_LIBRARIES(ep_testsuite_tap JSON_checker dirutils platform ${LIBEVENT_LIBRARIES} ${SNAPPY_LIBRARIES})
+ADD_DEPENDENCIES(ep_testsuite_tap engine_testapp)
+
+ADD_LIBRARY(ep_testsuite_checkpoint SHARED
+   tests/ep_testsuite_common.cc
+   tests/ep_testsuite_checkpoint.cc
+   tests/ep_test_apis.cc
+   src/ext_meta_parser.cc)
+SET_TARGET_PROPERTIES(ep_testsuite_checkpoint PROPERTIES PREFIX "")
+TARGET_LINK_LIBRARIES(ep_testsuite_checkpoint JSON_checker dirutils platform ${LIBEVENT_LIBRARIES} ${SNAPPY_LIBRARIES})
+ADD_DEPENDENCIES(ep_testsuite_checkpoint engine_testapp)
+
+ADD_LIBRARY(ep_testsuite_xdcr SHARED
+   tests/ep_testsuite_common.cc
+   tests/ep_testsuite_xdcr.cc
+   tests/ep_test_apis.cc
+   src/ext_meta_parser.cc)
+SET_TARGET_PROPERTIES(ep_testsuite_xdcr PROPERTIES PREFIX "")
+TARGET_LINK_LIBRARIES(ep_testsuite_xdcr JSON_checker dirutils platform ${LIBEVENT_LIBRARIES} ${SNAPPY_LIBRARIES})
+ADD_DEPENDENCIES(ep_testsuite_xdcr engine_testapp)
+
+ADD_LIBRARY(ep_perfsuite SHARED
+   tests/ep_perfsuite.cc
+   src/ext_meta_parser.cc
+   tests/ep_testsuite_common.cc
+   tests/ep_test_apis.cc
+   tests/mock/mock_dcp.cc)
+SET_TARGET_PROPERTIES(ep_perfsuite PROPERTIES PREFIX "")
+TARGET_LINK_LIBRARIES(ep_perfsuite dirutils platform)
+ADD_DEPENDENCIES(ep_perfsuite engine_testapp)
 
 #ADD_CUSTOM_COMMAND(OUTPUT
 #                     ${CMAKE_CURRENT_BINARY_DIR}/generated_suite_0.c
@@ -318,33 +576,66 @@ INSTALL(FILES
         management/tap_example.py
         DESTINATION lib/python)
 
+INSTALL(FILES
+        docs/stats.org
+        DESTINATION share/doc/ep-engine)
+
 INSTALL(TARGETS ep
-        RUNTIME DESTINATION lib/memcached
-        LIBRARY DESTINATION lib/memcached
-        ARCHIVE DESTINATION lib/memcached)
+        RUNTIME DESTINATION bin
+        LIBRARY DESTINATION lib
+        ARCHIVE DESTINATION lib)
 
-ADD_CUSTOM_TARGET(engine-tests
-                  COMMAND ${CMAKE_BINARY_DIR}/memcached/engine_testapp -E ep.so -T ep_testsuite.so -e "flushall_enabled=true;ht_size=13;ht_locks=7"
+
+# Defines a testsuite which runs in full and value eviction variants.
+FUNCTION(ADD_TESTSUITE value_evict_name full_evict_name testsuite_so timeout)
+  SET(_cmdline
+      ${CMAKE_BINARY_DIR}/memcached/engine_testapp -E ${CMAKE_CURRENT_BINARY_DIR}/ep.so -T ${testsuite_so})
+  ADD_TEST(NAME ${value_evict_name}
+         COMMAND ${_cmdline} -v -e "dbname=./${value_evict_name}")
+  ADD_TEST(NAME ${full_evict_name}
+         COMMAND ${_cmdline} -v -e "item_eviction_policy=full_eviction$<SEMICOLON>dbname=./${full_evict_name}")
+  SET_TESTS_PROPERTIES(${value_evict_name} PROPERTIES TIMEOUT ${timeout})
+  SET_TESTS_PROPERTIES(${full_evict_name} PROPERTIES TIMEOUT ${timeout})
+ENDFUNCTION()
+
+ADD_TESTSUITE(ep-engine_engine_tests ep-engine_full_eviction_tests
+              ${CMAKE_CURRENT_BINARY_DIR}/ep_testsuite.so
+              1800)
+
+ADD_TESTSUITE(ep-engine_basic_tests ep-engine_full_eviction_basic
+              ${CMAKE_CURRENT_BINARY_DIR}/ep_testsuite_basic.so
+              600)
+
+ADD_TESTSUITE(ep-engine_dcp_tests ep-engine_full_eviction_dcp
+              ${CMAKE_CURRENT_BINARY_DIR}/ep_testsuite_dcp.so
+              1200)
+
+ADD_TESTSUITE(ep-engine_value_eviction_tap ep-engine_full_eviction_tap
+              ${CMAKE_CURRENT_BINARY_DIR}/ep_testsuite_tap.so
+              180)
+
+ADD_TESTSUITE(ep-engine_value_eviction_checkpoint ep-engine_full_eviction_checkpoint
+              ${CMAKE_CURRENT_BINARY_DIR}/ep_testsuite_checkpoint.so
+              120)
+
+ADD_TESTSUITE(ep-engine_value_eviction_xdcr ep-engine_full_eviction_xdcr
+              ${CMAKE_CURRENT_BINARY_DIR}/ep_testsuite_xdcr.so
+              120)
+
+# ================================ PERF_TESTS ================================ #
+SET(_ep_perfsuite_cmdline ${CMAKE_BINARY_DIR}/memcached/engine_testapp -E ${CMAKE_CURRENT_BINARY_DIR}/ep.so -T ${CMAKE_CURRENT_BINARY_DIR}/ep_perfsuite.so -v)
+
+# Micro perf tests: value-only eviction mode. Note that it makes no sense to run
+# these tests in full-eviction mode as we disable persistence - see MB-19504.
+ADD_CUSTOM_TARGET(test-perfsuite
+                  COMMAND ${_ep_perfsuite_cmdline}
+                  DEPENDS ${CMAKE_BINARY_DIR}/memcached/engine_testapp
+                          ep
+                          ep_perfsuite
                   VERBATIM)
+ADD_TEST(NAME ep-engine_perfsuite
+         COMMAND ${_ep_perfsuite_cmdline} -e "dbname=./value_eviction_perf")
 
-ADD_TEST(ep-engine-engine-tests ${CMAKE_BINARY_DIR}/memcached/engine_testapp -E ep.so -T ep_testsuite.so -e "flushall_enabled=true;ht_size=13;ht_locks=7" )
-# ADD_TEST(ep-engine-breakdancer-engine-tests ${CMAKE_BINARY_DIR}/memcached/engine_testapp -E ep.so -T generated_testsuite.so -e 'flushall_enabled=true;ht_size=13;ht_locks=7;backend=couchdb')
+# ============================================================================ #
 
-ADD_CUSTOM_TARGET(test-valgrind
-                  COMMAND valgrind --log-file=valgrind.log
-                                   --tool=Memcheck
-                                   --num-callers=50
-                                   --error-limit=yes
-                                   --track-origins=yes
-                                   --malloc-fill=55
-                                   --free-fill=aa
-                                   --dsymutil=yes -q
-                                   ${CMAKE_BINARY_DIR}/memcached/engine_testapp
-                                         -E ep.so
-                                         -T ep_testsuite.so
-                                         -e "flushall_enabled=true;ht_size=13;ht_locks=7"
-                  DEPENDS
-                        ${CMAKE_BINARY_DIR}/memcached/engine_testapp
-                        ep
-                        ep_testsuite
-                  VERBATIM)
+ENABLE_CODE_COVERAGE_REPORT()

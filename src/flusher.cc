@@ -1,6 +1,6 @@
 /* -*- Mode: C++; tab-width: 4; c-basic-offset: 4; indent-tabs-mode: nil -*- */
 /*
- *     Copyright 2010 Couchbase, Inc
+ *     Copyright 2015 Couchbase, Inc
  *
  *   Licensed under the Apache License, Version 2.0 (the "License");
  *   you may not use this file except in compliance with the License.
@@ -15,17 +15,14 @@
  *   limitations under the License.
  */
 
-#include "config.h"
+#include "flusher.h"
+
+#include "common.h"
 
 #include <stdlib.h>
 
-#include <algorithm>
-#include <list>
-#include <map>
-#include <vector>
 #include <sstream>
 
-#include "flusher.h"
 
 bool Flusher::stop(bool isForceShutdown) {
     forceShutdownReceived = isForceShutdown;
@@ -41,14 +38,14 @@ void Flusher::wait(void) {
         if (!ExecutorPool::get()->wake(taskId)) {
             std::stringstream ss;
             ss << "Flusher task " << taskId << " vanished!";
-            LOG(EXTENSION_LOG_WARNING, ss.str().c_str());
+            LOG(EXTENSION_LOG_WARNING, "%s", ss.str().c_str());
             break;
         }
         usleep(1000);
     }
     hrtime_t endt(gethrtime());
     if ((endt - startt) > 1000) {
-        LOG(EXTENSION_LOG_WARNING,  "Had to wait %s for shutdown\n",
+        LOG(EXTENSION_LOG_NOTICE,  "Had to wait %s for shutdown\n",
             hrtime2text(endt - startt).c_str());
     }
 }
@@ -93,7 +90,11 @@ const char * Flusher::stateName(enum flusher_state st) const {
     static const char * const stateNames[] = {
         "initializing", "running", "pausing", "paused", "stopping", "stopped"
     };
-    cb_assert(st >= initializing && st <= stopped);
+    if (st < initializing || st > stopped) {
+        throw std::invalid_argument("Flusher::stateName: st (which is " +
+                                        std::to_string(st) +
+                                        ") is not a valid flusher_state");
+    }
     return stateNames[st];
 }
 
@@ -123,8 +124,7 @@ enum flusher_state Flusher::state() const {
     return _state;
 }
 
-void Flusher::initialize(size_t tid) {
-    cb_assert(taskId == tid);
+void Flusher::initialize() {
     LOG(EXTENSION_LOG_DEBUG, "Initializing flusher");
     transition_state(running);
 }
@@ -132,86 +132,87 @@ void Flusher::initialize(size_t tid) {
 void Flusher::schedule_UNLOCKED() {
     ExecutorPool* iom = ExecutorPool::get();
     ExTask task = new FlusherTask(ObjectRegistry::getCurrentEngine(),
-                                  this, Priority::FlusherPriority,
+                                  this,
                                   shard->getId());
     this->setTaskId(task->getId());
     iom->schedule(task, WRITER_TASK_IDX);
-    cb_assert(taskId > 0);
 }
 
 void Flusher::start() {
     LockHolder lh(taskMutex);
     if (taskId) {
-        LOG(EXTENSION_LOG_WARNING, "Double start in flusher task id %llu: %s",
-                taskId, stateName());
+        LOG(EXTENSION_LOG_WARNING,
+            "Double start in flusher task id %" PRIu64 ": %s",
+            uint64_t(taskId.load()), stateName());
         return;
     }
     schedule_UNLOCKED();
 }
 
 void Flusher::wake(void) {
-    LockHolder lh(taskMutex);
-    cb_assert(taskId > 0);
-    ExecutorPool::get()->wake(taskId);
+    // taskId becomes zero if the flusher were stopped
+    if (taskId > 0) {
+        ExecutorPool::get()->wake(taskId);
+    }
 }
 
 bool Flusher::step(GlobalTask *task) {
-    try {
-        switch (_state.load()) {
-        case initializing:
-            initialize(task->getId());
-            return true;
-        case paused:
-        case pausing:
-            if (_state == pausing) {
-                transition_state(paused);
-            }
-            // Indefinitely put task to sleep..
-            task->snooze(INT_MAX);
-            return true;
-        case running:
-            {
-                flushVB();
-                if (_state == running) {
-                    double tosleep = computeMinSleepTime();
-                    if (tosleep > 0) {
-                        task->snooze(tosleep);
-                    }
-                }
-                return true;
-            }
-        case stopping:
-            {
-                std::stringstream ss;
-                ss << "Shutting down flusher (Write of all dirty items)"
-                   << std::endl;
-                LOG(EXTENSION_LOG_DEBUG, "%s", ss.str().c_str());
-            }
-            completeFlush();
-            LOG(EXTENSION_LOG_DEBUG, "Flusher stopped");
-            transition_state(stopped);
-        case stopped:
-            {
-                LockHolder lh(taskMutex);
-                taskId = 0;
-                return false;
-            }
-        default:
-            LOG(EXTENSION_LOG_WARNING, "Unexpected state in flusher: %s",
-                stateName());
-            cb_assert(false);
+    flusher_state current_state = _state.load();
+
+    switch (current_state) {
+    case initializing:
+        if (task->getId() != taskId) {
+            throw std::invalid_argument("Flusher::step: Argument "
+                    "task->getId() (which is" + std::to_string(task->getId()) +
+                    ") does not equal member variable taskId (which is" +
+                    std::to_string(taskId.load()));
         }
-    } catch(std::runtime_error &e) {
-        std::stringstream ss;
-        ss << "Exception in flusher loop: " << e.what() << std::endl;
-        LOG(EXTENSION_LOG_WARNING, "%s", ss.str().c_str());
-        cb_assert(false);
+        initialize();
+        return true;
+
+    case paused:
+    case pausing:
+        if (_state == pausing) {
+            transition_state(paused);
+        }
+        // Indefinitely put task to sleep..
+        task->snooze(INT_MAX);
+        return true;
+
+    case running:
+        flushVB();
+        if (_state == running) {
+            double tosleep = computeMinSleepTime();
+            if (tosleep > 0) {
+                store->commit(shard->getId());
+                resetCommitInterval();
+                task->snooze(tosleep);
+            }
+        }
+        return true;
+
+    case stopping:
+        {
+            std::stringstream ss;
+            ss << "Shutting down flusher (Write of all dirty items)"
+               << std::endl;
+            LOG(EXTENSION_LOG_DEBUG, "%s", ss.str().c_str());
+        }
+        completeFlush();
+        store->commit(shard->getId());
+        resetCommitInterval();
+        LOG(EXTENSION_LOG_DEBUG, "Flusher stopped");
+        transition_state(stopped);
+        return false;
+
+    case stopped:
+        taskId = 0;
+        return false;
     }
 
-    // We should _NEVER_ get here (unless you compile with -DNDEBUG causing
-    // the assertions to be removed.. It's a bug, so we should abort and
-    // create a coredump
-    abort();
+    // If we got here there was an unhandled switch case
+    throw std::logic_error("Flusher::step: Invalid state " +
+                               std::to_string(current_state));
 }
 
 void Flusher::completeFlush() {
@@ -229,6 +230,18 @@ double Flusher::computeMinSleepTime() {
     return std::min(minSleepTime, DEFAULT_MAX_SLEEP_TIME);
 }
 
+uint16_t Flusher::decrCommitInterval(void) {
+    --currCommitInterval;
+    //When the current commit interval hits zero, then reset the
+    //current commit interval to the initial value
+    if (!currCommitInterval) {
+        currCommitInterval = initCommitInterval;
+        return 0;
+    }
+
+    return currCommitInterval;
+}
+
 void Flusher::flushVB(void) {
     if (store->diskFlushAll && shard->getId() != EP_PRIMARY_SHARD) {
         // another shard is doing disk flush
@@ -243,21 +256,17 @@ void Flusher::flushVB(void) {
         }
         bool inverse = true;
         if (pendingMutation.compare_exchange_strong(inverse, false)) {
-            std::vector<int> vbs = shard->getVBucketsSortedByState();
-            std::vector<int>::iterator itr = vbs.begin();
-            for (; itr != vbs.end(); ++itr) {
-                lpVbs.push(static_cast<uint16_t>(*itr));
+            for (auto vbid : shard->getVBucketsSortedByState()) {
+                lpVbs.push(vbid);
             }
         }
     }
 
     if (!doHighPriority && shard->highPriorityCount.load() > 0) {
-        std::vector<int> vbs = shard->getVBuckets();
-        std::vector<int>::iterator itr = vbs.begin();
-        for (; itr != vbs.end(); ++itr) {
-            RCPtr<VBucket> vb = store->getVBucket(*itr);
+        for (auto vbid : shard->getVBuckets()) {
+            RCPtr<VBucket> vb = store->getVBucket(vbid);
             if (vb && vb->getHighPriorityChkSize() > 0) {
-                hpVbs.push(static_cast<uint16_t>(*itr));
+                hpVbs.push(vbid);
             }
         }
         numHighPriority = hpVbs.size();

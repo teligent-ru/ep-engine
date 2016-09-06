@@ -21,85 +21,87 @@
 #include "flusher.h"
 #include "tasks.h"
 #include "warmup.h"
+#include "ep_engine.h"
+#include "kvstore.h"
+
+#include <climits>
+#include <type_traits>
+
+#include <phosphor/phosphor.h>
 
 static const double VBSTATE_SNAPSHOT_FREQ(300.0);
 static const double WORKLOAD_MONITOR_FREQ(5.0);
 
-void GlobalTask::snooze(const double secs) {
-    if (secs == INT_MAX) {
-        setState(TASK_SNOOZED, TASK_RUNNING);
-        set_max_tv(waketime);
-        return;
-    }
-
-    gettimeofday(&waketime, NULL);
-
-    if (secs) {
-        setState(TASK_SNOOZED, TASK_RUNNING);
-        advance_tv(waketime, secs);
-    }
-}
-
 bool FlusherTask::run() {
+    TRACE_EVENT0("ep-engine/task", "FlusherTask");
     return flusher->step(this);
 }
 
 bool VBSnapshotTask::run() {
+    TRACE_EVENT("ep-engine/task", "VBSnapshotTask", shardID);
     engine->getEpStore()->snapshotVBuckets(priority, shardID);
     return false;
 }
 
 DaemonVBSnapshotTask::DaemonVBSnapshotTask(EventuallyPersistentEngine *e,
-                                           bool completeBeforeShutdown) :
-    GlobalTask(e, Priority::VBucketPersistLowPriority, VBSTATE_SNAPSHOT_FREQ,
-               completeBeforeShutdown) {
-        desc = "Snapshotting vbucket states";
+                                           bool completeBeforeShutdown)
+    : GlobalTask(e, TaskId::DaemonVBSnapshotTask,
+                 VBSTATE_SNAPSHOT_FREQ, completeBeforeShutdown) {
+    desc = "Snapshotting vbucket states";
 }
 
 bool DaemonVBSnapshotTask::run() {
-    bool ret = engine->getEpStore()->scheduleVBSnapshot(
-               Priority::VBucketPersistLowPriority);
+    TRACE_EVENT0("ep-engine/task", "DaemonVBSnapshotTask");
+    bool ret = engine->getEpStore()->scheduleVBSnapshot(VBSnapshotTask::Priority::LOW);
     snooze(VBSTATE_SNAPSHOT_FREQ);
     return ret;
 }
 
 bool VBStatePersistTask::run() {
-    return engine->getEpStore()->persistVBState(priority, vbid);
+    TRACE_EVENT("ep-engine/task", "VBPersistTask", vbid);
+    return engine->getEpStore()->persistVBState(vbid);
 }
 
 bool VBDeleteTask::run() {
+    TRACE_EVENT("ep-engine/task", "VBDeleteTask", vbucketId, cookie);
     return !engine->getEpStore()->completeVBucketDeletion(vbucketId, cookie);
 }
 
-bool CompactVBucketTask::run() {
-    return engine->getEpStore()->compactVBucket(vbid, &compactCtx, cookie);
+bool CompactTask::run() {
+    TRACE_EVENT("ep-engine/task", "CompactTask", compactCtx.db_file_id);
+    return engine->getEpStore()->doCompact(&compactCtx, cookie);
 }
 
 bool StatSnap::run() {
+    TRACE_EVENT0("ep-engine/task", "StatSnap");
     engine->getEpStore()->snapshotStats();
     if (runOnce) {
         return false;
     }
-    ExecutorPool::get()->snooze(taskId, 60);
+    ExecutorPool::get()->snooze(uid, 60);
     return true;
 }
 
-bool BgFetcherTask::run() {
+bool MultiBGFetcherTask::run() {
+    TRACE_EVENT0("ep-engine/task", "MultiBGFetcherTask");
     return bgfetcher->run(this);
 }
 
 bool FlushAllTask::run() {
+    TRACE_EVENT0("ep-engine/task", "FlushAllTask");
     engine->getEpStore()->reset();
     return false;
 }
 
 bool VKeyStatBGFetchTask::run() {
+    TRACE_EVENT("ep-engine/task", "VKeyStatBGFetchTask", cookie, vbucket);
     engine->getEpStore()->completeStatsVKey(cookie, key, vbucket, bySeqNum);
     return false;
 }
 
 
-bool BGFetchTask::run() {
+bool SingleBGFetcherTask::run() {
+    TRACE_EVENT("ep-engine/task", "SingleBGFetcherTask", cookie, vbucket);
     engine->getEpStore()->completeBGFetch(key, vbucket, cookie, init,
                                           metaFetch);
     return false;
@@ -107,7 +109,7 @@ bool BGFetchTask::run() {
 
 WorkLoadMonitor::WorkLoadMonitor(EventuallyPersistentEngine *e,
                                  bool completeBeforeShutdown) :
-    GlobalTask(e, Priority::WorkLoadMonitorPriority, WORKLOAD_MONITOR_FREQ,
+    GlobalTask(e, TaskId::WorkLoadMonitor, WORKLOAD_MONITOR_FREQ,
                completeBeforeShutdown) {
     prevNumMutations = getNumMutations();
     prevNumGets = getNumGets();

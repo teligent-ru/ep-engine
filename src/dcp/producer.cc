@@ -1,6 +1,6 @@
 /* -*- Mode: C++; tab-width: 4; c-basic-offset: 4; indent-tabs-mode: nil -*- */
 /*
- *     Copyright 2013 Couchbase, Inc
+ *     Copyright 2015 Couchbase, Inc
  *
  *   Licensed under the Apache License, Version 2.0 (the "License");
  *   you may not use this file except in compliance with the License.
@@ -15,36 +15,107 @@
  *   limitations under the License.
  */
 
-#include "config.h"
+#include <vector>
+
+#include "dcp/producer.h"
 
 #include "backfill.h"
+#include "compress.h"
+#include "common.h"
 #include "ep_engine.h"
 #include "failover-table.h"
 #include "dcp/backfill-manager.h"
-#include "dcp/producer.h"
+#include "dcp/dcpconnmap.h"
 #include "dcp/response.h"
 #include "dcp/stream.h"
 
-const uint32_t DcpProducer::defaultNoopInerval = 20;
+const std::chrono::seconds DcpProducer::defaultDcpNoopTxInterval(20);
 
-void BufferLog::insert(DcpResponse* response) {
-    cb_assert(!isFull());
-    bytes_sent += response->getMessageSize();
+DcpProducer::BufferLog::State DcpProducer::BufferLog::getState_UNLOCKED() {
+    if (isEnabled_UNLOCKED()) {
+        if (isFull_UNLOCKED()) {
+            return Full;
+        } else {
+            return SpaceAvailable;
+        }
+    }
+    return Disabled;
 }
 
-void BufferLog::free(uint32_t bytes_to_free) {
-    if (bytes_sent >= bytes_to_free) {
-        bytes_sent -= bytes_to_free;
+void DcpProducer::BufferLog::setBufferSize(size_t maxBytes) {
+    WriterLockHolder lh(logLock);
+    this->maxBytes = maxBytes;
+    if (maxBytes == 0) {
+        bytesSent = 0;
+        ackedBytes = 0;
+    }
+}
+
+bool DcpProducer::BufferLog::insert(size_t bytes) {
+    WriterLockHolder wlh(logLock);
+    bool inserted = false;
+    // If the log is not enabled
+    // or there is space, allow the insert
+    if (!isEnabled_UNLOCKED() || !isFull_UNLOCKED()) {
+        bytesSent += bytes;
+        inserted = true;
+    }
+    return inserted;
+}
+
+void DcpProducer::BufferLog::release_UNLOCKED(size_t bytes) {
+    if (bytesSent >= bytes) {
+        bytesSent -= bytes;
     } else {
-        bytes_sent = 0;
+        bytesSent = 0;
+    }
+}
+
+bool DcpProducer::BufferLog::pauseIfFull() {
+    ReaderLockHolder rlh(logLock);
+    if (getState_UNLOCKED() == Full) {
+        producer.setPaused(true);
+        return true;
+    }
+    return false;
+}
+
+void DcpProducer::BufferLog::unpauseIfSpaceAvailable() {
+    ReaderLockHolder rlh(logLock);
+    if (getState_UNLOCKED() != Full) {
+        producer.notifyPaused(true);
+    }
+}
+
+void DcpProducer::BufferLog::acknowledge(size_t bytes) {
+    WriterLockHolder wlh(logLock);
+    State state = getState_UNLOCKED();
+    if (state != Disabled) {
+        release_UNLOCKED(bytes);
+        ackedBytes += bytes;
+        if (state == Full) {
+            producer.notifyPaused(true);
+        }
+    }
+}
+
+void DcpProducer::BufferLog::addStats(ADD_STAT add_stat, const void *c) {
+    ReaderLockHolder rlh(logLock);
+    if (isEnabled_UNLOCKED()) {
+        producer.addStat("max_buffer_bytes", maxBytes, add_stat, c);
+        producer.addStat("unacked_bytes", bytesSent, add_stat, c);
+        producer.addStat("total_acked_bytes", ackedBytes, add_stat, c);
+        producer.addStat("flow_control", "enabled", add_stat, c);
+    } else {
+        producer.addStat("flow_control", "disabled", add_stat, c);
     }
 }
 
 DcpProducer::DcpProducer(EventuallyPersistentEngine &e, const void *cookie,
                          const std::string &name, bool isNotifier)
     : Producer(e, cookie, name), rejectResp(NULL),
-      notifyOnly(isNotifier), lastSendTime(ep_current_time()), log(NULL),
-      itemsSent(0), totalBytesSent(0), ackedBytes(0) {
+      notifyOnly(isNotifier), lastSendTime(ep_current_time()), log(*this),
+      itemsSent(0), totalBytesSent(0) {
     setSupportAck(true);
     setReserved(true);
     setPaused(true);
@@ -53,6 +124,13 @@ DcpProducer::DcpProducer(EventuallyPersistentEngine &e, const void *cookie,
         setLogHeader("DCP (Notifier) " + getName() + " -");
     } else {
         setLogHeader("DCP (Producer) " + getName() + " -");
+    }
+    // Reduce the minimum log level of view engine DCP streams as they are
+    // extremely noisy due to creating new stream, per vbucket,per design doc
+    // every ~10s.
+    if (name.find("eq_dcpq:mapreduce_view") != std::string::npos ||
+        name.find("eq_dcpq:spatial_view") != std::string::npos) {
+        logger.min_log_level = EXTENSION_LOG_WARNING;
     }
 
     engine_.setDCPPriority(getCookie(), CONN_PRIORITY_MED);
@@ -67,26 +145,40 @@ DcpProducer::DcpProducer(EventuallyPersistentEngine &e, const void *cookie,
     // noop interval to 20 seconds by default, but in post 3.0 releases we set
     // it to be higher by default. Starting in 3.0.1 the DCP consumer sets the
     // noop interval of the producer when connecting so in an all 3.0.1+ cluster
-    // this value will be overriden. In 3.0 however we do not set the noop
+    // this value will be overridden. In 3.0 however we do not set the noop
     // interval so setting this value will make sure we don't disconnect on
     // accident due to the producer and the consumer having a different noop
     // interval.
-    noopCtx.noopInterval = defaultNoopInerval;
+    noopCtx.dcpNoopTxInterval = defaultDcpNoopTxInterval;
+    noopCtx.dcpIdleTimeout = std::chrono::seconds(
+            engine_.getConfiguration().getDcpIdleTimeout());
     noopCtx.pendingRecv = false;
     noopCtx.enabled = false;
 
     enableExtMetaData = false;
+    enableValueCompression = false;
 
-    backfillMgr = new BackfillManager(&engine_, this);
+    // Cursor dropping is disabled for replication connections by default,
+    // but will be enabled through a control message to support backward
+    // compatibility. For all other type of DCP connections, cursor dropping
+    // will be enabled by default.
+    if (name.find("replication") < name.length()) {
+        supportsCursorDropping = false;
+    } else {
+        supportsCursorDropping = true;
+    }
+
+    backfillMgr.reset(new BackfillManager(&engine_));
+
+    checkpointCreatorTask = new ActiveStreamCheckpointProcessorTask(e);
+    ExecutorPool::get()->schedule(checkpointCreatorTask, AUXIO_TASK_IDX);
 }
 
 DcpProducer::~DcpProducer() {
-    if (log) {
-        delete log;
-    }
-
+    backfillMgr.reset();
     delete rejectResp;
-    delete backfillMgr;
+
+    ExecutorPool::get()->cancel(checkpointCreatorTask->getId());
 }
 
 ENGINE_ERROR_CODE DcpProducer::streamRequest(uint32_t flags,
@@ -99,11 +191,12 @@ ENGINE_ERROR_CODE DcpProducer::streamRequest(uint32_t flags,
                                              uint64_t snap_end_seqno,
                                              uint64_t *rollback_seqno,
                                              dcp_add_failover_log callback) {
+
+    lastReceiveTime = ep_current_time();
     if (doDisconnect()) {
         return ENGINE_DISCONNECT;
     }
 
-    LockHolder lh(queueLock);
     RCPtr<VBucket> vb = engine_.getVBucket(vbucket);
     if (!vb) {
         LOG(EXTENSION_LOG_WARNING, "%s (vb %d) Stream request failed because "
@@ -117,17 +210,11 @@ ENGINE_ERROR_CODE DcpProducer::streamRequest(uint32_t flags,
         return ENGINE_TMPFAIL;
     }
 
-    if (flags & DCP_ADD_STREAM_FLAG_LATEST) {
-        end_seqno = vb->getHighSeqno();
-    }
-
-    if (flags & DCP_ADD_STREAM_FLAG_DISKONLY) {
-        end_seqno = engine_.getEpStore()->getLastPersistedSeqno(vbucket);
-    }
-
     if (!notifyOnly && start_seqno > end_seqno) {
         LOG(EXTENSION_LOG_WARNING, "%s (vb %d) Stream request failed because "
-            "the start seqno (%llu) is larger than the end seqno (%llu)",
+            "the start seqno (%" PRIu64 ") is larger than the end seqno "
+            "(%" PRIu64 "); "
+            "Incorrect params passed by the DCP client",
             logHeader(), vbucket, start_seqno, end_seqno);
         return ENGINE_ERANGE;
     }
@@ -135,25 +222,31 @@ ENGINE_ERROR_CODE DcpProducer::streamRequest(uint32_t flags,
     if (!notifyOnly && !(snap_start_seqno <= start_seqno &&
         start_seqno <= snap_end_seqno)) {
         LOG(EXTENSION_LOG_WARNING, "%s (vb %d) Stream request failed because "
-            "the snap start seqno (%llu) <= start seqno (%llu) <= snap end "
-            "seqno (%llu) is required", logHeader(), vbucket, snap_start_seqno,
-            start_seqno, snap_end_seqno);
+            "the snap start seqno (%" PRIu64 ") <= start seqno (%" PRIu64 ")"
+            " <= snap end seqno (%" PRIu64 ") is required", logHeader(), vbucket,
+            snap_start_seqno, start_seqno, snap_end_seqno);
         return ENGINE_ERANGE;
     }
 
     bool add_vb_conn_map = true;
-    std::map<uint16_t, stream_t>::iterator itr;
-    if ((itr = streams.find(vbucket)) != streams.end()) {
-        if (itr->second->getState() != STREAM_DEAD) {
-            LOG(EXTENSION_LOG_WARNING, "%s (vb %d) Stream request failed"
-                " because a stream already exists for this vbucket",
-                logHeader(), vbucket);
-            return ENGINE_KEY_EEXISTS;
-        } else {
-            streams.erase(vbucket);
-            ready.remove(vbucket);
-            // Don't need to add an entry to vbucket-to-conns map
-            add_vb_conn_map = false;
+    {
+        // Need to synchronise the search and conditional erase,
+        // therefore use external locking here.
+        std::lock_guard<StreamsMap> guard(streams);
+        auto it = streams.find(vbucket, guard);
+        if (it.second) {
+            auto& vb = it.first;
+            if (vb->getState() != STREAM_DEAD) {
+                LOG(EXTENSION_LOG_WARNING, "%s (vb %d) Stream request failed"
+                    " because a stream already exists for this vbucket",
+                    logHeader(), vbucket);
+                return ENGINE_KEY_EEXISTS;
+            } else {
+                streams.erase(vbucket, guard);
+
+                // Don't need to add an entry to vbucket-to-conns map
+                add_vb_conn_map = false;
+            }
         }
     }
 
@@ -171,8 +264,9 @@ ENGINE_ERROR_CODE DcpProducer::streamRequest(uint32_t flags,
                                      snap_end_seqno, vb->getPurgeSeqno(),
                                      rollback_seqno)) {
         LOG(EXTENSION_LOG_WARNING, "%s (vb %d) Stream request failed "
-            "because a rollback to seqno %llu is required (start seqno %llu, "
-            "vb_uuid %llu, snapStartSeqno %llu, snapEndSeqno %llu)",
+            "because a rollback to seqno %" PRIu64 " is required "
+            "(start seqno %" PRIu64 ", vb_uuid %" PRIu64 ", snapStartSeqno %" PRIu64
+            ", snapEndSeqno %" PRIu64 ")",
             logHeader(), vbucket, *rollback_seqno, start_seqno, vbucket_uuid,
             snap_start_seqno, snap_end_seqno);
         return ENGINE_ROLLBACK;
@@ -185,21 +279,68 @@ ENGINE_ERROR_CODE DcpProducer::streamRequest(uint32_t flags,
         return rv;
     }
 
-    if (notifyOnly) {
-        streams[vbucket] = new NotifierStream(&engine_, this, getName(), flags,
-                                              opaque, vbucket, notifySeqno,
-                                              end_seqno, vbucket_uuid,
-                                              snap_start_seqno, snap_end_seqno);
-    } else {
-        streams[vbucket] = new ActiveStream(&engine_, this, getName(), flags,
-                                            opaque, vbucket, start_seqno,
-                                            end_seqno, vbucket_uuid,
-                                            snap_start_seqno, snap_end_seqno);
-        static_cast<ActiveStream*>(streams[vbucket].get())->setActive();
+    if (flags & DCP_ADD_STREAM_FLAG_LATEST) {
+        end_seqno = vb->getHighSeqno();
     }
 
-    ready.push_back(vbucket);
-    lh.unlock();
+    if (flags & DCP_ADD_STREAM_FLAG_DISKONLY) {
+        end_seqno = engine_.getEpStore()->getLastPersistedSeqno(vbucket);
+    }
+
+    if (!notifyOnly && start_seqno > end_seqno) {
+        LOG(EXTENSION_LOG_WARNING, "%s (vb %d) Stream request failed because "
+            "the start seqno (%" PRIu64 ") is larger than the end seqno (%"
+            PRIu64 "), stream request flags %d, vb_uuid %" PRIu64
+            ", snapStartSeqno %" PRIu64 ", snapEndSeqno %" PRIu64
+            "; should have rolled back instead",
+            logHeader(), vbucket, start_seqno, end_seqno, flags, vbucket_uuid,
+            snap_start_seqno, snap_end_seqno);
+        return ENGINE_ERANGE;
+    }
+
+    if (!notifyOnly && start_seqno > static_cast<uint64_t>(vb->getHighSeqno()))
+    {
+        LOG(EXTENSION_LOG_WARNING, "%s (vb %d) Stream request failed because "
+            "the start seqno (%" PRIu64 ") is larger than the vb highSeqno (%"
+            PRId64 "), stream request flags is %d, vb_uuid %" PRIu64
+            ", snapStartSeqno %" PRIu64 ", snapEndSeqno %" PRIu64
+            "; should have rolled back instead",
+            logHeader(), vbucket, start_seqno, vb->getHighSeqno(), flags,
+            vbucket_uuid, snap_start_seqno, snap_end_seqno);
+        return ENGINE_ERANGE;
+    }
+
+    stream_t s;
+    if (notifyOnly) {
+        s = new NotifierStream(&engine_, this, getName(), flags,
+                               opaque, vbucket, notifySeqno,
+                               end_seqno, vbucket_uuid,
+                               snap_start_seqno, snap_end_seqno);
+    } else {
+        s = new ActiveStream(&engine_, this, getName(), flags,
+                             opaque, vbucket, start_seqno,
+                             end_seqno, vbucket_uuid,
+                             snap_start_seqno, snap_end_seqno);
+    }
+
+    {
+        ReaderLockHolder rlh(vb->getStateLock());
+        if (vb->getState() == vbucket_state_dead) {
+            LOG(EXTENSION_LOG_WARNING, "%s (vb %d) Stream request failed because "
+                    "this vbucket is in dead state", logHeader(), vbucket);
+            return ENGINE_NOT_MY_VBUCKET;
+        }
+
+        if (!notifyOnly) {
+            // MB-19428: Only activate the stream if we are adding it to the
+            // streams map.
+            static_cast<ActiveStream*>(s.get())->setActive();
+        }
+        streams.insert(std::make_pair(vbucket, s));
+    }
+
+    ready.pushUnique(vbucket);
+
     if (add_vb_conn_map) {
         connection_t conn(this);
         engine_.getDcpConnMap().addVBConnByVBId(conn, vbucket);
@@ -211,6 +352,7 @@ ENGINE_ERROR_CODE DcpProducer::streamRequest(uint32_t flags,
 ENGINE_ERROR_CODE DcpProducer::getFailoverLog(uint32_t opaque, uint16_t vbucket,
                                               dcp_add_failover_log callback) {
     (void) opaque;
+    lastReceiveTime = ep_current_time();
     if (doDisconnect()) {
         return ENGINE_DISCONNECT;
     }
@@ -233,6 +375,10 @@ ENGINE_ERROR_CODE DcpProducer::step(struct dcp_message_producers* producers) {
     }
 
     ENGINE_ERROR_CODE ret;
+    if ((ret = maybeDisconnect()) != ENGINE_FAILED) {
+          return ret;
+    }
+
     if ((ret = maybeSendNoop(producers)) != ENGINE_FAILED) {
         return ret;
     }
@@ -248,11 +394,48 @@ ENGINE_ERROR_CODE DcpProducer::step(struct dcp_message_producers* producers) {
         }
     }
 
-    ret = ENGINE_SUCCESS;
-
     Item* itmCpy = NULL;
     if (resp->getEvent() == DCP_MUTATION) {
-        itmCpy = static_cast<MutationResponse*>(resp)->getItemCopy();
+        try {
+            itmCpy = static_cast<MutationResponse*>(resp)->getItemCopy();
+        } catch (const std::bad_alloc&) {
+            rejectResp = resp;
+            LOG(EXTENSION_LOG_WARNING, "%s (vb %d) ENOMEM while trying to copy "
+                "item with seqno %" PRIu64 "before streaming it", logHeader(),
+                static_cast<MutationResponse*>(resp)->getVBucket(),
+                static_cast<MutationResponse*>(resp)->getBySeqno());
+            return ENGINE_ENOMEM;
+        } catch (const std::logic_error&) {
+            rejectResp = resp;
+            LOG(EXTENSION_LOG_WARNING, "%s (vb %d) illegal mutation payload "
+                "type while copying an item with seqno %" PRIu64 "before "
+                "streaming it", logHeader(),
+                static_cast<MutationResponse*>(resp)->getVBucket(),
+                static_cast<MutationResponse*>(resp)->getBySeqno());
+            return ENGINE_ENOTSUP;
+        }
+
+        if (enableValueCompression) {
+            /**
+             * If value compression is enabled, the producer will need
+             * to snappy-compress the document before transmitting.
+             * Compression will obviously be done only if the datatype
+             * indicates that the value isn't compressed already.
+             */
+            uint32_t sizeBefore = itmCpy->getNBytes();
+            if (!itmCpy->compressValue(
+                            engine_.getDcpConnMap().getMinCompressionRatio())) {
+                LOG(EXTENSION_LOG_WARNING,
+                    "%s Failed to snappy compress an uncompressed value!",
+                    logHeader());
+            }
+            uint32_t sizeAfter = itmCpy->getNBytes();
+
+            if (sizeAfter < sizeBefore) {
+                log.acknowledge(sizeBefore - sizeAfter);
+            }
+        }
+
     }
 
     EventuallyPersistentEngine *epe = ObjectRegistry::onSwitchThread(NULL,
@@ -351,26 +534,15 @@ ENGINE_ERROR_CODE DcpProducer::step(struct dcp_message_producers* producers) {
 ENGINE_ERROR_CODE DcpProducer::bufferAcknowledgement(uint32_t opaque,
                                                      uint16_t vbucket,
                                                      uint32_t buffer_bytes) {
-    LockHolder lh(queueLock);
-    if (log) {
-        bool wasFull = log->isFull();
-
-        ackedBytes.fetch_add(buffer_bytes);
-        log->free(buffer_bytes);
-        lh.unlock();
-
-        if (wasFull) {
-            engine_.getDcpConnMap().notifyPausedConnection(this, true);
-        }
-    }
-
+    lastReceiveTime = ep_current_time();
+    log.acknowledge(buffer_bytes);
     return ENGINE_SUCCESS;
 }
 
 ENGINE_ERROR_CODE DcpProducer::control(uint32_t opaque, const void* key,
                                        uint16_t nkey, const void* value,
                                        uint32_t nvalue) {
-    LockHolder lh(queueLock);
+    lastReceiveTime = ep_current_time();
     const char* param = static_cast<const char*>(key);
     std::string keyStr(static_cast<const char*>(key), nkey);
     std::string valueStr(static_cast<const char*>(value), nvalue);
@@ -378,11 +550,9 @@ ENGINE_ERROR_CODE DcpProducer::control(uint32_t opaque, const void* key,
     if (strncmp(param, "connection_buffer_size", nkey) == 0) {
         uint32_t size;
         if (parseUint32(valueStr.c_str(), &size)) {
-            if (!log) {
-                log = new BufferLog(size);
-            } else if (log->getBufferSize() != size) {
-                log->setBufferSize(size);
-            }
+            /* Size 0 implies the client (DCP consumer) does not support
+               flow control */
+            log.setBufferSize(size);
             return ENGINE_SUCCESS;
         }
     } else if (strncmp(param, "stream_buffer_size", nkey) == 0) {
@@ -390,33 +560,49 @@ ENGINE_ERROR_CODE DcpProducer::control(uint32_t opaque, const void* key,
             "not supported by this engine", logHeader());
         return ENGINE_ENOTSUP;
     } else if (strncmp(param, "enable_noop", nkey) == 0) {
-        if (valueStr.compare("true") == 0) {
+        if (valueStr == "true") {
             noopCtx.enabled = true;
         } else {
             noopCtx.enabled = false;
         }
         return ENGINE_SUCCESS;
     } else if (strncmp(param, "enable_ext_metadata", nkey) == 0) {
-        if (valueStr.compare("true") == 0) {
+        if (valueStr == "true") {
             enableExtMetaData = true;
         } else {
             enableExtMetaData = false;
         }
         return ENGINE_SUCCESS;
+    } else if (strncmp(param, "enable_value_compression", nkey) == 0) {
+        if (valueStr == "true") {
+            enableValueCompression = true;
+        } else {
+            enableValueCompression = false;
+        }
+        return ENGINE_SUCCESS;
+    } else if (strncmp(param, "supports_cursor_dropping", nkey) == 0) {
+        if (valueStr == "true") {
+            supportsCursorDropping = true;
+        } else {
+            supportsCursorDropping = false;
+        }
+        return ENGINE_SUCCESS;
     } else if (strncmp(param, "set_noop_interval", nkey) == 0) {
-        if (parseUint32(valueStr.c_str(), &noopCtx.noopInterval)) {
+        uint32_t noopInterval;
+        if (parseUint32(valueStr.c_str(), &noopInterval)) {
+            noopCtx.dcpNoopTxInterval = std::chrono::seconds(noopInterval);
             return ENGINE_SUCCESS;
         }
     } else if(strncmp(param, "set_priority", nkey) == 0) {
-        if (valueStr.compare("high") == 0) {
+        if (valueStr == "high") {
             engine_.setDCPPriority(getCookie(), CONN_PRIORITY_HIGH);
             priority.assign("high");
             return ENGINE_SUCCESS;
-        } else if (valueStr.compare("medium") == 0) {
+        } else if (valueStr == "medium") {
             engine_.setDCPPriority(getCookie(), CONN_PRIORITY_MED);
             priority.assign("medium");
             return ENGINE_SUCCESS;
-        } else if (valueStr.compare("low") == 0) {
+        } else if (valueStr == "low") {
             engine_.setDCPPriority(getCookie(), CONN_PRIORITY_LOW);
             priority.assign("low");
             return ENGINE_SUCCESS;
@@ -431,6 +617,7 @@ ENGINE_ERROR_CODE DcpProducer::control(uint32_t opaque, const void* key,
 
 ENGINE_ERROR_CODE DcpProducer::handleResponse(
                                         protocol_binary_response_header *resp) {
+    lastReceiveTime = ep_current_time();
     if (doDisconnect()) {
         return ENGINE_DISCONNECT;
     }
@@ -442,23 +629,22 @@ ENGINE_ERROR_CODE DcpProducer::handleResponse(
             reinterpret_cast<protocol_binary_response_dcp_stream_req*>(resp);
         uint32_t opaque = pkt->message.header.response.opaque;
 
-        LockHolder lh(queueLock);
-        stream_t active_stream;
-        std::map<uint16_t, stream_t>::iterator itr;
-        for (itr = streams.begin() ; itr != streams.end(); ++itr) {
-            active_stream = itr->second;
-            Stream *str = active_stream.get();
-            if (str && str->getType() == STREAM_ACTIVE) {
-                ActiveStream* as = static_cast<ActiveStream*>(str);
-                if (as && opaque == itr->second->getOpaque()) {
-                    break;
+
+        // Search for an active stream with the same opaque as the response.
+        auto itr = streams.find_if(
+            [opaque](const StreamsMap::value_type& s) {
+                const auto& stream = s.second;
+                if (stream && stream->getType() == STREAM_ACTIVE) {
+                    ActiveStream* as = static_cast<ActiveStream*>(stream.get());
+                    return (as && opaque == stream->getOpaque());
+                } else {
+                    return false;
                 }
             }
-        }
+        );
 
-        if (itr != streams.end()) {
-            lh.unlock();
-            ActiveStream *as = static_cast<ActiveStream*>(active_stream.get());
+        if (itr.second) {
+            ActiveStream *as = static_cast<ActiveStream*>(itr.first.get());
             if (opcode == PROTOCOL_BINARY_CMD_DCP_SET_VBUCKET_STATE) {
                 as->setVBucketStateAckRecieved();
             } else if (opcode == PROTOCOL_BINARY_CMD_DCP_SNAPSHOT_MARKER) {
@@ -487,138 +673,190 @@ ENGINE_ERROR_CODE DcpProducer::handleResponse(
 }
 
 ENGINE_ERROR_CODE DcpProducer::closeStream(uint32_t opaque, uint16_t vbucket) {
+    lastReceiveTime = ep_current_time();
     if (doDisconnect()) {
         return ENGINE_DISCONNECT;
     }
 
-    LockHolder lh(queueLock);
-    std::map<uint16_t, stream_t>::iterator itr;
-    if ((itr = streams.find(vbucket)) == streams.end()) {
+    auto it = streams.erase(vbucket);
+
+    ENGINE_ERROR_CODE ret;
+    if (!it.second) {
         LOG(EXTENSION_LOG_WARNING, "%s (vb %d) Cannot close stream because no "
             "stream exists for this vbucket", logHeader(), vbucket);
         return ENGINE_KEY_ENOENT;
-    } else if (!itr->second->isActive()) {
-        LOG(EXTENSION_LOG_WARNING, "%s (vb %d) Cannot close stream because "
-            "stream is already marked as dead", logHeader(), vbucket);
-        streams.erase(vbucket);
-        ready.remove(vbucket);
-        lh.unlock();
-        connection_t conn(this);
-        engine_.getDcpConnMap().removeVBConnByVBId(conn, vbucket);
-        return ENGINE_KEY_ENOENT;
+    } else {
+        auto& stream = it.first;
+        if (!stream->isActive()) {
+            LOG(EXTENSION_LOG_WARNING, "%s (vb %d) Cannot close stream because "
+                "stream is already marked as dead", logHeader(), vbucket);
+            connection_t conn(this);
+            engine_.getDcpConnMap().removeVBConnByVBId(conn, vbucket);
+            ret = ENGINE_KEY_ENOENT;
+        } else {
+            stream->setDead(END_STREAM_CLOSED);
+            connection_t conn(this);
+            engine_.getDcpConnMap().removeVBConnByVBId(conn, vbucket);
+            ret = ENGINE_SUCCESS;
+        }
     }
 
-    stream_t stream = itr->second;
-    streams.erase(vbucket);
-    ready.remove(vbucket);
-    lh.unlock();
+    return ret;
+}
 
-    stream->setDead(END_STREAM_CLOSED);
-    connection_t conn(this);
-    engine_.getDcpConnMap().removeVBConnByVBId(conn, vbucket);
-    return ENGINE_SUCCESS;
+void DcpProducer::notifyBackfillManager() {
+    backfillMgr->wakeUpTask();
+}
+
+bool DcpProducer::recordBackfillManagerBytesRead(uint32_t bytes) {
+    return backfillMgr->bytesRead(bytes);
+}
+
+void DcpProducer::recordBackfillManagerBytesSent(uint32_t bytes) {
+    backfillMgr->bytesSent(bytes);
+}
+
+void DcpProducer::scheduleBackfillManager(stream_t s,
+                                          uint64_t start, uint64_t end) {
+    backfillMgr->schedule(s, start, end);
 }
 
 void DcpProducer::addStats(ADD_STAT add_stat, const void *c) {
     Producer::addStats(add_stat, c);
 
-    LockHolder lh(queueLock);
-
     addStat("items_sent", getItemsSent(), add_stat, c);
-    addStat("items_remaining", getItemsRemaining_UNLOCKED(), add_stat, c);
+    addStat("items_remaining", getItemsRemaining(), add_stat, c);
     addStat("total_bytes_sent", getTotalBytes(), add_stat, c);
-    addStat("last_sent_time", lastSendTime, add_stat, c);
+    addStat("last_sent_time", lastSendTime, add_stat,
+            c);
     addStat("noop_enabled", noopCtx.enabled, add_stat, c);
     addStat("noop_wait", noopCtx.pendingRecv, add_stat, c);
     addStat("priority", priority.c_str(), add_stat, c);
     addStat("enable_ext_metadata", enableExtMetaData ? "enabled" : "disabled",
             add_stat, c);
+    addStat("enable_value_compression",
+            enableValueCompression ? "enabled" : "disabled",
+            add_stat, c);
+    addStat("cursor_dropping",
+            supportsCursorDropping ? "ELIGIBLE" : "NOT_ELIGIBLE",
+            add_stat, c);
 
+    // Possible that the producer has had its streams closed and hence doesn't
+    // have a backfill manager anymore.
     if (backfillMgr) {
         backfillMgr->addStats(this, add_stat, c);
     }
 
-    if (log) {
-        addStat("max_buffer_bytes", log->getBufferSize(), add_stat, c);
-        addStat("unacked_bytes", log->getBytesSent(), add_stat, c);
-        addStat("total_acked_bytes", ackedBytes, add_stat, c);
-        addStat("flow_control", "enabled", add_stat, c);
-    } else {
-        addStat("flow_control", "disabled", add_stat, c);
-    }
+    log.addStats(add_stat, c);
 
-    std::map<uint16_t, stream_t>::iterator itr;
-    for (itr = streams.begin(); itr != streams.end(); ++itr) {
-        itr->second->addStats(add_stat, c);
+    addStat("num_streams", streams.size(), add_stat, c);
+
+    // Make a copy of all valid streams (under lock), and then call addStats
+    // for each one. (Done in two stages to minmise how long we have the
+    // streams map locked for).
+    std::vector<StreamsMap::mapped_type> valid_streams;
+
+    streams.for_each(
+        [&valid_streams](const StreamsMap::value_type& element) {
+            valid_streams.push_back(element.second);
+        }
+    );
+    for (const auto& stream : valid_streams) {
+        stream->addStats(add_stat, c);
     }
 }
 
 void DcpProducer::addTakeoverStats(ADD_STAT add_stat, const void* c,
                                    uint16_t vbid) {
-    LockHolder lh(queueLock);
-    std::map<uint16_t, stream_t>::iterator itr = streams.find(vbid);
-    if (itr != streams.end()) {
-        Stream *s = itr->second.get();
-        if (s && s->getType() == STREAM_ACTIVE) {
-            ActiveStream* as = static_cast<ActiveStream*>(s);
-            if (as) {
-                as->addTakeoverStats(add_stat, c);
+
+    auto stream = findStream(vbid);
+    if (stream && stream->getType() == STREAM_ACTIVE) {
+        ActiveStream* as = static_cast<ActiveStream*>(stream.get());
+        if (as) {
+            if (as->getState() == STREAM_DEAD) {
+                return;
             }
+            as->addTakeoverStats(add_stat, c);
         }
     }
 }
 
-void DcpProducer::aggregateQueueStats(ConnCounter* aggregator) {
-    LockHolder lh(queueLock);
-    if (!aggregator) {
-        LOG(EXTENSION_LOG_WARNING, "%s Pointer to the queue stats aggregator"
-            " is NULL!!!", logHeader());
-        return;
-    }
-    aggregator->conn_queueDrain += itemsSent;
-    aggregator->conn_totalBytes += totalBytesSent;
-    aggregator->conn_queueRemaining += getItemsRemaining_UNLOCKED();
-    aggregator->conn_queueBackfillRemaining += totalBackfillBacklogs;
+void DcpProducer::aggregateQueueStats(ConnCounter& aggregator) {
+    aggregator.conn_queueDrain += itemsSent;
+    aggregator.conn_totalBytes += totalBytesSent;
+    aggregator.conn_queueRemaining += getItemsRemaining();
+    aggregator.conn_queueBackfillRemaining += totalBackfillBacklogs;
 }
 
 void DcpProducer::notifySeqnoAvailable(uint16_t vbucket, uint64_t seqno) {
-    LockHolder lh(queueLock);
-    std::map<uint16_t, stream_t>::iterator itr = streams.find(vbucket);
-    if (itr != streams.end() && itr->second->isActive()) {
-        stream_t stream = itr->second;
-        lh.unlock();
+    auto stream = findStream(vbucket);
+    if (stream && stream->isActive()) {
         stream->notifySeqnoAvailable(seqno);
     }
 }
 
 void DcpProducer::vbucketStateChanged(uint16_t vbucket, vbucket_state_t state) {
-    LockHolder lh(queueLock);
-    std::map<uint16_t, stream_t>::iterator itr = streams.find(vbucket);
-    if (itr != streams.end()) {
-        stream_t stream = itr->second;
-        lh.unlock();
+    auto stream = findStream(vbucket);
+    if (stream) {
+        LOG(EXTENSION_LOG_INFO, "%s (vb %" PRIu16 ") State changed to "
+            "%s, closing active stream!",
+            logHeader(), vbucket, VBucket::toString(state));
         stream->setDead(END_STREAM_STATE);
     }
 }
 
-void DcpProducer::closeAllStreams() {
-    LockHolder lh(queueLock);
-    std::list<uint16_t> vblist;
-    while (!streams.empty()) {
-        std::map<uint16_t, stream_t>::iterator itr = streams.begin();
-        uint16_t vbid = itr->first;
-        itr->second->setDead(END_STREAM_DISCONNECTED);
-        streams.erase(vbid);
-        ready.remove(vbid);
-        vblist.push_back(vbid);
+bool DcpProducer::handleSlowStream(uint16_t vbid,
+                                   const std::string &name) {
+    if (supportsCursorDropping) {
+        auto stream = findStream(vbid);
+        if (stream) {
+            if (stream->getName().compare(name) == 0) {
+                ActiveStream* as = static_cast<ActiveStream*>(stream.get());
+                if (as) {
+                    LOG(EXTENSION_LOG_NOTICE, "%s Producer is handling slow "
+                        "stream for vbucket %" PRIu16 ", stream name '%s'",
+                        logHeader(), vbid, name.c_str());
+                    as->handleSlowStream();
+                    return true;
+                }
+            }
+        }
     }
-    lh.unlock();
+    return false;
+}
 
-    connection_t conn(this);
-    std::list<uint16_t>::iterator it = vblist.begin();
-    for (; it != vblist.end(); ++it) {
-        engine_.getDcpConnMap().removeVBConnByVBId(conn, *it);
+void DcpProducer::closeAllStreams() {
+    lastReceiveTime = ep_current_time();
+    std::vector<uint16_t> vbvector;
+    {
+        // Need to synchronise the disconnect and clear, therefore use
+        // external locking here.
+        std::lock_guard<StreamsMap> guard(streams);
+
+        streams.for_each(
+            [&vbvector](StreamsMap::value_type& iter) {
+                vbvector.push_back(iter.first);
+                iter.second->setDead(END_STREAM_DISCONNECTED);
+            },
+            guard);
+
+        streams.clear(guard);
     }
+    connection_t conn(this);
+    for (const auto vbid: vbvector) {
+         engine_.getDcpConnMap().removeVBConnByVBId(conn, vbid);
+    }
+
+    // Destroy the backfillManager. (BackfillManager task also
+    // may hold a weak reference to it while running, but that is
+    // guaranteed to decay and free the BackfillManager once it
+    // completes run().
+    // This will terminate any tasks and delete any backfills
+    // associated with this Producer.  This is necessary as if we
+    // don't, then the RCPtr references which exist between
+    // DcpProducer and ActiveStream result in us leaking DcpProducer
+    // objects (and Couchstore vBucket files, via DCPBackfill task).
+    backfillMgr.reset();
 }
 
 const char* DcpProducer::getType() const {
@@ -630,56 +868,66 @@ const char* DcpProducer::getType() const {
 }
 
 DcpResponse* DcpProducer::getNextItem() {
-    LockHolder lh(queueLock);
+    do {
+        setPaused(false);
 
-    setPaused(false);
-    while (!ready.empty()) {
-        if (log && log->isFull()) {
-            setPaused(true);
-            return NULL;
+        uint16_t vbucket = 0;
+        while (ready.popFront(vbucket)) {
+            if (log.pauseIfFull()) {
+                ready.pushUnique(vbucket);
+                return NULL;
+            }
+
+            DcpResponse* op = NULL;
+            stream_t stream;
+            {
+                stream = findStream(vbucket);
+                if (!stream) {
+                    continue;
+                }
+            }
+
+            op = stream->next();
+
+            if (!op) {
+                // stream is empty, try another vbucket.
+                continue;
+            }
+
+            switch (op->getEvent()) {
+                case DCP_SNAPSHOT_MARKER:
+                case DCP_MUTATION:
+                case DCP_DELETION:
+                case DCP_EXPIRATION:
+                case DCP_STREAM_END:
+                case DCP_SET_VBUCKET:
+                    break;
+                default:
+                    LOG(EXTENSION_LOG_WARNING, "%s Producer is attempting to write"
+                        " an unexpected event %d", logHeader(), op->getEvent());
+                    abort();
+            }
+
+            ready.pushUnique(vbucket);
+
+            if (op->getEvent() == DCP_MUTATION || op->getEvent() == DCP_DELETION ||
+                op->getEvent() == DCP_EXPIRATION) {
+                itemsSent++;
+            }
+
+            totalBytesSent.fetch_add(op->getMessageSize());
+
+            return op;
         }
 
-        uint16_t vbucket = ready.front();
-        ready.pop_front();
+        // flag we are paused
+        setPaused(true);
 
-        if (streams.find(vbucket) == streams.end()) {
-            continue;
-        }
-        DcpResponse* op = streams[vbucket]->next();
-        if (!op) {
-            continue;
-        }
+        // re-check the ready queue.
+        // A new vbucket could of became ready and the notifier could of seen
+        // paused = false, so reloop so we don't miss an operation.
+    } while(!ready.empty());
 
-        switch (op->getEvent()) {
-            case DCP_SNAPSHOT_MARKER:
-            case DCP_MUTATION:
-            case DCP_DELETION:
-            case DCP_EXPIRATION:
-            case DCP_STREAM_END:
-            case DCP_SET_VBUCKET:
-                break;
-            default:
-                LOG(EXTENSION_LOG_WARNING, "%s Producer is attempting to write"
-                    " an unexpected event %d", logHeader(), op->getEvent());
-                abort();
-        }
-
-        if (log) {
-            log->insert(op);
-        }
-        ready.push_back(vbucket);
-
-        if (op->getEvent() == DCP_MUTATION || op->getEvent() == DCP_DELETION ||
-            op->getEvent() == DCP_EXPIRATION) {
-            itemsSent++;
-        }
-
-        totalBytesSent = totalBytesSent + op->getMessageSize();
-
-        return op;
-    }
-
-    setPaused(true);
     return NULL;
 }
 
@@ -687,53 +935,64 @@ void DcpProducer::setDisconnect(bool disconnect) {
     ConnHandler::setDisconnect(disconnect);
 
     if (disconnect) {
-        LockHolder lh(queueLock);
-        std::map<uint16_t, stream_t>::iterator itr = streams.begin();
-        for (; itr != streams.end(); ++itr) {
-            itr->second->setDead(END_STREAM_DISCONNECTED);
-        }
+        streams.for_each(
+            [](StreamsMap::value_type& iter){
+                iter.second->setDead(END_STREAM_DISCONNECTED);
+            }
+        );
     }
 }
 
 void DcpProducer::notifyStreamReady(uint16_t vbucket, bool schedule) {
-    LockHolder lh(queueLock);
-
-    std::list<uint16_t>::iterator iter =
-        std::find(ready.begin(), ready.end(), vbucket);
-    if (iter != ready.end()) {
-        return;
-    }
-
-    ready.push_back(vbucket);
-    lh.unlock();
-
-    if (!log || (log && !log->isFull())) {
-        engine_.getDcpConnMap().notifyPausedConnection(this, schedule);
+    if (ready.pushUnique(vbucket)) {
+        log.unpauseIfSpaceAvailable();
     }
 }
 
-ENGINE_ERROR_CODE DcpProducer::maybeSendNoop(struct dcp_message_producers* producers) {
-    if (noopCtx.enabled) {
-        size_t sinceTime = ep_current_time() - noopCtx.sendTime;
-        if (noopCtx.pendingRecv && sinceTime > noopCtx.noopInterval) {
-            LOG(EXTENSION_LOG_WARNING, "%s Disconnected because the connection"
-                " appears to be dead", logHeader());
-            return ENGINE_DISCONNECT;
-        } else if (!noopCtx.pendingRecv && sinceTime > noopCtx.noopInterval) {
-            ENGINE_ERROR_CODE ret;
-            EventuallyPersistentEngine *epe = ObjectRegistry::onSwitchThread(NULL, true);
-            ret = producers->noop(getCookie(), ++noopCtx.opaque);
-            ObjectRegistry::onSwitchThread(epe);
+void DcpProducer::notifyPaused(bool schedule) {
+    engine_.getDcpConnMap().notifyPausedConnection(this, schedule);
+}
 
-            if (ret == ENGINE_SUCCESS) {
-                ret = ENGINE_WANT_MORE;
-            }
+ENGINE_ERROR_CODE DcpProducer::maybeDisconnect() {
+    std::chrono::seconds elapsedTime(ep_current_time() - lastReceiveTime);
+    if (noopCtx.enabled && elapsedTime > noopCtx.dcpIdleTimeout) {
+        LOG(EXTENSION_LOG_NOTICE, "%s Disconnecting because the connection"
+            " appears to be dead", logHeader());
+            return ENGINE_DISCONNECT;
+        }
+        // Returning ENGINE_FAILED means ignore and continue
+        // without disconnecting
+        return ENGINE_FAILED;
+}
+
+ENGINE_ERROR_CODE DcpProducer::maybeSendNoop(
+        struct dcp_message_producers* producers) {
+    if (!noopCtx.enabled) {
+        // Returning ENGINE_FAILED means ignore and continue
+        // without sending a noop
+        return ENGINE_FAILED;
+    }
+    std::chrono::seconds elapsedTime(ep_current_time() - noopCtx.sendTime);
+
+    // Check to see if waiting for a noop reply.
+    // If not try to send a noop to the consumer if the interval has passed
+    if (!noopCtx.pendingRecv && elapsedTime >= noopCtx.dcpNoopTxInterval) {
+        EventuallyPersistentEngine *epe = ObjectRegistry::
+                onSwitchThread(NULL, true);
+        ENGINE_ERROR_CODE ret = producers->noop(getCookie(), ++noopCtx.opaque);
+        ObjectRegistry::onSwitchThread(epe);
+
+        if (ret == ENGINE_SUCCESS) {
+            ret = ENGINE_WANT_MORE;
             noopCtx.pendingRecv = true;
             noopCtx.sendTime = ep_current_time();
-            lastSendTime = ep_current_time();
-            return ret;
+            lastSendTime = noopCtx.sendTime;
         }
+      return ret;
     }
+    // We have already sent a noop and are awaiting a receive or
+    // the time interval has not passed.  In either case continue
+    // without sending a noop.
     return ENGINE_FAILED;
 }
 
@@ -747,16 +1006,11 @@ void DcpProducer::setTimeForNoop() {
 }
 
 void DcpProducer::clearQueues() {
-    LockHolder lh(queueLock);
-    std::map<uint16_t, stream_t>::iterator itr = streams.begin();
-    for (; itr != streams.end(); ++itr) {
-        itr->second->clear();
-    }
-}
-
-void DcpProducer::appendQueue(std::list<queued_item> *q) {
-    (void) q;
-    abort(); // Not Implemented
+    streams.for_each(
+        [](StreamsMap::value_type& iter) {
+            iter.second->clear();
+        }
+    );
 }
 
 size_t DcpProducer::getBackfillQueueSize() {
@@ -767,18 +1021,16 @@ size_t DcpProducer::getItemsSent() {
     return itemsSent;
 }
 
-size_t DcpProducer::getItemsRemaining_UNLOCKED() {
+size_t DcpProducer::getItemsRemaining() {
     size_t remainingSize = 0;
-
-    std::map<uint16_t, stream_t>::iterator itr = streams.begin();
-    for (; itr != streams.end(); ++itr) {
-        Stream *s = (itr->second).get();
-
-        if (s->getType() == STREAM_ACTIVE) {
-            ActiveStream *as = static_cast<ActiveStream *>(s);
-            remainingSize += as->getItemsRemaining();
+    streams.for_each(
+        [&remainingSize](const StreamsMap::value_type& iter) {
+            if (iter.second->getType() == STREAM_ACTIVE) {
+                ActiveStream *as = static_cast<ActiveStream *>(iter.second.get());
+                remainingSize += as->getItemsRemaining();
+            }
         }
-    }
+    );
 
     return remainingSize;
 }
@@ -787,14 +1039,13 @@ size_t DcpProducer::getTotalBytes() {
     return totalBytesSent;
 }
 
-std::list<uint16_t> DcpProducer::getVBList() {
-    LockHolder lh(queueLock);
-    std::list<uint16_t> vblist;
-    std::map<uint16_t, stream_t>::iterator itr = streams.begin();
-    for (; itr != streams.end(); ++itr) {
-        vblist.push_back(itr->first);
-    }
-    return vblist;
+std::vector<uint16_t> DcpProducer::getVBVector() {
+    std::vector<uint16_t> vbvector;
+    streams.for_each(
+        [&vbvector](StreamsMap::value_type& iter) {
+        vbvector.push_back(iter.first);
+    });
+    return vbvector;
 }
 
 bool DcpProducer::windowIsFull() {
@@ -803,4 +1054,27 @@ bool DcpProducer::windowIsFull() {
 
 void DcpProducer::flush() {
     abort(); // Not Implemented
+}
+
+bool DcpProducer::bufferLogInsert(size_t bytes) {
+    return log.insert(bytes);
+}
+
+void DcpProducer::scheduleCheckpointProcessorTask(stream_t s) {
+    static_cast<ActiveStreamCheckpointProcessorTask*>(checkpointCreatorTask.get())
+        ->schedule(s);
+}
+
+void DcpProducer::clearCheckpointProcessorTaskQueues() {
+    static_cast<ActiveStreamCheckpointProcessorTask*>(checkpointCreatorTask.get())
+        ->clearQueues();
+}
+
+SingleThreadedRCPtr<Stream> DcpProducer::findStream(uint16_t vbid) {
+    auto it = streams.find(vbid);
+    if (it.second) {
+        return it.first;
+    } else {
+        return SingleThreadedRCPtr<Stream>();
+    }
 }

@@ -1,6 +1,6 @@
 /* -*- Mode: C++; tab-width: 4; c-basic-offset: 4; indent-tabs-mode: nil -*- */
 /*
- *     Copyright 2010 Couchbase, Inc
+ *     Copyright 2016 Couchbase, Inc
  *
  *   Licensed under the Apache License, Version 2.0 (the "License");
  *   you may not use this file except in compliance with the License.
@@ -15,29 +15,20 @@
  *   limitations under the License.
  */
 
-#ifndef TESTS_EP_TESTSUITE_H_
-#define TESTS_EP_TESTSUITE_H_ 1
+#include "string_utils.h"
 
-#include "config.h"
+#include <gtest/gtest.h>
 
-#include <memcached/engine.h>
-#include <memcached/engine_testapp.h>
-
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-MEMCACHED_PUBLIC_API
-engine_test_t* get_tests(void);
-
-MEMCACHED_PUBLIC_API
-bool setup_suite(struct test_harness *th);
-
-MEMCACHED_PUBLIC_API
-bool teardown_suite(void);
-
-#ifdef __cplusplus
+TEST(cb_stobTest, ValidWorks) {
+    EXPECT_TRUE(cb_stob("true"));
+    EXPECT_FALSE(cb_stob("false"));
 }
-#endif
 
-#endif  /* TESTS_EP_TESTSUITE_H_ */
+TEST(cb_stobTest, ThrowsInvalid) {
+    EXPECT_THROW(cb_stob("TRUE"), invalid_argument_bool);
+    EXPECT_THROW(cb_stob("True"), invalid_argument_bool);
+    EXPECT_THROW(cb_stob("completelyinvalid"), invalid_argument_bool);
+    EXPECT_THROW(cb_stob("FALSE"), invalid_argument_bool);
+    EXPECT_THROW(cb_stob("FLASE"), invalid_argument_bool);
+    EXPECT_THROW(cb_stob("farce"), invalid_argument_bool);
+}

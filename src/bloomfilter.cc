@@ -18,6 +18,8 @@
 #include "bloomfilter.h"
 #include "murmurhash3.h"
 
+#include <cmath>
+
 #if __x86_64__ || __ppc64__
 #define MURMURHASH_3 MurmurHash3_x64_128
 #else
@@ -97,12 +99,8 @@ std::string BloomFilter::getStatusString() {
             return "COMPACTING";
         case BFILTER_ENABLED:
             return "ENABLED";
-        default:
-            // Fix warining:
-            //  control reaches end of non-void function [-Wreturn-type]
-            cb_assert(false);
-            return "UNKNOWN";
     }
+    return "UNKNOWN";
 }
 
 void BloomFilter::addKey(const char *key, size_t keylen) {

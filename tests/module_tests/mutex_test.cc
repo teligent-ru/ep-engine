@@ -18,20 +18,33 @@
 #include "config.h"
 
 #include <iostream>
+#include <thread>
 
 #include "common.h"
 #include "locks.h"
 
-int main(int argc, char **argv) {
-    (void)argc; (void)argv;
+#include <gtest/gtest.h>
 
-    Mutex m;
-    cb_assert(!m.ownsLock());
+TEST(LockTimerTest, LockHolder) {
+    std::mutex m;
     {
-        LockHolder lh(m);
-        cb_assert(m.ownsLock());
+        LockTimer<LockHolder, 1, 1> lh(m, "LockHolder");
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
-    cb_assert(!m.ownsLock());
+}
 
-    return 0;
+TEST(LockTimerTest, ReaderLockHolder) {
+    RWLock m;
+    {
+        LockTimer<ReaderLockHolder, 1, 1> rlh(m, "ReaderLockHolder");
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+}
+
+TEST(LockTimerTest, WriterLockHolder) {
+    RWLock m;
+    {
+        LockTimer<WriterLockHolder, 1, 1> wlh(m, "WriterLockHolder");
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
 }

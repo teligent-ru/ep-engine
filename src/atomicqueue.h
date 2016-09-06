@@ -44,9 +44,20 @@ public:
         }
     }
 
+    /**
+     * True if this queue is empty.
+     */
     bool empty() {
         std::lock_guard<std::mutex> lock(mutex);
         return queue.empty();
+    }
+
+    /**
+     * Return the number of queued items.
+     */
+    size_t size() {
+        std::lock_guard<std::mutex> lock(mutex);
+        return queue.size();
     }
 
 private:
@@ -58,8 +69,9 @@ private:
 
 #include <queue>
 
-#include "atomic.h"
+#include <atomic>
 #include "threadlocal.h"
+#include "utility.h"
 
 /**
  * Efficient approximate-FIFO queue optimize for concurrent writers.
@@ -141,7 +153,9 @@ private:
     AtomicPtr<std::queue<T> > *initialize() {
         std::queue<T> *q = new std::queue<T>;
         size_t i(counter++);
-        cb_assert(counter <= MAX_THREADS);
+        if (counter > MAX_THREADS) {
+            throw std::overflow_error("AtomicQueue::initialize: exceeded maximum allowed threads");
+        }
         queues[i].store(q);
         threadQueue = &queues[i];
         return &queues[i];
@@ -157,8 +171,8 @@ private:
 
     ThreadLocalPtr<AtomicPtr<std::queue<T> > > threadQueue;
     AtomicPtr<std::queue<T> > queues[MAX_THREADS];
-    AtomicValue<size_t> counter;
-    AtomicValue<size_t> numItems;
+    std::atomic<size_t> counter;
+    std::atomic<size_t> numItems;
     DISALLOW_COPY_AND_ASSIGN(AtomicQueue);
 };
 #endif

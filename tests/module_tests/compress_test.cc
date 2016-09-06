@@ -1,6 +1,6 @@
 /* -*- Mode: C++; tab-width: 4; c-basic-offset: 4; indent-tabs-mode: nil -*- */
 /*
- *     Copyright 2011 Couchbase, Inc.
+ *     Copyright 2015 Couchbase, Inc
  *
  *   Licensed under the Apache License, Version 2.0 (the "License");
  *   you may not use this file except in compliance with the License.
@@ -16,32 +16,23 @@
  */
 
 #include "config.h"
-#include "mutex.h"
+#include "common.h"
+#include "compress.h"
 
-Mutex::Mutex() : held(false)
-{
-    cb_mutex_initialize(&mutex);
+void test_snappy_behavior() {
+    std::string send("{\"foo1\":\"bar1\"}");
+    snap_buf output1, output2;
+    cb_assert(doSnappyUncompress(send.c_str(), send.size(), output1) == SNAP_FAILURE);
+    cb_assert(doSnappyCompress(send.c_str(), send.size(), output1) == SNAP_SUCCESS);
+    cb_assert(doSnappyUncompress(output1.buf.get(), output1.len, output2) == SNAP_SUCCESS);
+    std::string recv(output2.buf.get(), output2.len);
+    cb_assert(send == recv);
 }
 
-Mutex::~Mutex() {
-    cb_mutex_destroy(&mutex);
-}
+int main(int argc, char **argv) {
+    (void)argc;
+    (void)argv;
 
-void Mutex::acquire() {
-    cb_mutex_enter(&mutex);
-    setHolder(true);
-}
-
-bool Mutex::tryAcquire() {
-    if (!cb_mutex_try_enter(&mutex)) {
-        setHolder(true);
-        return true;
-    }
-    return false;
-}
-
-void Mutex::release() {
-    cb_assert(held && cb_thread_equal(holder, cb_thread_self()));
-    setHolder(false);
-    cb_mutex_exit(&mutex);
+    test_snappy_behavior();
+    return 0;
 }

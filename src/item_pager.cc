@@ -1,6 +1,6 @@
 /* -*- Mode: C++; tab-width: 4; c-basic-offset: 4; indent-tabs-mode: nil -*- */
 /*
- *     Copyright 2010 Couchbase, Inc
+ *     Copyright 2015 Couchbase, Inc
  *
  *   Licensed under the Apache License, Version 2.0 (the "License");
  *   you may not use this file except in compliance with the License.
@@ -15,7 +15,13 @@
  *   limitations under the License.
  */
 
-#include "config.h"
+#include "item_pager.h"
+
+#include "connmap.h"
+#include "dcp/dcpconnmap.h"
+#include "ep.h"
+#include "ep_engine.h"
+#include "tapconnmap.h"
 
 #include <cstdlib>
 #include <iostream>
@@ -24,13 +30,15 @@
 #include <string>
 #include <utility>
 
-#include "common.h"
-#include "ep.h"
-#include "ep_engine.h"
-#include "item_pager.h"
-#include "connmap.h"
+#include <phosphor/phosphor.h>
+
 
 static const size_t MAX_PERSISTENCE_QUEUE_SIZE = 1000000;
+
+enum pager_type_t {
+    ITEM_PAGER,
+    EXPIRY_PAGER
+};
 
 /**
  * As part of the ItemPager, visit all of the objects in memory and
@@ -53,13 +61,15 @@ public:
      * @param phase pointer to an item_pager_phase to be set
      */
     PagingVisitor(EventuallyPersistentStore &s, EPStats &st, double pcnt,
-                  bool *sfin, bool pause = false,
-                  double bias = 1, item_pager_phase *phase = NULL)
-      : store(s), stats(st), percent(pcnt),
+                  std::shared_ptr<std::atomic<bool>> &sfin, pager_type_t caller,
+                  bool pause, double bias,
+                  std::atomic<item_pager_phase>* phase) :
+        store(s), stats(st), percent(pcnt),
         activeBias(bias), ejected(0),
-        startTime(ep_real_time()), stateFinalizer(sfin), canPause(pause),
-        completePhase(true), wasHighMemoryUsage(s.isMemoryUsageTooHigh()),
-        pager_phase(phase) {}
+        startTime(ep_real_time()), stateFinalizer(sfin), owner(caller),
+        canPause(pause), completePhase(true),
+        wasHighMemoryUsage(s.isMemoryUsageTooHigh()),
+        taskStart(gethrtime()), pager_phase(phase) {}
 
     void visit(StoredValue *v) {
         // Delete expired items for an active vbucket.
@@ -135,7 +145,7 @@ public:
     }
 
     void update() {
-        store.deleteExpiredItems(expired);
+        store.deleteExpiredItems(expired, EXP_BY_PAGER);
 
         if (numEjected() > 0) {
             LOG(EXTENSION_LOG_INFO, "Paged out %ld values", numEjected());
@@ -157,9 +167,16 @@ public:
 
     void complete() {
         update();
-        if (stateFinalizer) {
-            *stateFinalizer = true;
+
+        hrtime_t elapsed_time = (gethrtime() - taskStart) / 1000;
+        if (owner == ITEM_PAGER) {
+            stats.itemPagerHisto.add(elapsed_time);
+        } else if (owner == EXPIRY_PAGER) {
+            stats.expiryPagerHisto.add(elapsed_time);
         }
+
+        bool inverse = false;
+        (*stateFinalizer).compare_exchange_strong(inverse, true);
 
         if (pager_phase && completePhase) {
             if (*pager_phase == PAGING_UNREFERENCED) {
@@ -220,14 +237,25 @@ private:
     double activeBias;
     size_t ejected;
     time_t startTime;
-    bool *stateFinalizer;
+    std::shared_ptr<std::atomic<bool>> stateFinalizer;
+    pager_type_t owner;
     bool canPause;
     bool completePhase;
     bool wasHighMemoryUsage;
-    item_pager_phase *pager_phase;
+    hrtime_t taskStart;
+    std::atomic<item_pager_phase>* pager_phase;
 };
 
+ItemPager::ItemPager(EventuallyPersistentEngine *e, EPStats &st) :
+    GlobalTask(e, TaskId::ItemPager, 10, false),
+    engine(e),
+    stats(st),
+    available(new std::atomic<bool>(true)),
+    phase(PAGING_UNREFERENCED),
+    doEvict(false) { }
+
 bool ItemPager::run(void) {
+    TRACE_EVENT0("ep-engine/task", "ItemPager");
     EventuallyPersistentStore *store = engine->getEpStore();
     double current = static_cast<double>(stats.getTotalMemoryUsed());
     double upper = static_cast<double>(stats.mem_high_wat);
@@ -238,7 +266,9 @@ bool ItemPager::run(void) {
         doEvict = false;
     }
 
-    if (available && ((current > upper) || doEvict)) {
+    bool inverse = true;
+    if (((current > upper) || doEvict) &&
+        (*available).compare_exchange_strong(inverse, false)) {
         if (store->getItemEvictionPolicy() == VALUE_ONLY) {
             doEvict = true;
         }
@@ -257,31 +287,84 @@ bool ItemPager::run(void) {
         size_t activeEvictPerc = cfg.getPagerActiveVbPcnt();
         double bias = static_cast<double>(activeEvictPerc) / 50;
 
-        available = false;
-        shared_ptr<PagingVisitor> pv(new PagingVisitor(*store, stats, toKill,
-                                                       &available,
+        std::shared_ptr<PagingVisitor> pv(new PagingVisitor(*store, stats, toKill,
+                                                       available, ITEM_PAGER,
                                                        false, bias, &phase));
         store->visit(pv, "Item pager", NONIO_TASK_IDX,
-                    Priority::ItemPagerPriority);
+                     TaskId::ItemPagerVisitor);
     }
 
     snooze(sleepTime);
     return true;
 }
 
+ExpiredItemPager::ExpiredItemPager(EventuallyPersistentEngine *e,
+                                   EPStats &st, size_t stime,
+                                   ssize_t taskTime) :
+    GlobalTask(e, TaskId::ExpiredItemPager,
+               static_cast<double>(stime), false),
+    engine(e),
+    stats(st),
+    sleepTime(static_cast<double>(stime)),
+    available(new std::atomic<bool>(true)) {
+
+    double initialSleep = sleepTime;
+    if (taskTime != -1) {
+        /*
+         * Ensure task start time will always be within a range of (0, 23).
+         * A validator is already in place in the configuration file.
+         */
+        size_t startTime = taskTime % 24;
+
+        /*
+         * The following logic calculates the amount of time this task
+         * needs to sleep for initially so that it would wake up at the
+         * designated task time, note that this logic kicks in only when
+         * taskTime is set to value other than -1.
+         * Otherwise this task will wake up periodically in a time
+         * specified by sleeptime.
+         */
+        time_t now = ep_abs_time(ep_current_time());
+        struct tm timeNow, timeTarget;
+        timeNow = *(gmtime(&now));
+        timeTarget = timeNow;
+        if (timeNow.tm_hour >= (int)startTime) {
+            timeTarget.tm_mday += 1;
+        }
+        timeTarget.tm_hour = startTime;
+        timeTarget.tm_min = 0;
+        timeTarget.tm_sec = 0;
+
+        initialSleep = difftime(mktime(&timeTarget), mktime(&timeNow));
+        snooze(initialSleep);
+    }
+
+    updateExpPagerTime(initialSleep);
+}
+
 bool ExpiredItemPager::run(void) {
+    TRACE_EVENT0("ep-engine/task", "ExpiredItemPager");
     EventuallyPersistentStore *store = engine->getEpStore();
-    if (available) {
+    bool inverse = true;
+    if ((*available).compare_exchange_strong(inverse, false)) {
         ++stats.expiryPagerRuns;
 
-        available = false;
-        shared_ptr<PagingVisitor> pv(new PagingVisitor(*store, stats, -1,
-                                                       &available,
+        std::shared_ptr<PagingVisitor> pv(new PagingVisitor(*store, stats, -1,
+                                                       available, EXPIRY_PAGER,
                                                        true, 1, NULL));
         // track spawned tasks for shutdown..
         store->visit(pv, "Expired item remover", NONIO_TASK_IDX,
-                Priority::ItemPagerPriority, 10);
+                     TaskId::ExpiredItemPagerVisitor, 10);
     }
     snooze(sleepTime);
+    updateExpPagerTime(sleepTime);
+
     return true;
+}
+
+void ExpiredItemPager::updateExpPagerTime(double sleepSecs) {
+    struct timeval _waketime;
+    gettimeofday(&_waketime, NULL);
+    _waketime.tv_sec += sleepSecs;
+    stats.expPagerTime.store(_waketime.tv_sec);
 }

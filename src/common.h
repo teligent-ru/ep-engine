@@ -1,6 +1,6 @@
 /* -*- Mode: C++; tab-width: 4; c-basic-offset: 4; indent-tabs-mode: nil -*- */
 /*
- *     Copyright 2010 Couchbase, Inc
+ *     Copyright 2015 Couchbase, Inc
  *
  *   Licensed under the Apache License, Version 2.0 (the "License");
  *   you may not use this file except in compliance with the License.
@@ -27,35 +27,14 @@
 #include <math.h>
 #include <memcached/engine.h>
 #include <platform/platform.h>
+#include <cJSON.h>
 
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
-#ifdef HAVE_CXX11_SUPPORT
-#include <unordered_map>
-#include <memory>
-using std::unordered_map;
-using std::shared_ptr;
-#else
-
-#ifndef HAVE_TR1_MEMORY
-#error "You need to install tr1/memory or upgrade your C++ compiler"
-#endif
-#include <tr1/memory>
-using std::tr1::shared_ptr;
-
-#ifndef HAVE_TR1_UNORDERED_MAP
-#error "You need to install tr1/unordered_map or upgrade your C++ compiler"
-#endif
-
-#include <tr1/unordered_map>
-using std::tr1::unordered_map;
-#endif
-
 #include <list>
 #include <sstream>
-#include <string>
 #include <utility>
 #include <vector>
 
@@ -68,22 +47,6 @@ using std::tr1::unordered_map;
 #ifndef UINT16_MAX
 #define UINT16_MAX 65535
 #endif /* UINT16_MAX */
-
-// Stolen from http://google-styleguide.googlecode.com/svn/trunk/cppguide.xml
-// A macro to disallow the copy constructor and operator= functions
-// This should be used in the private: declarations for a class
-#define DISALLOW_COPY_AND_ASSIGN(TypeName)      \
-    TypeName(const TypeName&);                  \
-    void operator=(const TypeName&)
-
-#define DISALLOW_ASSIGN(TypeName)               \
-    void operator=(const TypeName&)
-
-// Utility functions implemented in various modules.
-
-extern void LOG(EXTENSION_LOG_LEVEL severity, const char *fmt, ...);
-
-extern ALLOCATOR_HOOKS_API *getHooksApi(void);
 
 // Time handling functions
 inline void advance_tv(struct timeval &tv, const double secs) {
@@ -125,7 +88,10 @@ inline bool is_max_tv(struct timeval &tv) {
 }
 
 inline bool parseUint16(const char *in, uint16_t *out) {
-    cb_assert(out != NULL);
+    if (out == nullptr) {
+        return false;
+    }
+
     errno = 0;
     *out = 0;
     char *endptr;
@@ -142,8 +108,9 @@ inline bool parseUint16(const char *in, uint16_t *out) {
 
 inline bool parseUint32(const char *str, uint32_t *out) {
     char *endptr = NULL;
-    cb_assert(out);
-    cb_assert(str);
+    if (out == nullptr || str == nullptr) {
+        return false;
+    }
     *out = 0;
     errno = 0;
 
@@ -169,7 +136,9 @@ inline bool parseUint32(const char *str, uint32_t *out) {
 }
 
 inline bool parseInt64(const char *str, int64_t *out) {
-    cb_assert(out != NULL);
+    if (out == nullptr) {
+        return false;
+    }
     errno = 0;
     *out = 0;
     char *endptr;
@@ -189,7 +158,9 @@ inline bool parseInt64(const char *str, int64_t *out) {
 
 #define xisspace(c) isspace((unsigned char)c)
 inline bool parseUint64(const char *str, uint64_t *out) {
-    cb_assert(out != NULL);
+    if (out == nullptr) {
+        return false;
+    }
     errno = 0;
     *out = 0;
     char *endptr;
@@ -299,5 +270,14 @@ bool sorted(ForwardIterator first, ForwardIterator last, Compare compare) {
     return is_sorted;
 }
 
-#define GIGANTOR ((size_t)1<<(sizeof(size_t)*8-1))
+inline const std::string getJSONObjString(const cJSON *i) {
+    if (i == NULL) {
+        return "";
+    }
+    if (i->type != cJSON_String) {
+        abort();
+    }
+    return i->valuestring;
+}
+
 #endif  // SRC_COMMON_H_

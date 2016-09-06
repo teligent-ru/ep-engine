@@ -20,27 +20,19 @@
 
 #include "config.h"
 
-#include <errno.h>
+#include "ep.h"
+#include "tapconnection.h"
+#include "taskable.h"
+#include "vbucket.h"
 
-#include <algorithm>
-#include <cstdio>
-#include <limits>
-#include <list>
-#include <map>
-#include <sstream>
+#include <memcached/engine.h>
+
 #include <string>
 
-#include "configuration.h"
-#include "ep.h"
-#include "ep-engine/command_ids.h"
-#include "ext_meta_parser.h"
-#include "item_pager.h"
-#include "kvstore.h"
-#include "locks.h"
-#include "tapconnection.h"
-#include "workload.h"
-
+class StoredValue;
 class DcpConnMap;
+class DcpFlowControlManager;
+class Producer;
 class TapConnMap;
 class ReplicationThrottle;
 
@@ -49,6 +41,10 @@ extern "C" {
     ENGINE_ERROR_CODE create_instance(uint64_t interface,
                                       GET_SERVER_API get_server_api,
                                       ENGINE_HANDLE **handle);
+
+    EXPORT_FUNCTION
+    void destroy_engine(void);
+
     void EvpNotifyPendingConns(void*arg);
 }
 
@@ -62,6 +58,33 @@ typedef void (*NOTIFY_IO_COMPLETE_T)(const void *cookie,
 // Forward decl
 class EventuallyPersistentEngine;
 class TapConnMap;
+
+/**
+    To allow Engines to run tasks.
+**/
+class EpEngineTaskable : public Taskable {
+public:
+    EpEngineTaskable(EventuallyPersistentEngine* e) : myEngine(e) {
+
+    }
+
+    const std::string& getName() const;
+
+    task_gid_t getGID() const;
+
+    bucket_priority_t getWorkloadPriority() const;
+
+    void setWorkloadPriority(bucket_priority_t prio);
+
+    WorkLoadPolicy& getWorkLoadPolicy(void);
+
+    void logQTime(TaskId id, hrtime_t enqTime);
+
+    void logRunTime(TaskId id, hrtime_t runTime);
+
+private:
+    EventuallyPersistentEngine* myEngine;
+};
 
 /**
  * Vbucket visitor that counts active vbuckets.
@@ -80,17 +103,16 @@ public:
         opsCreate(0),
         opsUpdate(0), opsDelete(0),
         opsReject(0), queueSize(0),
-        queueMemory(0), queueAge(0),
-        queueFill(0), queueDrain(0),
+        queueMemory(0), queueFill(0), queueDrain(0),
         pendingWrites(0), chkPersistRemaining(0),
-        fileSpaceUsed(0), fileSize(0)
+        queueAge(0), rollbackItemCount(0)
     { }
 
     bool visitBucket(RCPtr<VBucket> &vb);
 
     void visit(StoredValue* v) {
-        (void)v;
-        cb_assert(false); // this does not happen
+        throw std::logic_error("VBucketCountVisitor:visit: Should never "
+                "be called");
     }
 
     vbucket_state_t getVBucketState() { return desired_state; }
@@ -134,8 +156,7 @@ public:
     size_t getPendingWrites() { return pendingWrites; }
     size_t getChkPersistRemaining() { return chkPersistRemaining; }
 
-    size_t getFileSpaceUsed() { return fileSpaceUsed; }
-    size_t getFileSize() { return fileSize; }
+    uint64_t getRollbackItemCount() { return rollbackItemCount; }
 
 private:
     EventuallyPersistentEngine &engine;
@@ -160,14 +181,25 @@ private:
 
     size_t queueSize;
     size_t queueMemory;
-    uint64_t queueAge;
     size_t queueFill;
     size_t queueDrain;
     size_t pendingWrites;
     size_t chkPersistRemaining;
+    uint64_t queueAge;
+    uint64_t rollbackItemCount;
+};
 
-    size_t fileSpaceUsed;
-    size_t fileSize;
+/**
+ * A container class holding VBucketCountVisitors to aggregate stats for
+ * different vbucket states.
+ */
+class VBucketCountAggregator : public VBucketVisitor  {
+public:
+    bool visitBucket(RCPtr<VBucket> &vb);
+
+    void addVisitor(VBucketCountVisitor* visitor);
+private:
+    std::map<vbucket_state_t, VBucketCountVisitor*> visitorMap;
 };
 
 /**
@@ -256,17 +288,17 @@ public:
                           const void* key,
                           const int nkey,
                           uint16_t vbucket,
-                          bool track_stat = false)
+                          get_options_t options)
     {
         BlockTimer timer(&stats.getCmdHisto);
         std::string k(static_cast<const char*>(key), nkey);
 
-        GetValue gv(epstore->get(k, vbucket, cookie, serverApi->core));
+        GetValue gv(epstore->get(k, vbucket, cookie, options));
         ENGINE_ERROR_CODE ret = gv.getStatus();
 
         if (ret == ENGINE_SUCCESS) {
             *itm = gv.getValue();
-            if (track_stat) {
+            if (options & TRACK_STATISTICS) {
                 ++stats.numOpsGet;
             }
         } else if (ret == ENGINE_KEY_ENOENT || ret == ENGINE_NOT_MY_VBUCKET) {
@@ -278,8 +310,8 @@ public:
         return ret;
     }
 
-    const char* getName() {
-        return name.c_str();
+    const std::string& getName() const {
+        return name;
     }
 
     ENGINE_ERROR_CODE getStats(const void* cookie,
@@ -317,15 +349,22 @@ public:
         item *it = NULL;
         Item *nit = NULL;
         uint64_t cas = 0;
+
         uint8_t ext_meta[1];
         uint8_t ext_len = EXT_META_LEN;
-        *(ext_meta) = datatype;
+        //Datatype of arithmetic values is always JSON
+        *(ext_meta) = PROTOCOL_BINARY_DATATYPE_JSON;
 
         rel_time_t expiretime = (exptime == 0 ||
                                  exptime == 0xffffffff) ?
             0 : ep_abs_time(ep_reltime(exptime));
 
-        ENGINE_ERROR_CODE ret = get(cookie, &it, key, nkey, vbucket);
+        get_options_t options = static_cast<get_options_t>(QUEUE_BG_FETCH |
+                                                           HONOR_STATES |
+                                                           TRACK_REFERENCE |
+                                                           HIDE_LOCKED_CAS);
+
+        ENGINE_ERROR_CODE ret = get(cookie, &it, key, nkey, vbucket, options);
         if (ret == ENGINE_SUCCESS) {
             Item *itm = static_cast<Item*>(it);
             char *endptr = NULL;
@@ -340,7 +379,11 @@ public:
                 delete itm;
                 return ENGINE_TMPFAIL;
             }
-            cb_assert(itm->getCas());
+            if (itm->getCas() == 0) {
+                // A zero cas should not be possible for a valid item
+                delete itm;
+                return ENGINE_EINVAL;
+            }
             if ((errno != ERANGE) && (isspace(*endptr)
                                       || (*endptr == '\0' && endptr != data))) {
                 if (increment) {
@@ -357,6 +400,7 @@ public:
                 vals << val;
                 size_t nb = vals.str().length();
                 *result = val;
+
                 nit = new Item(key, (uint16_t)nkey, itm->getFlags(),
                                      itm->getExptime(), vals.str().c_str(), nb,
                                      ext_meta, ext_len);
@@ -378,6 +422,7 @@ public:
                 vals << initial;
                 size_t nb = vals.str().length();
                 *result = initial;
+
                 nit = new Item(key, (uint16_t)nkey, 0, expiretime,
                                      vals.str().c_str(), nb, ext_meta, ext_len);
                 ret = store(cookie, nit, &cas, OPERATION_ADD, vbucket);
@@ -434,8 +479,13 @@ public:
                               uint32_t opaque,
                               uint32_t seqno,
                               uint32_t flags,
-                              void *stream_name,
+                              const void *stream_name,
                               uint16_t nname);
+
+    ENGINE_ERROR_CODE dcpAddStream(const void* cookie,
+                                   uint32_t opaque,
+                                   uint16_t vbucket,
+                                   uint32_t flags);
 
     ENGINE_ERROR_CODE ConnHandlerCheckPoint(TapConsumer *consumer,
                                             uint8_t event,
@@ -568,6 +618,7 @@ public:
     }
 
     void handleDisconnect(const void *cookie);
+    void handleDeleteBucket(const void *cookie);
 
     protocol_binary_response_status stopFlusher(const char **msg, size_t *msg_size) {
         (void) msg_size;
@@ -597,9 +648,10 @@ public:
         return epstore->deleteVBucket(vbid, c);
     }
 
-    ENGINE_ERROR_CODE compactDB(uint16_t vbid, compaction_ctx c,
+    ENGINE_ERROR_CODE compactDB(uint16_t vbid,
+                                compaction_ctx c,
                                 const void *cookie = NULL) {
-        return epstore->compactDB(vbid, c, cookie);
+        return epstore->scheduleCompaction(vbid, c, cookie);
     }
 
     bool resetVBucket(uint16_t vbid) {
@@ -621,13 +673,10 @@ public:
         return epstore->evictKey(key, vbucket, msg, msg_size);
     }
 
-    bool getLocked(const std::string &key,
-                   uint16_t vbucket,
-                   Callback<GetValue> &cb,
-                   rel_time_t currentTime,
-                   uint32_t lockTimeout,
-                   const void *cookie) {
-        return epstore->getLocked(key, vbucket, cb, currentTime, lockTimeout, cookie);
+    GetValue getLocked(const std::string &key, uint16_t vbucket,
+                       rel_time_t currentTime, uint32_t lockTimeout,
+                       const void *cookie) {
+        return epstore->getLocked(key, vbucket, currentTime, lockTimeout, cookie);
     }
 
     ENGINE_ERROR_CODE unlockKey(const std::string &key,
@@ -668,6 +717,10 @@ public:
     TapConnMap &getTapConnMap() { return *tapConnMap; }
 
     DcpConnMap &getDcpConnMap() { return *dcpConnMap_; }
+
+    DcpFlowControlManager &getDcpFlowControlManager() {
+        return *dcpFlowControlManager_;
+    }
 
     TapConfig &getTapConfig() { return *tapConfig; }
 
@@ -725,14 +778,12 @@ public:
         return *workload;
     }
 
-    bucket_priority_t getWorkloadPriority(void) {return workloadPriority; }
+    bucket_priority_t getWorkloadPriority(void) const {return workloadPriority; }
     void setWorkloadPriority(bucket_priority_t p) { workloadPriority = p; }
 
     struct clusterConfig {
-        clusterConfig() : len(0), config(NULL) {}
-        uint32_t len;
-        uint8_t *config;
-        Mutex lock;
+        std::string config;
+        std::mutex lock;
     } clusterConfig;
 
     ENGINE_ERROR_CODE getRandomKey(const void *cookie,
@@ -747,6 +798,53 @@ public:
      * testing.
      */
     void runDefragmenterTask(void);
+
+    /*
+     * Explicitly trigger the AccessScanner task. Provided to facilitate
+     * testing.
+     */
+    bool runAccessScannerTask(void);
+
+    /*
+     * Explicitly trigger the VbStatePersist task. Provided to facilitate
+     * testing.
+     */
+    void runVbStatePersistTask(int vbid);
+
+    /**
+     * Get a (sloppy) list of the sequence numbers for all of the vbuckets
+     * on this server. It is not to be treated as a consistent set of seqence,
+     * but rather a list of "at least" numbers. The way the list is generated
+     * is that we're starting for vbucket 0 and record the current number,
+     * then look at the next vbucket and record its number. That means that
+     * at the time we get the number for vbucket X all of the previous
+     * numbers could have been incremented. If the client just needs a list
+     * of where we are for each vbucket this method may be more optimal than
+     * requesting one by one.
+     *
+     * @param cookie The cookie representing the connection to requesting
+     *               list
+     * @param add_response The method used to format the output buffer
+     * @return ENGINE_SUCCESS upon success
+     */
+    ENGINE_ERROR_CODE getAllVBucketSequenceNumbers(
+                                        const void *cookie,
+                                        protocol_binary_request_header *request,
+                                        ADD_RESPONSE response);
+
+    void updateDcpMinCompressionRatio(float value);
+
+    /**
+     * Sends a not-my-vbucket response, using the specified response callback.
+     * to the specified connection via it's cookie.
+     */
+    ENGINE_ERROR_CODE sendNotMyVBucketResponse(ADD_RESPONSE response,
+                                               const void* cookie,
+                                               uint64_t cas);
+
+    EpEngineTaskable& getTaskable() {
+        return taskable;
+    }
 
 protected:
     friend class EpEngineValueChangeListener;
@@ -763,7 +861,6 @@ protected:
         getlMaxTimeout = value;
     }
 
-private:
     EventuallyPersistentEngine(GET_SERVER_API get_server_api);
     friend ENGINE_ERROR_CODE create_instance(uint64_t interface,
                                              GET_SERVER_API get_server_api,
@@ -800,11 +897,7 @@ private:
             ++stats.tmp_oom_errors;
             // Wake up the item pager task as memory usage
             // seems to have exceeded high water mark
-            if ((getEpStore()->fetchItemPagerTask())->getState() ==
-                                                                TASK_SNOOZED) {
-                ExecutorPool::get()->wake(
-                        (getEpStore()->fetchItemPagerTask())->getId());
-            }
+            getEpStore()->wakeUpItemPager();
             return ENGINE_TMPFAIL;
         } else {
             ++stats.oom_errors;
@@ -868,6 +961,8 @@ private:
                                    const char* stat_key, int nkey);
     ENGINE_ERROR_CODE doDiskStats(const void *cookie, ADD_STAT add_stat,
                                   const char* stat_key, int nkey);
+    void addSeqnoVbStats(const void *cookie, ADD_STAT add_stat,
+                                  const RCPtr<VBucket> &vb);
 
     void addLookupResult(const void *cookie, Item *result) {
         LockHolder lh(lookupMutex);
@@ -904,6 +999,10 @@ private:
     // If this method returns NULL, you should return TAP_DISCONNECT
     TapProducer* getTapProducer(const void *cookie);
 
+    // Initialize all required callbacks of this engine with the underlying
+    // server.
+    void initializeEngineCallbacks();
+
     SERVER_HANDLE_V1 *serverApi;
     EventuallyPersistentStore *epstore;
     WorkLoadPolicy *workload;
@@ -911,8 +1010,8 @@ private:
 
     ReplicationThrottle *replicationThrottle;
     std::map<const void*, Item*> lookups;
-    unordered_map<const void*, ENGINE_ERROR_CODE> allKeysLookups;
-    Mutex lookupMutex;
+    std::unordered_map<const void*, ENGINE_ERROR_CODE> allKeysLookups;
+    std::mutex lookupMutex;
     GET_SERVER_API getServerApiFunc;
     union {
         engine_info info;
@@ -920,6 +1019,7 @@ private:
     } info;
 
     DcpConnMap *dcpConnMap_;
+    DcpFlowControlManager *dcpFlowControlManager_;
     TapConnMap *tapConnMap;
     TapConfig *tapConfig;
     CheckpointConfig *checkpointConfig;
@@ -930,13 +1030,13 @@ private:
     size_t maxFailoverEntries;
     EPStats stats;
     Configuration configuration;
-    AtomicValue<bool> trafficEnabled;
+    std::atomic<bool> trafficEnabled;
 
     bool flushAllEnabled;
     // a unique system generated token initialized at each time
     // ep_engine starts up.
-    time_t startupTime;
-
+    std::atomic<time_t> startupTime;
+    EpEngineTaskable taskable;
 };
 
 #endif  // SRC_EP_ENGINE_H_

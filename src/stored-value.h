@@ -1,6 +1,6 @@
 /* -*- Mode: C++; tab-width: 4; c-basic-offset: 4; indent-tabs-mode: nil -*- */
 /*
- *     Copyright 2010 Couchbase, Inc
+ *     Copyright 2016 Couchbase, Inc
  *
  *   Licensed under the Apache License, Version 2.0 (the "License");
  *   you may not use this file except in compliance with the License.
@@ -20,18 +20,8 @@
 
 #include "config.h"
 
-#include <algorithm>
-#include <climits>
-#include <cstring>
-#include <string>
-
-#include "common.h"
-#include "ep_time.h"
-#include "histo.h"
-#include "item.h"
 #include "item_pager.h"
-#include "locks.h"
-#include "stats.h"
+#include "utility.h"
 
 // Forward declaration for StoredValue
 class HashTable;
@@ -77,9 +67,6 @@ public:
     // returns time this object was dirtied.
     /**
      * Mark this item as clean.
-     *
-     * @param dataAge an output parameter that captures the time this
-     *                item was marked dirty
      */
     void markClean() {
         _isDirty = 0;
@@ -104,7 +91,7 @@ public:
     }
 
 
-    enum conflict_resolution_mode getConflictResMode(void) {
+    enum conflict_resolution_mode getConflictResMode(void) const {
         return static_cast<enum conflict_resolution_mode>(conflictResMode);
     }
 
@@ -222,7 +209,15 @@ public:
             itm.setRevSeqno(revSeqno);
         }
 
+        conflictResMode = itm.getConflictResMode();
+        nru = itm.getNRUValue();
+
         markDirty();
+
+        if (isTempItem()) {
+            markNotResident();
+        }
+
         size_t newSize = size();
         increaseCacheSize(ht, newSize);
     }
@@ -231,7 +226,10 @@ public:
      * Reset the value of this item.
      */
     void resetValue() {
-        cb_assert(!isDeleted());
+        if (isDeleted()) {
+            throw std::logic_error("StoredValue::resetValue: Not possible to "
+                    "reset the value of a deleted item");
+        }
         markNotResident();
         // item no longer resident once reset the value
         deleted = true;
@@ -309,7 +307,7 @@ public:
      *
      * @return the ID for the item; 0 if the item has no ID
      */
-    int64_t getBySeqno() {
+    int64_t getBySeqno() const {
         return bySeqno;
     }
 
@@ -321,16 +319,23 @@ public:
      * It is an error to set an ID on an item that already has one.
      */
     void setBySeqno(int64_t to) {
+        if (to <= 0) {
+            throw std::invalid_argument("StoredValue::setBySeqno: to "
+                    "(which is " + std::to_string(to) + ") must be positive");
+        }
         bySeqno = to;
-        cb_assert(hasBySeqno());
     }
 
-    /**
-     * Set the stored value state to the specified value
-     */
-    void setStoredValueState(const int64_t to) {
-        cb_assert(to == state_deleted_key || to == state_non_existent_key);
-        bySeqno = to;
+    // Marks the stored item as deleted.
+    void setDeleted()
+    {
+        bySeqno = state_deleted_key;
+    }
+
+    // Marks the stored item as non-existent.
+    void setNonExistent()
+    {
+        bySeqno = state_non_existent_key;
     }
 
     /**
@@ -419,7 +424,7 @@ public:
     /**
      * Logically delete this object.
      */
-    void del(HashTable &ht, bool isMetaDelete=false) {
+    void del(HashTable &ht) {
         if (isDeleted()) {
             return;
         }
@@ -427,9 +432,6 @@ public:
         reduceCacheSize(ht, valuelen());
         resetValue();
         markDirty();
-        if (!isMetaDelete) {
-            setCas(getCas() + 1);
-        }
     }
 
 
@@ -467,9 +469,24 @@ public:
     Item *toItem(bool lck, uint16_t vbucket) const;
 
     /**
+     * Generate a new Item with only key and metadata out of this object.
+     * The item generated will not contain value
+     *
+     * @param vbucket the vbucket containing this item.
+     */
+    Item *toValuelessItem(uint16_t vbucket) const;
+
+    /**
      * Set the memory threshold on the current bucket quota for accepting a new mutation
      */
     static void setMutationMemoryThreshold(double memThreshold);
+
+    /**
+     * Return the memory threshold for accepting a new mutation
+     */
+    static double getMutationMemThreshold() {
+        return mutation_mem_threshold;
+    }
 
     /*
      * Values of the bySeqno attribute used by temporarily created StoredValue
@@ -500,22 +517,28 @@ private:
 
     StoredValue(const Item &itm, StoredValue *n, EPStats &stats, HashTable &ht,
                 bool setDirty = true) :
-        value(itm.getValue()), next(n), bySeqno(itm.getBySeqno()),
-        flags(itm.getFlags()) {
-        cas = itm.getCas();
-        exptime = itm.getExptime();
-        deleted = false;
-        newCacheItem = true;
-        nru = INITIAL_NRU_VALUE;
-        lock_expiry = 0;
-        keylen = itm.getNKey();
-        revSeqno = itm.getRevSeqno();
-        conflictResMode = revision_seqno;
+        value(itm.getValue()),
+        next(n),
+        cas(itm.getCas()),
+        revSeqno(itm.getRevSeqno()),
+        bySeqno(itm.getBySeqno()),
+        lock_expiry(0),
+        exptime(itm.getExptime()),
+        flags(itm.getFlags()),
+        deleted(false),
+        newCacheItem(true),
+        conflictResMode(itm.getConflictResMode()),
+        nru(itm.getNRUValue()),
+        keylen(itm.getNKey()) {
 
         if (setDirty) {
             markDirty();
         } else {
             markClean();
+        }
+
+        if (isTempItem()) {
+            markNotResident();
         }
 
         increaseMetaDataSize(ht, stats, metaDataSize());
@@ -557,7 +580,7 @@ private:
 /**
  * Mutation types as returned by store commands.
  */
-typedef enum {
+enum mutation_type_t {
     /**
      * Storage was attempted on a vbucket not managed by this node.
      */
@@ -569,141 +592,18 @@ typedef enum {
     IS_LOCKED,                  //!< The item is locked and can't be updated.
     NOMEM,                      //!< Insufficient memory to store this item.
     NEED_BG_FETCH               //!< Require a bg fetch to process SET op
-} mutation_type_t;
+};
 
 /**
  * Result from add operation.
  */
-typedef enum {
+enum add_type_t {
     ADD_SUCCESS,                //!< Add was successful.
     ADD_NOMEM,                  //!< No memory for operation
     ADD_EXISTS,                 //!< Did not update -- item exists with this key
     ADD_UNDEL,                  //!< Undeletes an existing dirty item
     ADD_TMP_AND_BG_FETCH,       //!< Create a tmp item and schedule a bg metadata fetch
     ADD_BG_FETCH                //!< Schedule a bg metadata fetch to process ADD op
-} add_type_t;
-
-/**
- * Base class for visiting a hash table.
- */
-class HashTableVisitor {
-public:
-    virtual ~HashTableVisitor() {}
-
-    /**
-     * Visit an individual item within a hash table.
-     *
-     * @param v a pointer to a value in the hash table
-     */
-    virtual void visit(StoredValue *v) = 0;
-    /**
-     * True if the visiting should continue.
-     *
-     * This is called periodically to ensure the visitor still wants
-     * to visit items.
-     */
-    virtual bool shouldContinue() { return true; }
-};
-
-class PauseResumeHashTableVisitor;
-
-/**
- * Hash table visitor that reports the depth of each hashtable bucket.
- */
-class HashTableDepthVisitor {
-public:
-    virtual ~HashTableDepthVisitor() {}
-
-    /**
-     * Called once for each hashtable bucket with its depth.
-     *
-     * @param bucket the index of the hashtable bucket
-     * @param depth the number of entries in this hashtable bucket
-     * @param mem counted memory used by this hash table
-     */
-    virtual void visit(int bucket, int depth, size_t mem) = 0;
-};
-
-/**
- * Hash table visitor that finds the min and max bucket depths.
- */
-class HashTableDepthStatVisitor : public HashTableDepthVisitor {
-public:
-
-    HashTableDepthStatVisitor() : depthHisto(GrowingWidthGenerator<unsigned int>(1, 1, 1.3),
-                                             10),
-                                  size(0), memUsed(0), min(-1), max(0) {}
-
-    void visit(int bucket, int depth, size_t mem) {
-        (void)bucket;
-        // -1 is a special case for min.  If there's a value other than
-        // -1, we prefer that.
-        min = std::min(min == -1 ? depth : min, depth);
-        max = std::max(max, depth);
-        depthHisto.add(depth);
-        size += depth;
-        memUsed += mem;
-    }
-
-    Histogram<unsigned int> depthHisto;
-    size_t                  size;
-    size_t                  memUsed;
-    int                     min;
-    int                     max;
-};
-
-/**
- * Hash table visitor that collects stats of what's inside.
- */
-class HashTableStatVisitor : public HashTableVisitor {
-public:
-
-    HashTableStatVisitor() : numNonResident(0), numTotal(0),
-                             memSize(0), valSize(0), cacheSize(0) {}
-
-    void visit(StoredValue *v) {
-        ++numTotal;
-        memSize += v->size();
-        valSize += v->valuelen();
-
-        if (v->isResident()) {
-            cacheSize += v->size();
-        } else {
-            ++numNonResident;
-        }
-    }
-
-    size_t numNonResident;
-    size_t numTotal;
-    size_t memSize;
-    size_t valSize;
-    size_t cacheSize;
-};
-
-/**
- * Track the current number of hashtable visitors.
- *
- * This class is a pretty generic counter holder that increments on
- * entry and decrements on return providing RAII guarantees around an
- * atomic counter.
- */
-class VisitorTracker {
-public:
-
-    /**
-     * Mark a visitor as visiting.
-     *
-     * @param c the counter that should be incremented (and later
-     * decremented).
-     */
-    explicit VisitorTracker(AtomicValue<size_t> *c) : counter(c) {
-        counter->fetch_add(1);
-    }
-    ~VisitorTracker() {
-        counter->fetch_sub(1);
-    }
-private:
-    AtomicValue<size_t> *counter;
 };
 
 /**
@@ -739,7 +639,11 @@ private:
         size_t base = sizeof(StoredValue) - sizeof(char);
 
         const std::string &key = itm.getKey();
-        cb_assert(key.length() < 256);
+        if (key.length() >= 256) {
+            throw std::invalid_argument("StoredValueFactory::newStoredValue: "
+                    "item key length (which is " + std::to_string(key.length()) +
+                    "is greater than 256");
+        }
 
         size_t len = key.length() + base;
 
@@ -751,830 +655,5 @@ private:
 
     EPStats                *stats;
 };
-
-/**
- * A container of StoredValue instances.
- */
-class HashTable {
-public:
-
-    /**
-     * Represents a position within the hashtable.
-     *
-     * Currently opaque (and constant), clients can pass them around but
-     * cannot reposition the iterator.
-     */
-    class Position {
-    public:
-        // Allow default construction positioned at the start,
-        // but nothing else.
-        Position() : ht_size(0), lock(0), hash_bucket(0) {}
-
-        bool operator==(const Position& other) const {
-            return (ht_size == other.ht_size) &&
-                   (lock == other.lock) &&
-                   (hash_bucket == other.hash_bucket);
-        }
-
-        bool operator!=(const Position& other) const {
-            return ! (*this == other);
-        }
-
-    private:
-        Position(size_t ht_size_, int lock_, int hash_bucket_)
-          : ht_size(ht_size_),
-            lock(lock_),
-            hash_bucket(hash_bucket_) {}
-
-        // Size of the hashtable when the position was created.
-        size_t ht_size;
-        // Lock ID we are up to.
-        size_t lock;
-        // hash bucket ID (under the given lock) we are up to.
-        size_t hash_bucket;
-
-        friend class HashTable;
-        friend std::ostream& operator<<(std::ostream& os, const Position& pos);
-    };
-
-    /**
-     * Create a HashTable.
-     *
-     * @param st the global stats reference
-     * @param s the number of hash table buckets
-     * @param l the number of locks in the hash table
-     */
-    HashTable(EPStats &st, size_t s = 0, size_t l = 0) :
-        maxDeletedRevSeqno(0), numTotalItems(0),
-        numNonResidentItems(0), numEjects(0),
-        memSize(0), cacheSize(0), metaDataMemory(0), stats(st),
-        valFact(st), visitors(0), numItems(0), numResizes(0),
-        numTempItems(0)
-    {
-        size = HashTable::getNumBuckets(s);
-        n_locks = HashTable::getNumLocks(l);
-        cb_assert(size > 0);
-        cb_assert(n_locks > 0);
-        cb_assert(visitors == 0);
-        values = static_cast<StoredValue**>(calloc(size, sizeof(StoredValue*)));
-        mutexes = new Mutex[n_locks];
-        activeState = true;
-    }
-
-    ~HashTable() {
-        clear(true);
-        // Wait for any outstanding visitors to finish.
-        while (visitors > 0) {
-#ifdef _MSC_VER
-            Sleep(1);
-#else
-            usleep(100);
-#endif
-        }
-        delete []mutexes;
-        free(values);
-        values = NULL;
-    }
-
-    size_t memorySize() {
-        return sizeof(HashTable)
-            + (size * sizeof(StoredValue*))
-            + (n_locks * sizeof(Mutex));
-    }
-
-    /**
-     * Get the number of hash table buckets this hash table has.
-     */
-    size_t getSize(void) { return size; }
-
-    /**
-     * Get the number of locks in this hash table.
-     */
-    size_t getNumLocks(void) { return n_locks; }
-
-    /**
-     * Get the number of in-memory non-resident and resident items within
-     * this hash table.
-     */
-    size_t getNumInMemoryItems(void) { return numItems; }
-
-    /**
-     * Get the number of in-memory non-resident items within this hash table.
-     */
-    size_t getNumInMemoryNonResItems(void) { return numNonResidentItems; }
-
-    /**
-     * Get the number of non-resident and resident items managed by
-     * this hash table. Note that this will be equal to getNumItems() if
-     * VALUE_ONLY_EVICTION is chosen as a cache management.
-     */
-    size_t getNumItems(void) {
-        return numTotalItems;
-    }
-
-    /**
-     * Get the number of items whose values are ejected from this hash table.
-     */
-    size_t getNumEjects(void) { return numEjects; }
-
-    /**
-     * Get the total item memory size in this hash table.
-     */
-    size_t getItemMemory(void) { return memSize; }
-
-    /**
-     * Clear the hash table.
-     *
-     * @param deactivate true when this hash table is being destroyed completely
-     *
-     * @return a stat visitor reporting how much stuff was removed
-     */
-    HashTableStatVisitor clear(bool deactivate = false);
-
-    /**
-     * Get the number of times this hash table has been resized.
-     */
-    size_t getNumResizes() { return numResizes; }
-
-    /**
-     * Get the number of temp. items within this hash table.
-     */
-    size_t getNumTempItems(void) { return numTempItems; }
-
-    /**
-     * Automatically resize to fit the current data.
-     */
-    void resize();
-
-    /**
-     * Resize to the specified size.
-     */
-    void resize(size_t to);
-
-    /**
-     * Find the item with the given key.
-     *
-     * @param key the key to find
-     * @return a pointer to a StoredValue -- NULL if not found
-     */
-    StoredValue *find(std::string &key, bool trackReference=true) {
-        cb_assert(isActive());
-        int bucket_num(0);
-        LockHolder lh = getLockedBucket(key, &bucket_num);
-        return unlocked_find(key, bucket_num, false, trackReference);
-    }
-
-    /**
-     * Find a resident item
-     *
-     * @param rnd a randomization input
-     * @return an item -- NULL if not fount
-     */
-    Item *getRandomKey(long rnd);
-
-    /**
-     * Set a new Item into this hashtable. Use this function when your item
-     * doesn't contain meta data.
-     *
-     * @param val the Item to store
-     * @param policy item eviction policy
-     * @param nru the nru bit for the item
-     * @return a result indicating the status of the store
-     */
-    mutation_type_t set(const Item &val,
-                        item_eviction_policy_t policy = VALUE_ONLY,
-                        uint8_t nru=0xff)
-    {
-        return set(val, val.getCas(), true, false, policy, nru);
-    }
-
-    /**
-     * Set an Item into the this hashtable. Use this function to do a set
-     * when your item includes meta data.
-     *
-     * @param val the Item to store
-     * @param cas This is the cas value for the item <b>in</b> the cache
-     * @param allowExisting should we allow existing items or not
-     * @param hasMetaData should we keep the same revision seqno or increment it
-     * @param policy item eviction policy
-     * @param nru the nru bit for the item
-     * @param isReplication true if issued by consumer (for replication)
-     * @return a result indicating the status of the store
-     */
-    mutation_type_t set(const Item &val, uint64_t cas, bool allowExisting,
-                        bool hasMetaData = true, item_eviction_policy_t policy = VALUE_ONLY,
-                        uint8_t nru=0xff) {
-        int bucket_num(0);
-        LockHolder lh = getLockedBucket(val.getKey(), &bucket_num);
-        StoredValue *v = unlocked_find(val.getKey(), bucket_num, true, false);
-        return unlocked_set(v, val, cas, allowExisting, hasMetaData, policy, nru);
-    }
-
-    mutation_type_t unlocked_set(StoredValue*& v, const Item &val, uint64_t cas,
-                                 bool allowExisting, bool hasMetaData = true,
-                                 item_eviction_policy_t policy = VALUE_ONLY,
-                                 uint8_t nru=0xff, bool maybeKeyExists=true,
-                                 bool isReplication = false) {
-        cb_assert(isActive());
-        Item &itm = const_cast<Item&>(val);
-        if (!StoredValue::hasAvailableSpace(stats, itm, isReplication)) {
-            return NOMEM;
-        }
-
-        mutation_type_t rv = NOT_FOUND;
-
-        if (cas && policy == FULL_EVICTION && maybeKeyExists) {
-            if (!v || v->isTempInitialItem()) {
-                return NEED_BG_FETCH;
-            }
-        }
-
-        /*
-         * prior to checking for the lock, we should check if this object
-         * has expired. If so, then check if CAS value has been provided
-         * for this set op. In this case the operation should be denied since
-         * a cas operation for a key that doesn't exist is not a very cool
-         * thing to do. See MB 3252
-         */
-        if (v && v->isExpired(ep_real_time()) && !hasMetaData) {
-            if (v->isLocked(ep_current_time())) {
-                v->unlock();
-            }
-            if (cas) {
-                /* item has expired and cas value provided. Deny ! */
-                return NOT_FOUND;
-            }
-        }
-
-        if (v) {
-            if (!allowExisting && !v->isTempItem()) {
-                return INVALID_CAS;
-            }
-            if (v->isLocked(ep_current_time())) {
-                /*
-                 * item is locked, deny if there is cas value mismatch
-                 * or no cas value is provided by the user
-                 */
-                if (cas != v->getCas()) {
-                    return IS_LOCKED;
-                }
-                /* allow operation*/
-                v->unlock();
-            } else if (cas && cas != v->getCas()) {
-                if (v->isTempDeletedItem() || v->isTempNonExistentItem()) {
-                    return NOT_FOUND;
-                }
-                return INVALID_CAS;
-            }
-
-            rv = v->isClean() ? WAS_CLEAN : WAS_DIRTY;
-            if (!v->isResident() && !v->isDeleted() && !v->isTempItem()) {
-                --numNonResidentItems;
-            }
-
-            if (v->isTempItem()) {
-                --numTempItems;
-                ++numItems;
-                ++numTotalItems;
-            }
-
-            v->setValue(itm, *this, hasMetaData /*Preserve revSeqno*/);
-            if (nru <= MAX_NRU_VALUE) {
-                v->setNRUValue(nru);
-            }
-        } else if (cas != 0) {
-            rv = NOT_FOUND;
-        } else {
-            int bucket_num = getBucketForHash(hash(itm.getKey()));
-            v = valFact(itm, values[bucket_num], *this);
-            values[bucket_num] = v;
-            ++numItems;
-            ++numTotalItems;
-            if (nru <= MAX_NRU_VALUE && !v->isTempItem()) {
-                v->setNRUValue(nru);
-            }
-
-            if (!hasMetaData) {
-                /**
-                 * Possibly, this item is being recreated. Conservatively assign it
-                 * a seqno that is greater than the greatest seqno of all deleted
-                 * items seen so far.
-                 */
-                uint64_t seqno = getMaxDeletedRevSeqno() + 1;
-                v->setRevSeqno(seqno);
-                itm.setRevSeqno(seqno);
-            }
-            rv = WAS_CLEAN;
-        }
-        return rv;
-    }
-
-    /**
-     * Insert an item to this hashtable. This is called from the backfill
-     * so we need a bit more logic here. If we're trying to insert a partial
-     * item we don't allow the object to be stored there (and if you try to
-     * insert a full item we're only allowing an item without the value
-     * in memory...)
-     *
-     * @param val the Item to insert
-     * @param policy item eviction policy
-     * @param eject true if we should eject the value immediately
-     * @param partial is this a complete item, or just the key and meta-data
-     * @return a result indicating the status of the store
-     */
-    mutation_type_t insert(Item &itm, item_eviction_policy_t policy,
-                           bool eject, bool partial);
-
-    /**
-     * Add an item to the hash table iff it doesn't already exist.
-     *
-     * @param val the item to store
-     * @param policy item eviction policy
-     * @param isDirty true if the item should be marked dirty on store
-     * @param storeVal true if the value should be stored (paged-in)
-     * @return an indication of what happened
-     */
-    add_type_t add(const Item &val, item_eviction_policy_t policy,
-                   bool isDirty = true, bool storeVal = true) {
-        cb_assert(isActive());
-        int bucket_num(0);
-        LockHolder lh = getLockedBucket(val.getKey(), &bucket_num);
-        StoredValue *v = unlocked_find(val.getKey(), bucket_num, true, false);
-        return unlocked_add(bucket_num, v, val, policy, isDirty, storeVal);
-    }
-
-    /**
-     * Unlocked version of the add() method.
-     *
-     * @param bucket_num the locked partition where the key belongs
-     * @param v the stored value to do this operaiton on
-     * @param val the item to store
-     * @param policy item eviction policy
-     * @param isDirty true if the item should be marked dirty on store
-     * @param storeVal true if the value should be stored (paged-in)
-     * @param isReplication true if issued by consumer (for replication)
-     * @return an indication of what happened
-     */
-    add_type_t unlocked_add(int &bucket_num,
-                            StoredValue*& v,
-                            const Item &val,
-                            item_eviction_policy_t policy,
-                            bool isDirty = true,
-                            bool storeVal = true,
-                            bool maybeKeyExists = true,
-                            bool isReplication = false);
-
-    /**
-     * Add a temporary item to the hash table iff it doesn't already exist.
-     *
-     * NOTE: This method should be called after acquiring the correct
-     *       bucket/partition lock.
-     *
-     * @param bucket_num the locked partition where the key belongs
-     * @param key the key for which a temporary item needs to be added
-     * @param policy item eviction policy
-     * @param isReplication true if issued by consumer (for replication)
-     * @return an indication of what happened
-     */
-    add_type_t unlocked_addTempItem(int &bucket_num,
-                                    const std::string &key,
-                                    item_eviction_policy_t policy,
-                                    bool isReplication = false);
-
-    /**
-     * Mark the given record logically deleted.
-     *
-     * @param key the key of the item to delete
-     * @param cas the expected CAS of the item (or 0 to override)
-     * @param policy item eviction policy
-     * @return an indicator of what the deletion did
-     */
-    mutation_type_t softDelete(const std::string &key, uint64_t cas,
-                               item_eviction_policy_t policy = VALUE_ONLY) {
-        cb_assert(isActive());
-        int bucket_num(0);
-        LockHolder lh = getLockedBucket(key, &bucket_num);
-        StoredValue *v = unlocked_find(key, bucket_num, false, false);
-        return unlocked_softDelete(v, cas, policy);
-    }
-
-    mutation_type_t unlocked_softDelete(StoredValue *v,
-                                        uint64_t cas,
-                                        item_eviction_policy_t policy = VALUE_ONLY) {
-        ItemMetaData metadata;
-        if (v) {
-            metadata.revSeqno = v->getRevSeqno() + 1;
-        }
-        return unlocked_softDelete(v, cas, metadata, policy);
-    }
-
-    /**
-     * Unlocked implementation of softDelete.
-     */
-    mutation_type_t unlocked_softDelete(StoredValue *v,
-                                        uint64_t cas,
-                                        ItemMetaData &metadata,
-                                        item_eviction_policy_t policy,
-                                        bool use_meta=false) {
-        mutation_type_t rv = NOT_FOUND;
-
-        if ((!v || v->isTempInitialItem()) && policy == FULL_EVICTION) {
-            return NEED_BG_FETCH;
-        }
-
-        if (v) {
-            if (v->isExpired(ep_real_time()) && !use_meta) {
-                if (!v->isResident() && !v->isDeleted() && !v->isTempItem()) {
-                    --numNonResidentItems;
-                }
-                v->setRevSeqno(metadata.revSeqno);
-                v->del(*this, use_meta);
-                updateMaxDeletedRevSeqno(v->getRevSeqno());
-                return rv;
-            }
-
-            if (v->isLocked(ep_current_time())) {
-                if (cas != v->getCas()) {
-                    return IS_LOCKED;
-                }
-                v->unlock();
-            }
-
-            if (cas != 0 && cas != v->getCas()) {
-                return INVALID_CAS;
-            }
-
-            if (!v->isResident() && !v->isDeleted() && !v->isTempItem()) {
-                --numNonResidentItems;
-            }
-
-            if (v->isTempItem()) {
-                --numTempItems;
-                ++numItems;
-                ++numTotalItems;
-            }
-
-            /* allow operation*/
-            v->unlock();
-
-            rv = v->isClean() ? WAS_CLEAN : WAS_DIRTY;
-            v->setRevSeqno(metadata.revSeqno);
-            if (use_meta) {
-                v->setCas(metadata.cas);
-                v->setFlags(metadata.flags);
-                v->setExptime(metadata.exptime);
-            }
-            v->del(*this, use_meta);
-            updateMaxDeletedRevSeqno(v->getRevSeqno());
-        }
-        return rv;
-    }
-
-    /**
-     * Find an item within a specific bucket assuming you already
-     * locked the bucket.
-     *
-     * @param key the key of the item to find
-     * @param bucket_num the bucket number
-     * @param wantsDeleted true if soft deleted items should be returned
-     *
-     * @return a pointer to a StoredValue -- NULL if not found
-     */
-    StoredValue *unlocked_find(const std::string &key, int bucket_num,
-                               bool wantsDeleted=false, bool trackReference=true) {
-        StoredValue *v = values[bucket_num];
-        while (v) {
-            if (v->hasKey(key)) {
-                if (trackReference && !v->isDeleted()) {
-                    v->referenced();
-                }
-                if (wantsDeleted || !v->isDeleted()) {
-                    return v;
-                } else {
-                    return NULL;
-                }
-            }
-            v = v->next;
-        }
-        return NULL;
-    }
-
-    /**
-     * Compute a hash for the given string.
-     *
-     * @param str the beginning of the string
-     * @param len the number of bytes in the string
-     *
-     * @return the hash value
-     */
-    inline int hash(const char *str, const size_t len) {
-        cb_assert(isActive());
-        int h=5381;
-
-        for(size_t i=0; i < len; i++) {
-            h = ((h << 5) + h) ^ str[i];
-        }
-
-        return h;
-    }
-
-    /**
-     * Compute a hash for the given string.
-     *
-     * @param s the string
-     * @return the hash value
-     */
-    inline int hash(const std::string &s) {
-        return hash(s.data(), s.length());
-    }
-
-    /**
-     * Get a lock holder holding a lock for the given bucket
-     *
-     * @param bucket the bucket to lock
-     * @return a locked LockHolder
-     */
-    inline LockHolder getLockedBucket(int bucket) {
-        LockHolder rv(mutexes[mutexForBucket(bucket)]);
-        return rv;
-    }
-
-    /**
-     * Get a lock holder holding a lock for the bucket for the given
-     * hash.
-     *
-     * @param h the input hash
-     * @param bucket output parameter to receive a bucket
-     * @return a locked LockHolder
-     */
-    inline LockHolder getLockedBucket(int h, int *bucket) {
-        while (true) {
-            cb_assert(isActive());
-            *bucket = getBucketForHash(h);
-            LockHolder rv(mutexes[mutexForBucket(*bucket)]);
-            if (*bucket == getBucketForHash(h)) {
-                return rv;
-            }
-        }
-    }
-
-    /**
-     * Get a lock holder holding a lock for the bucket for the hash of
-     * the given key.
-     *
-     * @param s the start of the key
-     * @param n the size of the key
-     * @param bucket output parameter to receive a bucket
-     * @return a locked LockHolder
-     */
-    inline LockHolder getLockedBucket(const char *s, size_t n, int *bucket) {
-        return getLockedBucket(hash(s, n), bucket);
-    }
-
-    /**
-     * Get a lock holder holding a lock for the bucket for the hash of
-     * the given key.
-     *
-     * @param s the key
-     * @param bucket output parameter to receive a bucket
-     * @return a locked LockHolder
-     */
-    inline LockHolder getLockedBucket(const std::string &s, int *bucket) {
-        return getLockedBucket(hash(s.data(), s.size()), bucket);
-    }
-
-    /**
-     * Delete a key from the cache without trying to lock the cache first
-     * (Please note that you <b>MUST</b> acquire the mutex before calling
-     * this function!!!
-     *
-     * @param key the key to delete
-     * @param bucket_num the bucket to look in (must already be locked)
-     * @return true if an object was deleted, false otherwise
-     */
-    bool unlocked_del(const std::string &key, int bucket_num) {
-        cb_assert(isActive());
-        StoredValue *v = values[bucket_num];
-
-        // Special case empty bucket.
-        if (!v) {
-            return false;
-        }
-
-        // Special case the first one
-        if (v->hasKey(key)) {
-            if (!v->isDeleted() && v->isLocked(ep_current_time())) {
-                return false;
-            }
-
-            values[bucket_num] = v->next;
-            StoredValue::reduceCacheSize(*this, v->size());
-            StoredValue::reduceMetaDataSize(*this, stats, v->metaDataSize());
-            if (v->isTempItem()) {
-                --numTempItems;
-            } else {
-                --numItems;
-                --numTotalItems;
-            }
-            delete v;
-            return true;
-        }
-
-        while (v->next) {
-            if (v->next->hasKey(key)) {
-                StoredValue *tmp = v->next;
-                if (!tmp->isDeleted() && tmp->isLocked(ep_current_time())) {
-                    return false;
-                }
-
-                v->next = v->next->next;
-                StoredValue::reduceCacheSize(*this, tmp->size());
-                StoredValue::reduceMetaDataSize(*this, stats, tmp->metaDataSize());
-                if (tmp->isTempItem()) {
-                    --numTempItems;
-                } else {
-                    --numItems;
-                    --numTotalItems;
-                }
-                delete tmp;
-                return true;
-            } else {
-                v = v->next;
-            }
-        }
-
-        return false;
-    }
-
-    /**
-     * Delete the item with the given key.
-     *
-     * @param key the key to delete
-     * @return true if the item existed before this call
-     */
-    bool del(const std::string &key) {
-        cb_assert(isActive());
-        int bucket_num(0);
-        LockHolder lh = getLockedBucket(key, &bucket_num);
-        return unlocked_del(key, bucket_num);
-    }
-
-    /**
-     * Visit all items within this hashtable.
-     */
-    void visit(HashTableVisitor &visitor);
-
-    /**
-     * Visit all items within this call with a depth visitor.
-     */
-    void visitDepth(HashTableDepthVisitor &visitor);
-
-    /**
-     * Visit the items in this hashtable, starting the iteration from the
-     * given startPosition and allowing the visit to be paused at any point.
-     *
-     * During visitation, the visitor object can request that the visit
-     * is stopped after the current item. The position passed to the
-     * visitor can then be used to restart visiting at the *APPROXIMATE*
-     * same position as it paused.
-     * This is approximate as hashtable locks are released when the
-     * function returns, so any changes to the hashtable may cause the
-     * visiting to restart at the slightly different place.
-     *
-     * As a consequence, *DO NOT USE THIS METHOD* if you need to guarantee
-     * that all items are visited!
-     *
-     * @param visitor The visitor object to use.
-     * @param start_pos At what position to start in the hashtable.
-     * @return The final HashTable position visited; equal to
-     *         HashTable::end() if all items were visited otherwise the
-     *         position to resume from.
-     */
-    Position pauseResumeVisit(PauseResumeHashTableVisitor& visitor,
-                              Position& start_pos);
-
-    /**
-     * Return a position at the end of the hashtable. Has similar semantics
-     * as STL end() (i.e. one past the last element).
-     */
-    Position endPosition() const;
-
-    /**
-     * Get the number of buckets that should be used for initialization.
-     *
-     * @param s if 0, return the default number of buckets, else return s
-     */
-    static size_t getNumBuckets(size_t s = 0);
-
-    /**
-     * Get the number of locks that should be used for initialization.
-     *
-     * @param s if 0, return the default number of locks, else return s
-     */
-    static size_t getNumLocks(size_t s);
-
-    /**
-     * Set the default number of buckets.
-     */
-    static void setDefaultNumBuckets(size_t);
-
-    /**
-     * Set the default number of locks.
-     */
-    static void setDefaultNumLocks(size_t);
-
-    /**
-     * Get the max deleted revision seqno seen so far.
-     */
-    uint64_t getMaxDeletedRevSeqno() const {
-        return maxDeletedRevSeqno.load();
-    }
-
-    /**
-     * Set the max deleted seqno (required during warmup).
-     */
-    void setMaxDeletedRevSeqno(const uint64_t seqno) {
-        maxDeletedRevSeqno.store(seqno);
-    }
-
-    /**
-     * Update maxDeletedRevSeqno to a (possibly) new value.
-     */
-    void updateMaxDeletedRevSeqno(const uint64_t seqno) {
-        atomic_setIfBigger(maxDeletedRevSeqno, seqno);
-    }
-
-    /**
-     * Eject an item meta data and value from memory.
-     * @param vptr the reference to the pointer to the StoredValue instance
-     * @param policy item eviction policy
-     * @return true if an item is ejected.
-     */
-    bool unlocked_ejectItem(StoredValue*& vptr, item_eviction_policy_t policy);
-
-    AtomicValue<uint64_t>     maxDeletedRevSeqno;
-    AtomicValue<size_t>       numTotalItems;
-    AtomicValue<size_t>       numNonResidentItems;
-    AtomicValue<size_t>       numEjects;
-    //! Memory consumed by items in this hashtable.
-    AtomicValue<size_t>       memSize;
-    //! Cache size.
-    AtomicValue<size_t>       cacheSize;
-    //! Meta-data size.
-    AtomicValue<size_t>       metaDataMemory;
-
-private:
-    friend class StoredValue;
-
-    inline bool isActive() const { return activeState; }
-    inline void setActiveState(bool newv) { activeState = newv; }
-
-    AtomicValue<size_t> size;
-    size_t               n_locks;
-    StoredValue        **values;
-    Mutex               *mutexes;
-    EPStats&             stats;
-    StoredValueFactory   valFact;
-    AtomicValue<size_t>       visitors;
-    AtomicValue<size_t>       numItems;
-    AtomicValue<size_t>       numResizes;
-    AtomicValue<size_t>       numTempItems;
-    bool                 activeState;
-
-    static size_t                 defaultNumBuckets;
-    static size_t                 defaultNumLocks;
-
-    int getBucketForHash(int h) {
-        return abs(h % static_cast<int>(size));
-    }
-
-    inline int mutexForBucket(int bucket_num) {
-        cb_assert(isActive());
-        cb_assert(bucket_num >= 0);
-        int lock_num = bucket_num % static_cast<int>(n_locks);
-        cb_assert(lock_num < static_cast<int>(n_locks));
-        cb_assert(lock_num >= 0);
-        return lock_num;
-    }
-
-    Item *getRandomKeyFromSlot(int slot);
-
-    DISALLOW_COPY_AND_ASSIGN(HashTable);
-};
-
-/**
- * Base class for visiting a hash table with pause/resume support.
- */
-class PauseResumeHashTableVisitor {
-public:
-    /**
-     * Visit an individual item within a hash table.
-     *
-     * @param v a pointer to a value in the hash table.
-     * @return True if visiting should continue, otherwise false.
-     */
-    virtual bool visit(StoredValue& v) = 0;
-};
-
 
 #endif  // SRC_STORED_VALUE_H_

@@ -1,6 +1,6 @@
 /* -*- Mode: C++; tab-width: 4; c-basic-offset: 4; indent-tabs-mode: nil -*- */
 /*
- *     Copyright 2011 Couchbase, Inc.
+ *     Copyright 2015 Couchbase, Inc.
  *
  *   Licensed under the Apache License, Version 2.0 (the "License");
  *   you may not use this file except in compliance with the License.
@@ -19,8 +19,12 @@
 
 #include "config.h"
 
+#include <atomic>
+
 class EventuallyPersistentEngine;
 class Blob;
+class Item;
+class StoredValue;
 
 extern "C" {
     typedef size_t (*get_allocation_size)(const void *ptr);
@@ -46,7 +50,7 @@ public:
     static EventuallyPersistentEngine *onSwitchThread(EventuallyPersistentEngine *engine,
                                                       bool want_old_thread_local = false);
 
-    static void setStats(AtomicValue<size_t>* init_track);
+    static void setStats(std::atomic<size_t>* init_track);
     static bool memoryAllocated(size_t mem);
     static bool memoryDeallocated(size_t mem);
 };

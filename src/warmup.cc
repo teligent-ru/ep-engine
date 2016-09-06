@@ -15,32 +15,23 @@
  *   limitations under the License.
  */
 
-#include "config.h"
+#include "warmup.h"
 
 #include <limits>
-#include <list>
-#include <map>
 #include <string>
 #include <utility>
-#include <vector>
+#include <array>
+#include <random>
 
+#include "common.h"
+#include "connmap.h"
 #include "ep_engine.h"
 #include "failover-table.h"
+#include "mutation_log.h"
 #define STATWRITER_NAMESPACE warmup
 #include "statwriter.h"
 #undef STATWRITER_NAMESPACE
-#include "mutation_log.h"
-#include "connmap.h"
-#include "warmup.h"
-
-#include <platform/random.h>
-
-class NoLookupCallback : public Callback<CacheLookup> {
-public:
-    NoLookupCallback() {}
-    ~NoLookupCallback() {}
-    void callback(CacheLookup&) {}
-};
+#include "tapconnmap.h"
 
 struct WarmupCookie {
     WarmupCookie(EventuallyPersistentStore *s, Callback<GetValue>&c) :
@@ -71,21 +62,24 @@ static bool batchWarmupCallback(uint16_t vbId,
                 continue;
             }
             VBucketBGFetchItem *fit = new VBucketBGFetchItem(NULL, false);
-            items2fetch[(*itm).first].push_back(fit);
+            vb_bgfetch_item_ctx_t& bg_itm_ctx = items2fetch[(*itm).first];
+            bg_itm_ctx.isMetaOnly = false;
+            bg_itm_ctx.bgfetched_list.push_back(fit);
         }
 
         c->epstore->getROUnderlying(vbId)->getMulti(vbId, items2fetch);
 
         vb_bgfetch_queue_t::iterator items = items2fetch.begin();
         for (; items != items2fetch.end(); items++) {
-           VBucketBGFetchItem * fetchedItem = (*items).second.back();
+           vb_bgfetch_item_ctx_t& bg_itm_ctx = (*items).second;
+           VBucketBGFetchItem * fetchedItem = bg_itm_ctx.bgfetched_list.back();
            GetValue &val = fetchedItem->value;
            if (val.getStatus() == ENGINE_SUCCESS) {
                 c->loaded++;
                 c->cb.callback(val);
            } else {
                 LOG(EXTENSION_LOG_WARNING,
-                "Warning: warmup failed to load data for vBucket = %d"
+                "Warmup failed to load data for vBucket = %d"
                 " key = %s error = %X\n",
                 vbId,
                     (*items).first.c_str(), val.getStatus());
@@ -114,7 +108,7 @@ static bool warmupCallback(void *arg, uint16_t vb, const std::string &key)
             cookie->cb.callback(cb.val);
             cookie->loaded++;
         } else {
-            LOG(EXTENSION_LOG_WARNING, "Warning: warmup failed to load data "
+            LOG(EXTENSION_LOG_WARNING, "Warmup failed to load data "
                 "for vBucket = %d key = %s error = %X\n", vb, key.c_str(),
                 cb.val.getStatus());
             cookie->error++;
@@ -138,7 +132,7 @@ const int WarmupState::LoadingData = 7;
 const int WarmupState::Done = 8;
 
 const char *WarmupState::toString(void) const {
-    return getStateDescription(state);
+    return getStateDescription(state.load());
 }
 
 const char *WarmupState::getStateDescription(int st) const {
@@ -170,10 +164,10 @@ void WarmupState::transition(int to, bool allowAnystate) {
     if (allowAnystate || legalTransition(to)) {
         std::stringstream ss;
         ss << "Warmup transition from state \""
-           << getStateDescription(state) << "\" to \""
+           << getStateDescription(state.load()) << "\" to \""
            << getStateDescription(to) << "\"";
         LOG(EXTENSION_LOG_DEBUG, "%s", ss.str().c_str());
-        state = to;
+        state.store(to);
     } else {
         // Throw an exception to make it possible to test the logic ;)
         std::stringstream ss;
@@ -183,7 +177,7 @@ void WarmupState::transition(int to, bool allowAnystate) {
 }
 
 bool WarmupState::legalTransition(int to) const {
-    switch (state) {
+    switch (state.load()) {
     case Initialize:
         return (to == CreateVBuckets);
     case CreateVBuckets:
@@ -216,14 +210,14 @@ std::ostream& operator <<(std::ostream &out, const WarmupState &state)
 void LoadStorageKVPairCallback::callback(GetValue &val) {
     Item *i = val.getValue();
     bool stopLoading = false;
-    if (i != NULL && !epstore->getWarmup()->isComplete()) {
+    if (i != NULL && !epstore.getWarmup()->isComplete()) {
         RCPtr<VBucket> vb = vbuckets.getBucket(i->getVBucketId());
         if (!vb) {
             return;
         }
         bool succeeded(false);
         int retry = 2;
-        item_eviction_policy_t policy = epstore->getItemEvictionPolicy();
+        item_eviction_policy_t policy = epstore.getItemEvictionPolicy();
         do {
             if (i->getCas() == static_cast<uint64_t>(-1)) {
                 if (val.isPartial()) {
@@ -253,15 +247,9 @@ void LoadStorageKVPairCallback::callback(GetValue &val) {
                 }
                 break;
             case INVALID_CAS:
-                if (vb->getShard()->getROUnderlying()->isKeyDumpSupported()) {
-                    LOG(EXTENSION_LOG_DEBUG,
-                        "Value changed in memory before restore from disk. "
-                        "Ignored disk value for: %s.", i->getKey().c_str());
-                } else {
-                    LOG(EXTENSION_LOG_WARNING,
-                        "Warmup dataload error: Duplicate key: %s.",
-                        i->getKey().c_str());
-                }
+                LOG(EXTENSION_LOG_DEBUG,
+                    "Value changed in memory before restore from disk. "
+                    "Ignored disk value for: %s.", i->getKey().c_str());
                 ++stats.warmDups;
                 succeeded = true;
                 break;
@@ -277,16 +265,21 @@ void LoadStorageKVPairCallback::callback(GetValue &val) {
         val.setValue(NULL);
 
         if (maybeEnableTraffic) {
-            stopLoading = epstore->maybeEnableTraffic();
+            stopLoading = epstore.maybeEnableTraffic();
         }
 
         switch (warmupState) {
             case WarmupState::KeyDump:
-                ++stats.warmedUpKeys;
+                if (stats.warmOOM) {
+                    epstore.getWarmup()->setOOMFailure();
+                    stopLoading = true;
+                } else {
+                    ++stats.warmedUpKeys;
+                }
                 break;
             case WarmupState::LoadingData:
             case WarmupState::LoadingAccessLog:
-                if (epstore->getItemEvictionPolicy() == FULL_EVICTION) {
+                if (epstore.getItemEvictionPolicy() == FULL_EVICTION) {
                     ++stats.warmedUpKeys;
                 }
                 ++stats.warmedUpValues;
@@ -303,14 +296,14 @@ void LoadStorageKVPairCallback::callback(GetValue &val) {
     if (stopLoading) {
         // warmup has completed, return ENGINE_ENOMEM to
         // cancel remaining data dumps from couchstore
-        if (epstore->getWarmup()->setComplete()) {
-            epstore->getWarmup()->setWarmupTime();
-            epstore->warmupCompleted();
-            LOG(EXTENSION_LOG_WARNING, "Warmup completed in %s",
-                    hrtime2text(epstore->getWarmup()->getTime()).c_str());
+        if (epstore.getWarmup()->setComplete()) {
+            epstore.getWarmup()->setWarmupTime();
+            epstore.warmupCompleted();
+            LOG(EXTENSION_LOG_NOTICE, "Warmup completed in %s",
+                    hrtime2text(epstore.getWarmup()->getTime()).c_str());
 
         }
-        LOG(EXTENSION_LOG_WARNING,
+        LOG(EXTENSION_LOG_NOTICE,
             "Engine warmup is complete, request to stop "
             "loading remaining database");
         setStatus(ENGINE_ENOMEM);
@@ -322,22 +315,20 @@ void LoadStorageKVPairCallback::callback(GetValue &val) {
 void LoadStorageKVPairCallback::purge() {
     class EmergencyPurgeVisitor : public VBucketVisitor {
     public:
-        EmergencyPurgeVisitor(EventuallyPersistentStore *store) :
+        EmergencyPurgeVisitor(EventuallyPersistentStore& store) :
             epstore(store) {}
 
         void visit(StoredValue *v) {
             currentBucket->ht.unlocked_ejectItem(v,
-                                             epstore->getItemEvictionPolicy());
+                                             epstore.getItemEvictionPolicy());
         }
     private:
-        EventuallyPersistentStore *epstore;
+        EventuallyPersistentStore& epstore;
     };
 
-    std::vector<int> vbucketIds(vbuckets.getBuckets());
-    std::vector<int>::iterator it;
+    auto vbucketIds(vbuckets.getBuckets());
     EmergencyPurgeVisitor epv(epstore);
-    for (it = vbucketIds.begin(); it != vbucketIds.end(); ++it) {
-        int vbid = *it;
+    for (auto vbid : vbucketIds) {
         RCPtr<VBucket> vb = vbuckets.getBucket(vbid);
         if (vb && epv.visitBucket(vb)) {
             vb->ht.visit(epv);
@@ -373,20 +364,39 @@ void LoadValueCallback::callback(CacheLookup &lookup)
 //////////////////////////////////////////////////////////////////////////////
 
 
-Warmup::Warmup(EventuallyPersistentStore *st) :
-    state(), store(st), startTime(0), metadata(0), warmup(0),
-    threadtask_count(0),
-    estimateTime(0), estimatedItemCount(std::numeric_limits<size_t>::max()),
-    cleanShutdown(true), corruptAccessLog(false), warmupComplete(false),
-    estimatedWarmupCount(std::numeric_limits<size_t>::max())
+Warmup::Warmup(EventuallyPersistentStore& st)
+    : state(),
+      store(st),
+      startTime(0),
+      metadata(0),
+      warmup(0),
+      threadtask_count(0),
+      estimateTime(0),
+      estimatedItemCount(std::numeric_limits<size_t>::max()),
+      cleanShutdown(true),
+      corruptAccessLog(false),
+      warmupComplete(false),
+      warmupOOMFailure(false),
+      estimatedWarmupCount(std::numeric_limits<size_t>::max())
 {
-    shardVbStates = new std::map<uint16_t, vbucket_state>[
-                                                       store->vbMap.numShards];
-    shardVbIds = new std::vector<uint16_t>[store->vbMap.numShards];
-    shardKeyDumpStatus = new bool[store->vbMap.numShards];
-    for (size_t i = 0; i < store->vbMap.numShards; i++) {
+    const size_t num_shards = store.vbMap.getNumShards();
+
+    shardVbStates = new std::map<uint16_t, vbucket_state>[num_shards];
+    shardVbIds = new std::vector<uint16_t>[num_shards];
+    shardKeyDumpStatus = new bool[num_shards];
+    for (size_t i = 0; i < num_shards; i++) {
         shardKeyDumpStatus[i] = false;
     }
+}
+
+void Warmup::addToTaskSet(size_t taskId) {
+    LockHolder lh(taskSetMutex);
+    taskSet.insert(taskId);
+}
+
+void Warmup::removeFromTaskSet(size_t taskId) {
+    LockHolder lh(taskSetMutex);
+    taskSet.erase(taskId);
 }
 
 Warmup::~Warmup() {
@@ -397,12 +407,12 @@ Warmup::~Warmup() {
 
 void Warmup::setEstimatedWarmupCount(size_t to)
 {
-    estimatedWarmupCount = to;
+    estimatedWarmupCount.store(to);
 }
 
 size_t Warmup::getEstimatedItemCount()
 {
-    return estimatedItemCount;
+    return estimatedItemCount.load();
 }
 
 void Warmup::start(void)
@@ -412,8 +422,13 @@ void Warmup::start(void)
 
 void Warmup::stop(void)
 {
-    if (taskId) {
-        ExecutorPool::get()->cancel(taskId);
+    LockHolder lh(taskSetMutex);
+    if (!taskSet.empty()) {
+        for (auto id : taskSet) {
+            ExecutorPool::get()->cancel(id);
+        }
+        taskSet.clear();
+        lh.unlock();
         transition(WarmupState::Done, true);
         done();
     }
@@ -421,19 +436,17 @@ void Warmup::stop(void)
 
 void Warmup::scheduleInitialize()
 {
-    ExTask task = new WarmupInitialize(*store, this,
-            Priority::WarmupPriority);
+    ExTask task = new WarmupInitialize(store, this);
     ExecutorPool::get()->schedule(task, READER_TASK_IDX);
 }
 
 void Warmup::initialize()
 {
-    startTime = gethrtime();
-    allVbStates = store->loadVBucketState();
+    startTime.store(gethrtime());
 
     std::map<std::string, std::string> session_stats;
-    store->getOneROUnderlying()->getPersistedStats(session_stats);
-    store->getEPEngine().getTapConnMap().loadPrevSessionStats(session_stats);
+    store.getOneROUnderlying()->getPersistedStats(session_stats);
+    store.getEPEngine().getTapConnMap().loadPrevSessionStats(session_stats);
 
 
     std::map<std::string, std::string>::const_iterator it =
@@ -450,23 +463,25 @@ void Warmup::initialize()
 void Warmup::scheduleCreateVBuckets()
 {
     threadtask_count = 0;
-    for (size_t i = 0; i < store->vbMap.shards.size(); i++) {
-        ExTask task = new WarmupCreateVBuckets(*store, i, this,
-                                               Priority::WarmupPriority);
+    for (size_t i = 0; i < store.vbMap.shards.size(); i++) {
+        ExTask task = new WarmupCreateVBuckets(store, i, this);
         ExecutorPool::get()->schedule(task, READER_TASK_IDX);
     }
 }
 
 void Warmup::createVBuckets(uint16_t shardId) {
-    size_t maxEntries = store->getEPEngine().getMaxFailoverEntries();
+    size_t maxEntries = store.getEPEngine().getMaxFailoverEntries();
     std::map<uint16_t, vbucket_state>& vbStates = shardVbStates[shardId];
+    Configuration& config = store.getEPEngine().getConfiguration();
+    time_sync_t timeSyncConfig =
+               VBucket::convertStrToTimeSyncConfig(config.getTimeSynchronization());
 
     std::map<uint16_t, vbucket_state>::iterator itr;
     for (itr = vbStates.begin(); itr != vbStates.end(); ++itr) {
         uint16_t vbid = itr->first;
         vbucket_state vbs = itr->second;
 
-        RCPtr<VBucket> vb = store->getVBucket(vbid);
+        RCPtr<VBucket> vb = store.getVBucket(vbid);
         if (!vb) {
             FailoverTable* table;
             if (vbs.failovers.empty()) {
@@ -474,21 +489,27 @@ void Warmup::createVBuckets(uint16_t shardId) {
             } else {
                 table = new FailoverTable(vbs.failovers, maxEntries);
             }
-            KVShard* shard = store->getVBuckets().getShard(vbid);
-            shared_ptr<Callback<uint16_t> > cb(new NotifyFlusherCB(shard));
+            KVShard* shard = store.getVBuckets().getShardByVbId(vbid);
+            std::shared_ptr<Callback<uint16_t> > cb(new NotifyFlusherCB(shard));
             vb.reset(new VBucket(vbid, vbs.state,
-                                 store->getEPEngine().getEpStats(),
-                                 store->getEPEngine().getCheckpointConfig(),
+                                 store.getEPEngine().getEpStats(),
+                                 store.getEPEngine().getCheckpointConfig(),
                                  shard, vbs.highSeqno, vbs.lastSnapStart,
                                  vbs.lastSnapEnd, table, cb, vbs.state, 1,
                                  vbs.purgeSeqno, vbs.maxCas,
                                  vbs.driftCounter));
 
+            vb->setTimeSyncConfig(timeSyncConfig);
+
             if(vbs.state == vbucket_state_active && !cleanShutdown) {
-                vb->failovers->createEntry(vbs.lastSnapStart);
+                if (static_cast<uint64_t>(vbs.highSeqno) == vbs.lastSnapEnd) {
+                    vb->failovers->createEntry(vbs.lastSnapEnd);
+                } else {
+                    vb->failovers->createEntry(vbs.lastSnapStart);
+                }
             }
 
-            store->vbMap.addBucket(vb);
+            store.vbMap.addBucket(vb);
         }
 
         // Pass the open checkpoint Id for each vbucket.
@@ -497,12 +518,12 @@ void Warmup::createVBuckets(uint16_t shardId) {
         vb->ht.setMaxDeletedRevSeqno(vbs.maxDeletedSeqno);
         // For each vbucket, set its latest checkpoint Id that was
         // successfully persisted.
-        store->vbMap.setPersistenceCheckpointId(vbid, vbs.checkpointId);
+        store.vbMap.setPersistenceCheckpointId(vbid, vbs.checkpointId);
         // For each vbucket, set the last persisted seqno checkpoint
-        store->vbMap.setPersistenceSeqno(vbid, vbs.highSeqno);
+        store.vbMap.setPersistenceSeqno(vbid, vbs.highSeqno);
     }
 
-    if (++threadtask_count == store->vbMap.numShards) {
+    if (++threadtask_count == store.vbMap.getNumShards()) {
         transition(WarmupState::EstimateDatabaseItemCount);
     }
 }
@@ -513,9 +534,8 @@ void Warmup::scheduleEstimateDatabaseItemCount()
     threadtask_count = 0;
     estimateTime = 0;
     estimatedItemCount = 0;
-    for (size_t i = 0; i < store->vbMap.shards.size(); i++) {
-        ExTask task = new WarmupEstimateDatabaseItemCount(
-                                *store, i, this, Priority::WarmupPriority);
+    for (size_t i = 0; i < store.vbMap.shards.size(); i++) {
+        ExTask task = new WarmupEstimateDatabaseItemCount(store, i, this);
         ExecutorPool::get()->schedule(task, READER_TASK_IDX);
     }
 }
@@ -528,23 +548,20 @@ void Warmup::estimateDatabaseItemCount(uint16_t shardId)
     const std::vector<uint16_t> &vbs = shardVbIds[shardId];
     std::vector<uint16_t>::const_iterator it = vbs.begin();
     for (; it != vbs.end(); ++it) {
-        DBFileInfo info = store->getRWUnderlyingByShard(shardId)->
-                                                        getDbFileInfo(*it);
-        RCPtr<VBucket> vb = store->getVBucket(*it);
+        size_t vbItemCount = store.getROUnderlyingByShard(shardId)->
+                                                        getItemCount(*it);
+        RCPtr<VBucket> vb = store.getVBucket(*it);
         if (vb) {
-            vb->ht.numTotalItems = info.itemCount;
-            vb->fileSize = info.fileSize;
-            vb->fileSpaceUsed = info.spaceUsed;
-
+            vb->ht.numTotalItems = vbItemCount;
         }
-        item_count += info.itemCount;
+        item_count += vbItemCount;
     }
 
     estimatedItemCount.fetch_add(item_count);
     estimateTime.fetch_add(gethrtime() - st);
 
-    if (++threadtask_count == store->vbMap.numShards) {
-        if (store->getItemEvictionPolicy() == VALUE_ONLY) {
+    if (++threadtask_count == store.vbMap.getNumShards()) {
+        if (store.getItemEvictionPolicy() == VALUE_ONLY) {
             transition(WarmupState::KeyDump);
         } else {
             transition(WarmupState::CheckForAccessLog);
@@ -555,9 +572,8 @@ void Warmup::estimateDatabaseItemCount(uint16_t shardId)
 void Warmup::scheduleKeyDump()
 {
     threadtask_count = 0;
-    for (size_t i = 0; i < store->vbMap.shards.size(); i++) {
-        ExTask task = new WarmupKeyDump(*store, this,
-                                        i, Priority::WarmupPriority);
+    for (size_t i = 0; i < store.vbMap.shards.size(); i++) {
+        ExTask task = new WarmupKeyDump(store, i, this);
         ExecutorPool::get()->schedule(task, READER_TASK_IDX);
     }
 
@@ -565,29 +581,29 @@ void Warmup::scheduleKeyDump()
 
 void Warmup::keyDumpforShard(uint16_t shardId)
 {
-    if (store->getROUnderlyingByShard(shardId)->isKeyDumpSupported()) {
-        KVStore* kvstore = store->getROUnderlyingByShard(shardId);
-        LoadStorageKVPairCallback *load_cb =
+    KVStore* kvstore = store.getROUnderlyingByShard(shardId);
+    LoadStorageKVPairCallback *load_cb =
             new LoadStorageKVPairCallback(store, false, state.getState());
-        shared_ptr<Callback<GetValue> > cb(load_cb);
-        shared_ptr<Callback<CacheLookup> > cl(new NoLookupCallback());
+    std::shared_ptr<Callback<GetValue> > cb(load_cb);
+    std::shared_ptr<Callback<CacheLookup> > cl(new NoLookupCallback());
 
-        std::vector<uint16_t>::iterator itr = shardVbIds[shardId].begin();
-        for (; itr != shardVbIds[shardId].end(); ++itr) {
-            ScanContext* ctx = kvstore->initScanContext(cb, cl, *itr, 0, true,
-                                                        true, false);
-            if (ctx) {
-                kvstore->scan(ctx);
-                kvstore->destroyScanContext(ctx);
-            }
+    std::vector<uint16_t>::iterator itr = shardVbIds[shardId].begin();
+
+    for (; itr != shardVbIds[shardId].end(); ++itr) {
+        ScanContext* ctx = kvstore->initScanContext(cb, cl, *itr, 0,
+                                                    DocumentFilter::NO_DELETES,
+                                                    ValueFilter::KEYS_ONLY);
+        if (ctx) {
+            kvstore->scan(ctx);
+            kvstore->destroyScanContext(ctx);
         }
-
-        shardKeyDumpStatus[shardId] = true;
     }
 
-    if (++threadtask_count == store->vbMap.numShards) {
+    shardKeyDumpStatus[shardId] = true;
+
+    if (++threadtask_count == store.vbMap.getNumShards()) {
         bool success = false;
-        for (size_t i = 0; i < store->vbMap.numShards; i++) {
+        for (size_t i = 0; i < store.vbMap.getNumShards(); i++) {
             if (shardKeyDumpStatus[i]) {
                 success = true;
             } else {
@@ -599,10 +615,8 @@ void Warmup::keyDumpforShard(uint16_t shardId)
         if (success) {
             transition(WarmupState::CheckForAccessLog);
         } else {
-            if (store->getROUnderlyingByShard(shardId)->isKeyDumpSupported()) {
-                LOG(EXTENSION_LOG_WARNING,
-                        "Failed to dump keys, falling back to full dump");
-            }
+            LOG(EXTENSION_LOG_WARNING,
+                "Failed to dump keys, falling back to full dump");
             transition(WarmupState::LoadingKVPairs);
         }
     }
@@ -610,35 +624,34 @@ void Warmup::keyDumpforShard(uint16_t shardId)
 
 void Warmup::scheduleCheckForAccessLog()
 {
-    ExTask task = new WarmupCheckforAccessLog(*store, this,
-            Priority::WarmupPriority);
+    ExTask task = new WarmupCheckforAccessLog(store, this);
     ExecutorPool::get()->schedule(task, READER_TASK_IDX);
 }
 
 void Warmup::checkForAccessLog()
 {
-    metadata = gethrtime() - startTime;
-    LOG(EXTENSION_LOG_WARNING, "metadata loaded in %s",
-        hrtime2text(metadata).c_str());
+    metadata.store(gethrtime() - startTime);
+    LOG(EXTENSION_LOG_NOTICE, "metadata loaded in %s",
+        hrtime2text(metadata.load()).c_str());
 
-    if (store->maybeEnableTraffic()) {
+    if (store.maybeEnableTraffic()) {
         transition(WarmupState::Done);
     }
 
     size_t accesslogs = 0;
-    for (size_t i = 0; i < store->vbMap.shards.size(); i++) {
-        std::string curr = store->accessLog[i]->getLogFile();
-        std::string old = store->accessLog[i]->getLogFile();
+    for (size_t i = 0; i < store.vbMap.shards.size(); i++) {
+        std::string curr = store.accessLog[i]->getLogFile();
+        std::string old = store.accessLog[i]->getLogFile();
         old.append(".old");
         if (access(curr.c_str(), F_OK) == 0 ||
             access(old.c_str(), F_OK) == 0) {
             accesslogs++;
         }
     }
-    if (accesslogs == store->vbMap.shards.size()) {
+    if (accesslogs == store.vbMap.shards.size()) {
         transition(WarmupState::LoadingAccessLog);
     } else {
-        if (store->getItemEvictionPolicy() == VALUE_ONLY) {
+        if (store.getItemEvictionPolicy() == VALUE_ONLY) {
             transition(WarmupState::LoadingData);
         } else {
             transition(WarmupState::LoadingKVPairs);
@@ -650,24 +663,22 @@ void Warmup::checkForAccessLog()
 void Warmup::scheduleLoadingAccessLog()
 {
     threadtask_count = 0;
-    for (size_t i = 0; i < store->vbMap.shards.size(); i++) {
-        ExTask task = new WarmupLoadAccessLog(*store, this, i,
-                Priority::WarmupPriority);
+    for (size_t i = 0; i < store.vbMap.shards.size(); i++) {
+        ExTask task = new WarmupLoadAccessLog(store, i, this);
         ExecutorPool::get()->schedule(task, READER_TASK_IDX);
     }
 }
 
 void Warmup::loadingAccessLog(uint16_t shardId)
 {
-
     LoadStorageKVPairCallback *load_cb =
         new LoadStorageKVPairCallback(store, true, state.getState());
     bool success = false;
     hrtime_t stTime = gethrtime();
-    if (store->accessLog[shardId]->exists()) {
+    if (store.accessLog[shardId]->exists()) {
         try {
-            store->accessLog[shardId]->open();
-            if (doWarmup(*(store->accessLog[shardId]),
+            store.accessLog[shardId]->open();
+            if (doWarmup(*(store.accessLog[shardId]),
                          shardVbStates[shardId], *load_cb) != (size_t)-1) {
                 success = true;
             }
@@ -680,7 +691,7 @@ void Warmup::loadingAccessLog(uint16_t shardId)
 
     if (!success) {
         // Do we have the previous file?
-        std::string nm = store->accessLog[shardId]->getLogFile();
+        std::string nm = store.accessLog[shardId]->getLogFile();
         nm.append(".old");
         MutationLog old(nm);
         if (old.exists()) {
@@ -698,19 +709,20 @@ void Warmup::loadingAccessLog(uint16_t shardId)
         }
     }
 
-    size_t numItems = store->getEPEngine().getEpStats().warmedUpValues;
+    size_t numItems = store.getEPEngine().getEpStats().warmedUpValues;
     if (success && numItems) {
-        LOG(EXTENSION_LOG_WARNING,
-            "%d items loaded from access log, completed in %s", numItems,
+        LOG(EXTENSION_LOG_NOTICE,
+            "%" PRIu64 " items loaded from access log, completed in %s",
+            uint64_t(numItems),
             hrtime2text((gethrtime() - stTime) / 1000).c_str());
     } else {
-        size_t estimatedCount= store->getEPEngine().getEpStats().warmedUpKeys;
+        size_t estimatedCount= store.getEPEngine().getEpStats().warmedUpKeys;
         setEstimatedWarmupCount(estimatedCount);
     }
 
     delete load_cb;
-    if (++threadtask_count == store->vbMap.numShards) {
-        if (!store->maybeEnableTraffic()) {
+    if (++threadtask_count == store.vbMap.getNumShards()) {
+        if (!store.maybeEnableTraffic()) {
             transition(WarmupState::LoadingData);
         } else {
             transition(WarmupState::Done);
@@ -722,7 +734,7 @@ void Warmup::loadingAccessLog(uint16_t shardId)
 size_t Warmup::doWarmup(MutationLog &lf, const std::map<uint16_t,
                         vbucket_state> &vbmap, Callback<GetValue> &cb)
 {
-    MutationLogHarvester harvester(lf, &store->getEPEngine());
+    MutationLogHarvester harvester(lf, &store.getEPEngine());
     std::map<uint16_t, vbucket_state>::const_iterator it;
     for (it = vbmap.begin(); it != vbmap.end(); ++it) {
         harvester.setVBucket(it->first);
@@ -740,8 +752,8 @@ size_t Warmup::doWarmup(MutationLog &lf, const std::map<uint16_t,
         hrtime2text(end - st).c_str(), total);
 
     st = gethrtime();
-    WarmupCookie cookie(store, cb);
-    if (store->multiBGFetchEnabled()) {
+    WarmupCookie cookie(&store, cb);
+    if (store.multiBGFetchEnabled()) {
         harvester.apply(&cookie, &batchWarmupCallback);
     } else {
         harvester.apply(&cookie, &warmupCallback);
@@ -763,9 +775,8 @@ void Warmup::scheduleLoadingKVPairs()
     setEstimatedWarmupCount(estimatedItemCount);
 
     threadtask_count = 0;
-    for (size_t i = 0; i < store->vbMap.shards.size(); i++) {
-        ExTask task = new WarmupLoadingKVPairs(*store, this,
-                                               i, Priority::WarmupPriority);
+    for (size_t i = 0; i < store.vbMap.shards.size(); i++) {
+        ExTask task = new WarmupLoadingKVPairs(store, i, this);
         ExecutorPool::get()->schedule(task, READER_TASK_IDX);
     }
 
@@ -774,72 +785,84 @@ void Warmup::scheduleLoadingKVPairs()
 void Warmup::loadKVPairsforShard(uint16_t shardId)
 {
     bool maybe_enable_traffic = false;
-    if (store->getItemEvictionPolicy() == FULL_EVICTION) {
+    scan_error_t errorCode = scan_success;
+
+    if (store.getItemEvictionPolicy() == FULL_EVICTION) {
         maybe_enable_traffic = true;
     }
 
-    KVStore* kvstore = store->getROUnderlyingByShard(shardId);
+    KVStore* kvstore = store.getROUnderlyingByShard(shardId);
     LoadStorageKVPairCallback *load_cb =
         new LoadStorageKVPairCallback(store, maybe_enable_traffic,
                                       state.getState());
-    shared_ptr<Callback<GetValue> > cb(load_cb);
-    shared_ptr<Callback<CacheLookup> >
-        cl(new LoadValueCallback(store->vbMap, state.getState()));
+    std::shared_ptr<Callback<GetValue> > cb(load_cb);
+    std::shared_ptr<Callback<CacheLookup> >
+        cl(new LoadValueCallback(store.vbMap, state.getState()));
 
     std::vector<uint16_t>::iterator itr = shardVbIds[shardId].begin();
     for (; itr != shardVbIds[shardId].end(); ++itr) {
-        ScanContext* ctx = kvstore->initScanContext(cb, cl, *itr, 0, false,
-                                                    true, false);
+        ScanContext* ctx = kvstore->initScanContext(cb, cl, *itr, 0,
+                                                    DocumentFilter::NO_DELETES,
+                                                    ValueFilter::VALUES_DECOMPRESSED);
         if (ctx) {
-            kvstore->scan(ctx);
+            errorCode = kvstore->scan(ctx);
             kvstore->destroyScanContext(ctx);
+            if (errorCode == scan_again) { // ENGINE_ENOMEM
+                // skip loading remaining VBuckets as memory limit was reached
+                break;
+            }
         }
     }
-    if (++threadtask_count == store->vbMap.numShards) {
+    if (++threadtask_count == store.vbMap.getNumShards()) {
         transition(WarmupState::Done);
     }
 }
 
 void Warmup::scheduleLoadingData()
 {
-    size_t estimatedCount = store->getEPEngine().getEpStats().warmedUpKeys;
+    size_t estimatedCount = store.getEPEngine().getEpStats().warmedUpKeys;
     setEstimatedWarmupCount(estimatedCount);
 
     threadtask_count = 0;
-    for (size_t i = 0; i < store->vbMap.shards.size(); i++) {
-        ExTask task = new WarmupLoadingData(*store, this,
-                                            i, Priority::WarmupPriority);
+    for (size_t i = 0; i < store.vbMap.shards.size(); i++) {
+        ExTask task = new WarmupLoadingData(store, i, this);
         ExecutorPool::get()->schedule(task, READER_TASK_IDX);
     }
 }
 
 void Warmup::loadDataforShard(uint16_t shardId)
 {
-    KVStore* kvstore = store->getROUnderlyingByShard(shardId);
+    scan_error_t errorCode = scan_success;
+
+    KVStore* kvstore = store.getROUnderlyingByShard(shardId);
     LoadStorageKVPairCallback *load_cb =
         new LoadStorageKVPairCallback(store, true, state.getState());
-    shared_ptr<Callback<GetValue> > cb(load_cb);
-    shared_ptr<Callback<CacheLookup> >
-        cl(new LoadValueCallback(store->vbMap, state.getState()));
+    std::shared_ptr<Callback<GetValue> > cb(load_cb);
+    std::shared_ptr<Callback<CacheLookup> >
+        cl(new LoadValueCallback(store.vbMap, state.getState()));
 
     std::vector<uint16_t>::iterator itr = shardVbIds[shardId].begin();
     for (; itr != shardVbIds[shardId].end(); ++itr) {
-        ScanContext* ctx = kvstore->initScanContext(cb, cl, *itr, 0, false,
-                                                    true, false);
+        ScanContext* ctx = kvstore->initScanContext(cb, cl, *itr, 0,
+                                                    DocumentFilter::NO_DELETES,
+                                                    ValueFilter::VALUES_DECOMPRESSED);
         if (ctx) {
-            kvstore->scan(ctx);
+            errorCode = kvstore->scan(ctx);
             kvstore->destroyScanContext(ctx);
+            if (errorCode == scan_again) { // ENGINE_ENOMEM
+                // skip loading remaining VBuckets as memory limit was reached
+                break;
+            }
         }
     }
 
-    if (++threadtask_count == store->vbMap.numShards) {
+    if (++threadtask_count == store.vbMap.getNumShards()) {
         transition(WarmupState::Done);
     }
 }
 
 void Warmup::scheduleCompletion() {
-    ExTask task = new WarmupCompletion(*store, this,
-                                       Priority::WarmupPriority);
+    ExTask task = new WarmupCompletion(store, this);
     ExecutorPool::get()->schedule(task, READER_TASK_IDX);
 }
 
@@ -847,9 +870,9 @@ void Warmup::done()
 {
     if (setComplete()) {
         setWarmupTime();
-        store->warmupCompleted();
-        LOG(EXTENSION_LOG_WARNING, "warmup completed in %s",
-                                   hrtime2text(warmup).c_str());
+        store.warmupCompleted();
+        LOG(EXTENSION_LOG_NOTICE, "warmup completed in %s",
+                                   hrtime2text(warmup.load()).c_str());
     }
 }
 
@@ -920,8 +943,8 @@ void Warmup::addStat(const char *nm, const T &val, ADD_STAT add_stat,
 
 void Warmup::addStats(ADD_STAT add_stat, const void *c) const
 {
-    if (store->getEPEngine().getConfiguration().isWarmup()) {
-        EPStats &stats = store->getEPEngine().getEpStats();
+    if (store.getEPEngine().getConfiguration().isWarmup()) {
+        EPStats &stats = store.getEPEngine().getEpStats();
         addStat(NULL, "enabled", add_stat, c);
         const char *stateName = state.toString();
         addStat("state", stateName, add_stat, c);
@@ -934,57 +957,82 @@ void Warmup::addStats(ADD_STAT add_stat, const void *c) const
         addStat("value_count", stats.warmedUpValues, add_stat, c);
         addStat("dups", stats.warmDups, add_stat, c);
         addStat("oom", stats.warmOOM, add_stat, c);
-        addStat("item_expired", stats.warmupExpired, add_stat, c);
         addStat("min_memory_threshold",
                 stats.warmupMemUsedCap * 100.0, add_stat, c);
         addStat("min_item_threshold",
                 stats.warmupNumReadCap * 100.0, add_stat, c);
 
-        if (metadata > 0) {
-            addStat("keys_time", metadata / 1000, add_stat, c);
+        hrtime_t md_time = metadata.load();
+        if (md_time > 0) {
+            addStat("keys_time", md_time / 1000, add_stat, c);
         }
 
-        if (warmup > 0) {
-            addStat("time", warmup / 1000, add_stat, c);
+        hrtime_t w_time = warmup.load();
+        if (w_time > 0) {
+            addStat("time", w_time / 1000, add_stat, c);
         }
 
-        if (estimatedItemCount == std::numeric_limits<size_t>::max()) {
+        size_t itemCount = estimatedItemCount.load();
+        if (itemCount == std::numeric_limits<size_t>::max()) {
             addStat("estimated_key_count", "unknown", add_stat, c);
         } else {
-            if (estimateTime != 0) {
-                addStat("estimate_time", estimateTime / 1000, add_stat, c);
+            hrtime_t e_time = estimateTime.load();
+            if (e_time != 0) {
+                addStat("estimate_time", e_time / 1000, add_stat, c);
             }
-            addStat("estimated_key_count", estimatedItemCount, add_stat, c);
+            addStat("estimated_key_count", itemCount, add_stat, c);
         }
 
         if (corruptAccessLog) {
             addStat("access_log", "corrupt", add_stat, c);
         }
 
-        if (estimatedWarmupCount ==  std::numeric_limits<size_t>::max()) {
+        size_t warmupCount = estimatedWarmupCount.load();
+        if (warmupCount ==  std::numeric_limits<size_t>::max()) {
             addStat("estimated_value_count", "unknown", add_stat, c);
         } else {
-            addStat("estimated_value_count", estimatedWarmupCount,
-            add_stat, c);
+            addStat("estimated_value_count", warmupCount, add_stat, c);
         }
    } else {
         addStat(NULL, "disabled", add_stat, c);
     }
 }
 
-void Warmup::populateShardVbStates()
+/* In the case of CouchKVStore, all vbucket states of all the shards are stored
+ * in a single instance. ForestKVStore stores only the vbucket states specific
+ * to that shard. Hence the vbucket states of all the shards need to be
+ * retrieved */
+uint16_t Warmup::getNumKVStores()
 {
-    for (uint16_t vb = 0; vb < allVbStates.size(); vb++) {
-        if (!allVbStates[vb]) {
-            continue;
-        }
-        std::map<uint16_t, vbucket_state> &shardVB =
-            shardVbStates[vb % store->vbMap.numShards];
-        shardVB.insert(std::pair<uint16_t, vbucket_state>(vb,
-                                                          *(allVbStates[vb])));
+    Configuration& config = store.getEPEngine().getConfiguration();
+    if (config.getBackend().compare("couchdb") == 0) {
+        return 1;
+    } else if (config.getBackend().compare("forestdb") == 0) {
+        return config.getMaxNumShards();
     }
 
-    for (size_t i = 0; i < store->vbMap.shards.size(); i++) {
+    return 0;
+}
+
+void Warmup::populateShardVbStates()
+{
+    uint16_t numKvs = getNumKVStores();
+
+    for (size_t i = 0; i < numKvs; i++) {
+        std::vector<vbucket_state *> allVbStates =
+                     store.getROUnderlyingByShard(i)->listPersistedVbuckets();
+        for (uint16_t vb = 0; vb < allVbStates.size(); vb++) {
+            if (!allVbStates[vb] || allVbStates[vb]->state == vbucket_state_dead) {
+                continue;
+            }
+            std::map<uint16_t, vbucket_state> &shardVB =
+                shardVbStates[vb % store.vbMap.getNumShards()];
+            shardVB.insert(std::pair<uint16_t, vbucket_state>(vb,
+                                                          *(allVbStates[vb])));
+        }
+    }
+
+    for (size_t i = 0; i < store.vbMap.shards.size(); i++) {
         std::vector<uint16_t> activeVBs, replicaVBs;
         std::map<uint16_t, vbucket_state>::const_iterator it;
         for (it = shardVbStates[i].begin(); it != shardVbStates[i].end(); ++it) {
@@ -997,23 +1045,41 @@ void Warmup::populateShardVbStates()
             }
         }
 
-        // Order the vbucket ids into the vector for each shard in such a
-        // way, that active vbuckets get 60% preference and replica vbuckets
-        // get 40% preference.
-
-        Couchbase::RandomGenerator provider(true);
-        std::vector<uint16_t>::iterator it1 = activeVBs.begin();
-        std::vector<uint16_t>::iterator it2 = replicaVBs.begin();
-        while (it1 != activeVBs.end() || it2 != replicaVBs.end()) {
-            uint64_t num = provider.next();
-            if ((num % 2 == 0 || num % 5 == 0) && it1 != activeVBs.end()) {
-                shardVbIds[i].push_back(*it1);
-                ++it1;
-            } else if (it2 != replicaVBs.end()) {
-                shardVbIds[i].push_back(*it2);
-                ++it2;
-            }
+        // Push one active VB to the front.
+        // When the ratio of RAM to VBucket is poor (big vbuckets) this will
+        // ensure we at least bring active data in before replicas eat RAM.
+        if (!activeVBs.empty()) {
+            shardVbIds[i].push_back(activeVBs.back());
+            activeVBs.pop_back();
         }
 
+        // Now the VB lottery can begin.
+        // Generate a psudeo random, weighted list of active/replica vbuckets.
+        // The random seed is the shard ID so that re-running warmup
+        // for the same shard and vbucket set always gives the same output and keeps
+        // nodes of the cluster more equal after a warmup.
+
+        std::mt19937 twister(i);
+        // Give 'true' (aka active) 60% of the time
+        // Give 'false' (aka replica) 40% of the time.
+        std::bernoulli_distribution distribute(0.6);
+        std::array<std::vector<uint16_t>*, 2> activeReplicaSource = {{&activeVBs,
+                                                                      &replicaVBs}};
+
+        while (!activeVBs.empty() || !replicaVBs.empty()) {
+            const bool active = distribute(twister);
+            int num = active ? 0 : 1;
+            if (!activeReplicaSource[num]->empty()) {
+                shardVbIds[i].push_back(activeReplicaSource[num]->back());
+                activeReplicaSource[num]->pop_back();
+            } else {
+                // Once active or replica set is empty, just drain the other one.
+                num = num ^ 1;
+                while (!activeReplicaSource[num]->empty()) {
+                    shardVbIds[i].push_back(activeReplicaSource[num]->back());
+                    activeReplicaSource[num]->pop_back();
+                }
+            }
+        }
     }
 }

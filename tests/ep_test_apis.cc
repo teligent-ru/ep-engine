@@ -17,6 +17,7 @@
 
 #include "config.h"
 #include "ep_test_apis.h"
+#include "ep_testsuite_common.h"
 
 #include <memcached/util.h>
 #include <platform/platform.h>
@@ -25,29 +26,103 @@
 
 #include <algorithm>
 #include <iostream>
+#include <list>
+#include <mutex>
 #include <sstream>
 
 #include "mock/mock_dcp.h"
 
-#define check(expr, msg) \
-    static_cast<void>((expr) ? 0 : abort_msg(#expr, msg, __LINE__))
+// Due to the limitations of the add_stats callback (essentially we cannot pass
+// a context into it) we instead have a single, global `vals` map. This mutex
+// is used to serialise modifications to it to allow multiple threads to request
+// stats.
+// There is also an optimized add_stats callback (add_individual_stat) which
+// checks for one stat (and hence doesn't have to keep a map of all of them).
+// the vals_mutex is also used for serializing acccess to it's data
+// (requested_stat_name and actual_stat_value).
+std::mutex vals_mutex;
+statistic_map vals;
+std::string requested_stat_name;
+std::string actual_stat_value;
 
-extern "C" bool abort_msg(const char *expr, const char *msg, int line);
-
-std::map<std::string, std::string> vals;
 bool dump_stats = false;
-protocol_binary_response_status last_status =
-    static_cast<protocol_binary_response_status>(0);
-uint32_t last_bodylen = 0;
-char *last_key = NULL;
-char *last_body = NULL;
-bool last_deleted_flag = false;
-uint8_t last_conflict_resolution_mode = static_cast<uint8_t>(-1);
-uint64_t last_cas = 0;
-uint8_t last_datatype = 0x00;
+std::atomic<protocol_binary_response_status> last_status(
+    static_cast<protocol_binary_response_status>(0));
+std::string last_key;
+std::string last_body;
+bool last_deleted_flag(false);
+std::atomic<uint8_t> last_conflict_resolution_mode(static_cast<uint8_t>(-1));
+std::atomic<uint64_t> last_cas(0);
+std::atomic<uint8_t> last_datatype(0x00);
 ItemMetaData last_meta;
-uint64_t last_uuid = 0;
-uint64_t last_seqno = 0;
+std::atomic<uint64_t> last_uuid(0);
+std::atomic<uint64_t> last_seqno(0);
+
+/* HistogramBinStats is used to hold a histogram bin object a histogram stat.
+   This is a class used to hold already computed stats. Hence we do not expect
+   any change once a bin object is created */
+template<typename T>
+class HistogramBinStats {
+public:
+    HistogramBinStats(const T& s, const T& e, uint64_t count)
+        : start_(s), end_(e), count_(count) { }
+
+    T start() const {
+        return start_;
+    }
+
+    T end() const {
+        return end_;
+    }
+
+    uint64_t count() const {
+        return count_;
+    }
+
+private:
+    T start_;
+    T end_;
+    uint64_t count_;
+};
+
+
+/* HistogramStats is used to hold necessary info from a histogram stat.
+   Since this class used to hold already computed stats, only write apis to add
+   new bins is implemented */
+template<typename T>
+class HistogramStats {
+public:
+    HistogramStats() : total_count(0) {}
+
+    /* Add a new bin */
+    void add_bin(const T& start, const T& end, uint64_t count) {
+        bins.push_back(HistogramBinStats<T>(start, end, count));
+        total_count += count;
+    }
+
+    /* Num of bins in the histogram */
+    size_t num_bins() const {
+        return bins.size();
+    }
+
+    uint64_t total() const {
+        return total_count;
+    }
+
+    /* Add a bin iterator when needed */
+private:
+    /* List of all the bins in the histogram stats */
+    std::list<HistogramBinStats<T>> bins;
+    /* Total number of samples across all histogram bins */
+    uint64_t total_count;
+};
+
+/* HistogramStats<T>* is supported C++14 onwards. Until then use a separate
+   ptr for each type */
+static HistogramStats<int>* histogram_stat_int_value;
+
+static void get_histo_stat(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1,
+                                  const char *statname, const char *statkey);
 
 extern "C" bool add_response_get_meta(const void *key, uint16_t keylen,
                                       const void *ext, uint8_t extlen,
@@ -67,16 +142,7 @@ ENGINE_ERROR_CODE vb_map_response(const void *cookie,
                                   const void *map,
                                   size_t mapsize) {
     (void)cookie;
-    last_bodylen = mapsize;
-    if (last_body) {
-        free(last_body);
-        last_body = NULL;
-    }
-    if (mapsize > 0) {
-        last_body = static_cast<char*>(malloc(mapsize));
-        cb_assert(last_body);
-        memcpy(last_body, map, mapsize);
-    }
+    last_body.assign(static_cast<const char*>(map), mapsize);
     return ENGINE_SUCCESS;
 }
 
@@ -87,30 +153,11 @@ bool add_response(const void *key, uint16_t keylen, const void *ext,
     (void)ext;
     (void)extlen;
     (void)cookie;
-    last_bodylen = bodylen;
-    last_status = static_cast<protocol_binary_response_status>(status);
-    if (last_body) {
-        free(last_body);
-        last_body = NULL;
-    }
-    if (bodylen > 0) {
-        last_body = static_cast<char*>(malloc(bodylen + 1));
-        cb_assert(last_body);
-        memcpy(last_body, body, bodylen);
-        last_body[bodylen] = '\0';
-    }
-    if (last_key) {
-        free(last_key);
-        last_key = NULL;
-    }
-    if (keylen > 0) {
-        last_key = static_cast<char*>(malloc(keylen + 1));
-        cb_assert(last_key);
-        memcpy(last_key, key, keylen);
-        last_key[keylen] = '\0';
-    }
-    last_cas = cas;
-    last_datatype = datatype;
+    last_status.store(static_cast<protocol_binary_response_status>(status));
+    last_body.assign(static_cast<const char*>(body), bodylen);
+    last_key.assign(static_cast<const char*>(key), keylen);
+    last_cas.store(cas);
+    last_datatype.store(datatype);
     return true;
 }
 
@@ -149,8 +196,8 @@ bool add_response_set_del_meta(const void *key, uint16_t keylen, const void *ext
         uint64_t seqno;
         memcpy(&vb_uuid, ext_bytes, 8);
         memcpy(&seqno, ext_bytes + 8, 8);
-        last_uuid = ntohll(vb_uuid);
-        last_seqno = ntohll(seqno);
+        last_uuid.store(ntohll(vb_uuid));
+        last_seqno.store(ntohll(seqno));
     }
 
     return add_response(key, keylen, ext, extlen, body, bodylen, datatype,
@@ -187,6 +234,52 @@ void add_stats(const char *key, const uint16_t klen, const char *val,
 
     vals[k] = v;
 }
+
+/* Callback passed to engine interface `get_stats`, used by get_int_stat and
+ * friends to lookup a specific stat. If `key` matches the requested key name,
+ * then record its value in actual_stat_value.
+ */
+void add_individual_stat(const char *key, const uint16_t klen, const char *val,
+               const uint32_t vlen, const void *cookie) {
+
+    if (actual_stat_value.empty() &&
+        requested_stat_name.compare(0, requested_stat_name.size(),
+                                    key, klen) == 0) {
+        actual_stat_value = std::string(val, vlen);
+    }
+}
+
+void add_individual_histo_stat(const char *key, const uint16_t klen,
+                               const char *val, const uint32_t vlen,
+                               const void *cookie) {
+    /* Convert key to string */
+    std::string key_str(key, klen);
+    size_t pos1 = key_str.find(requested_stat_name);
+    if (pos1 != std::string::npos)
+    {
+        actual_stat_value.append(val, vlen);
+        /* Parse start and end from the key.
+           Key is in the format task_name_START,END (backfill_tasks_20,100) */
+        pos1 += requested_stat_name.length();
+        /* Find ',' to move to end of bin_start */
+        size_t pos2 = key_str.find(',', pos1);
+        if ((std::string::npos == pos2) || (pos1 >= pos2)) {
+            throw std::invalid_argument("Malformed histogram stat: " + key_str);
+        }
+        int start = std::stoi(std::string(key_str, pos1, pos2));
+
+        /* Move next to ',' for starting character of bin_end */
+        pos1 = pos2 + 1;
+        /* key_str ends with bin_end */
+        pos2 = key_str.length();
+        if (pos1 >= pos2) {
+            throw std::invalid_argument("Malformed histogram stat: " + key_str);
+        }
+        int end = std::stoi(std::string(key_str, pos1, pos2));
+        histogram_stat_int_value->add_bin(start, end, std::stoull(val));
+    }
+}
+
 
 void encodeExt(char *buffer, uint32_t val) {
     val = htonl(val);
@@ -253,21 +346,23 @@ protocol_binary_request_header* createPacket(uint8_t opcode,
 }
 
 void set_drift_counter_state(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1,
-                             int64_t initialDriftCount, uint8_t timeSync) {
+                             int64_t initialDriftCount) {
 
     protocol_binary_request_header *request;
 
     int64_t driftCount = htonll(initialDriftCount);
+    uint8_t timeSync = 0x00;
     uint8_t extlen = sizeof(driftCount) + sizeof(timeSync);
     char *ext = new char[extlen];
-    memcpy(ext, (char*)&driftCount, sizeof(driftCount));
-    memcpy(ext + sizeof(driftCount), (char*)&timeSync, sizeof(timeSync));
+    memcpy(ext, (char *)&driftCount, sizeof(driftCount));
+    memcpy(ext + sizeof(driftCount), (char *)&timeSync, sizeof(timeSync));
 
     request = createPacket(PROTOCOL_BINARY_CMD_SET_DRIFT_COUNTER_STATE,
                            0, 0, ext, extlen);
     h1->unknown_command(h, NULL, request, add_response);
     check(last_status == PROTOCOL_BINARY_RESPONSE_SUCCESS,
             "Expected success for CMD_SET_DRIFT_COUNTER_STATE");
+    free(request);
     delete[] ext;
 }
 
@@ -311,6 +406,7 @@ void add_with_meta(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1, const char *key,
     }
     check(h1->unknown_command(h, NULL, pkt, add_response) == ENGINE_SUCCESS,
           "Expected to be able to store with meta");
+    free(pkt);
     delete[] ext;
 }
 
@@ -391,6 +487,7 @@ void del_with_meta(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1, const char *key,
     }
     check(h1->unknown_command(h, cookie, pkt, add_response_set_del_meta) == ENGINE_SUCCESS,
           "Expected to be able to delete with meta");
+    free(pkt);
     delete[] ext;
 }
 
@@ -405,11 +502,12 @@ void evict_key(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1, const char *key,
     check(h1->unknown_command(h, NULL, pkt, add_response) == ENGINE_SUCCESS,
           "Failed to evict key.");
 
+    free(pkt);
     if (expectError) {
         check(last_status == PROTOCOL_BINARY_RESPONSE_KEY_EEXISTS,
               "Expected exists when evicting key.");
     } else {
-        if (strcmp(last_body, "Already ejected.") != 0) {
+        if (last_body != "Already ejected.") {
             nonResidentItems++;
             numEjectedItems++;
         }
@@ -422,9 +520,9 @@ void evict_key(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1, const char *key,
     check(get_int_stat(h, h1, "ep_num_value_ejects") == numEjectedItems,
           "Incorrect number of ejected items");
 
-    if (msg != NULL && strcmp(last_body, msg) != 0) {
+    if (msg != NULL && last_body != msg) {
         fprintf(stderr, "Expected evict to return ``%s'', but it returned ``%s''\n",
-                msg, last_body);
+                msg, last_body.c_str());
         abort();
     }
 }
@@ -537,6 +635,7 @@ bool get_meta(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1, const char* key,
     ENGINE_ERROR_CODE ret = h1->unknown_command(h, NULL, req,
                                                 add_response_get_meta);
     check(ret == ENGINE_SUCCESS, "Expected get_meta call to be successful");
+    free(req);
     if (last_status == PROTOCOL_BINARY_RESPONSE_SUCCESS) {
         return true;
     }
@@ -617,9 +716,11 @@ bool set_param(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1, protocol_binary_engine_pa
                        strlen(param), val, strlen(val));
 
     if (h1->unknown_command(h, NULL, pkt, add_response) != ENGINE_SUCCESS) {
+        free(pkt);
         return false;
     }
 
+    free(pkt);
     return last_status == PROTOCOL_BINARY_RESPONSE_SUCCESS;
 }
 
@@ -637,6 +738,55 @@ bool set_vbucket_state(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1,
 
     free(pkt);
     return last_status == PROTOCOL_BINARY_RESPONSE_SUCCESS;
+}
+
+bool get_all_vb_seqnos(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1,
+                       vbucket_state_t state, const void *cookie) {
+    protocol_binary_request_header *pkt;
+    if (state) {
+        char ext[sizeof(vbucket_state_t)];
+        encodeExt(ext, static_cast<uint32_t>(state));
+        pkt = createPacket(PROTOCOL_BINARY_CMD_GET_ALL_VB_SEQNOS, 0, 0, ext,
+                           sizeof(vbucket_state_t));
+    } else {
+        pkt = createPacket(PROTOCOL_BINARY_CMD_GET_ALL_VB_SEQNOS);
+    }
+
+    check(h1->unknown_command(h, cookie, pkt, add_response) ==
+          ENGINE_SUCCESS, "Error in getting all vb info");
+
+    free(pkt);
+    return last_status == PROTOCOL_BINARY_RESPONSE_SUCCESS;
+}
+
+void verify_all_vb_seqnos(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1,
+                          int vb_start, int vb_end) {
+    const int per_vb_resp_size = sizeof(uint16_t) + sizeof(uint64_t);
+    const int high_seqno_offset = sizeof(uint16_t);
+
+    /* Check if the total response length is as expected. We expect 10 bytes
+     (2 for vb_id + 8 for seqno) */
+    checkeq((vb_end - vb_start + 1) * per_vb_resp_size,
+            static_cast<int>(last_body.size()),
+            "Failed to get all vb info.");
+    /* Check if the contents are correct */
+    for (int i = 0; i < (vb_end - vb_start + 1); i++) {
+        /* Check for correct vb_id */
+        checkeq(static_cast<const uint16_t>(vb_start + i),
+                ntohs(*(reinterpret_cast<const uint16_t*>(last_body.data() +
+                                                          per_vb_resp_size*i))),
+              "vb_id mismatch");
+        /* Check for correct high_seqno */
+        std::string vb_stat_seqno("vb_" + std::to_string(vb_start + i) +
+                                  ":high_seqno");
+        uint64_t high_seqno_vb =
+        get_ull_stat(h, h1, vb_stat_seqno.c_str(), "vbucket-seqno");
+        checkeq(high_seqno_vb,
+                ntohll(*(reinterpret_cast<const uint64_t*>(last_body.data() +
+                                                           per_vb_resp_size*i +
+                                                           high_seqno_offset))),
+                "high_seqno mismatch");
+    }
 }
 
 void set_with_meta(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1, const char *key,
@@ -683,13 +833,15 @@ void set_with_meta(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1, const char *key,
 
     check(h1->unknown_command(h, cookie, pkt, add_response_set_del_meta) == ENGINE_SUCCESS,
           "Expected to be able to store with meta");
+    free(pkt);
     delete[] ext;
 }
 
 void return_meta(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1, const char *key,
                  const size_t keylen, const char *val, const size_t vallen,
                  const uint32_t vb, const uint64_t cas, const uint32_t flags,
-                 const uint32_t exp, const uint32_t type, uint8_t datatype) {
+                 const uint32_t exp, const uint32_t type, uint8_t datatype,
+                 const void *cookie) {
     char ext[12];
     encodeExt(ext, type);
     encodeExt(ext + 4, flags);
@@ -697,7 +849,7 @@ void return_meta(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1, const char *key,
     protocol_binary_request_header *pkt;
     pkt = createPacket(PROTOCOL_BINARY_CMD_RETURN_META, vb, cas, ext, 12, key, keylen, val,
                        vallen, datatype);
-    check(h1->unknown_command(h, NULL, pkt, add_response_ret_meta)
+    check(h1->unknown_command(h, cookie, pkt, add_response_ret_meta)
               == ENGINE_SUCCESS, "Expected to be able to store ret meta");
     free(pkt);
 }
@@ -705,23 +857,24 @@ void return_meta(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1, const char *key,
 void set_ret_meta(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1, const char *key,
                   const size_t keylen, const char *val, const size_t vallen,
                   const uint32_t vb, const uint64_t cas, const uint32_t flags,
-                  const uint32_t exp, uint8_t datatype) {
+                  const uint32_t exp, uint8_t datatype, const void *cookie) {
     return_meta(h, h1, key, keylen, val, vallen, vb, cas, flags, exp,
-                SET_RET_META, datatype);
+                SET_RET_META, datatype, cookie);
 }
 
 void add_ret_meta(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1, const char *key,
                   const size_t keylen, const char *val, const size_t vallen,
                   const uint32_t vb, const uint64_t cas, const uint32_t flags,
-                  const uint32_t exp, uint8_t datatype) {
+                  const uint32_t exp, uint8_t datatype, const void *cookie) {
     return_meta(h, h1, key, keylen, val, vallen, vb, cas, flags, exp,
-                ADD_RET_META, datatype);
+                ADD_RET_META, datatype, cookie);
 }
 
 void del_ret_meta(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1, const char *key,
-                  const size_t keylen, const uint32_t vb, const uint64_t cas) {
+                  const size_t keylen, const uint32_t vb, const uint64_t cas,
+                  const void *cookie) {
     return_meta(h, h1, key, keylen, NULL, 0, vb, cas, 0, 0,
-                DEL_RET_META);
+                DEL_RET_META, 0x00, cookie);
 }
 
 void disable_traffic(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1) {
@@ -775,6 +928,25 @@ ENGINE_ERROR_CODE store(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1,
                         uint8_t datatype) {
     return storeCasVb11(h, h1, cookie, op, key, value, strlen(value),
                         9258, outitem, casIn, vb, exp, datatype);
+}
+
+ENGINE_ERROR_CODE storeCasOut(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1,
+                              const void *cookie, const uint16_t vb,
+                              const std::string& key, const std::string& value,
+                              const protocol_binary_datatypes datatype,
+                              item*& out_item, uint64_t& out_cas) {
+    item *it = NULL;
+    check(h1->allocate(h, NULL, &it, key.c_str(), key.size(), value.size(), 0,
+                       0, datatype) == ENGINE_SUCCESS,
+          "Allocation failed.");
+    item_info info;
+    info.nvalue = 1;
+    check(h1->get_item_info(h, h1, it, &info), "Unable to get item_info");
+    check(info.nvalue == 1, "iovectors not supported");
+    memcpy(info.value[0].iov_base, value.data(), value.size());
+    ENGINE_ERROR_CODE res = h1->store(h, NULL, it, &out_cas, OPERATION_SET, vb);
+    h1->release(h, NULL, it);
+    return res;
 }
 
 ENGINE_ERROR_CODE storeCasVb11(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1,
@@ -840,6 +1012,7 @@ void unl(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1, const char* key,
 
 void compact_db(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1,
                      const uint16_t vbucket_id,
+                     const uint16_t db_file_id,
                      const uint64_t purge_before_ts,
                      const uint64_t purge_before_seq,
                      const uint8_t  drop_deletes) {
@@ -849,14 +1022,25 @@ void compact_db(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1,
     req.message.body.purge_before_seq = htonll(purge_before_seq);
     req.message.body.drop_deletes     = drop_deletes;
 
+    std::string backend = get_str_stat(h, h1, "ep_backend");
+    uint16_t vbid;
+
+    if (backend == "forestdb") {
+        req.message.body.db_file_id = db_file_id;
+        vbid = 0xFFFF;
+    } else {
+        vbid = vbucket_id;
+    }
+
     const char *args = (const char *)&(req.message.body);
     uint32_t argslen = 24;
 
     protocol_binary_request_header *pkt =
-        createPacket(PROTOCOL_BINARY_CMD_COMPACT_DB, vbucket_id, 0, args, argslen,  NULL, 0,
+        createPacket(PROTOCOL_BINARY_CMD_COMPACT_DB, vbid, 0, args, argslen,  NULL, 0,
                      NULL, 0);
     check(h1->unknown_command(h, NULL, pkt, add_response) == ENGINE_SUCCESS,
           "Failed to request compact vbucket");
+    free(pkt);
 }
 
 void vbucketDelete(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1, uint16_t vb,
@@ -867,6 +1051,7 @@ void vbucketDelete(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1, uint16_t vb,
                      args, argslen);
     check(h1->unknown_command(h, NULL, pkt, add_response) == ENGINE_SUCCESS,
           "Failed to request delete bucket");
+    free(pkt);
 }
 
 ENGINE_ERROR_CODE verify_key(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1,
@@ -887,6 +1072,7 @@ bool verify_vbucket_missing(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1,
 
     // Try up to three times to verify the bucket is missing.  Bucket
     // state changes are async.
+    std::lock_guard<std::mutex> lh(vals_mutex);
     vals.clear();
     check(h1->get_stats(h, NULL, NULL, 0, add_stats) == ENGINE_SUCCESS,
           "Failed to get stats.");
@@ -906,6 +1092,7 @@ bool verify_vbucket_state(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1, uint16_t vb,
     pkt = createPacket(PROTOCOL_BINARY_CMD_GET_VBUCKET, vb, 0);
 
     ENGINE_ERROR_CODE errcode = h1->unknown_command(h, NULL, pkt, add_response);
+    free(pkt);
     if (errcode != ENGINE_SUCCESS) {
         if (!mute) {
             fprintf(stderr, "Error code when getting vbucket %d\n", errcode);
@@ -916,13 +1103,14 @@ bool verify_vbucket_state(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1, uint16_t vb,
     if (last_status != PROTOCOL_BINARY_RESPONSE_SUCCESS) {
         if (!mute) {
             fprintf(stderr, "Last protocol status was %d (%s)\n",
-                    last_status, last_body ? last_body : "unknown");
+                    last_status.load(),
+                    last_body.size() > 0 ? last_body.c_str() : "unknown");
         }
         return false;
     }
 
     vbucket_state_t state;
-    memcpy(&state, last_body, sizeof(state));
+    memcpy(&state, last_body.data(), sizeof(state));
     state = static_cast<vbucket_state_t>(ntohl(state));
     return state == expected;
 }
@@ -940,40 +1128,155 @@ void sendDcpAck(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1,
           "Expected success");
 }
 
+class engine_error : public std::exception {
+public:
+    engine_error(ENGINE_ERROR_CODE code_)
+        : code(code_) {}
+
+    virtual const char* what() const NOEXCEPT {
+        return "engine_error";
+    }
+
+    ENGINE_ERROR_CODE code;
+};
+
+/* The following set of functions get a given stat as the specified type
+ * (int, float, unsigned long, string, bool, etc).
+ * If the engine->get_stats() call fails, throws a engine_error exception.
+ * If the given statname doesn't exist under the given statname, throws a
+ * std::out_of_range exception.
+ */
 int get_int_stat(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1, const char *statname,
                  const char *statkey) {
-    vals.clear();
-    check(h1->get_stats(h, NULL, statkey, statkey == NULL ? 0 : strlen(statkey),
-                        add_stats) == ENGINE_SUCCESS, "Failed to get stats.");
-    std::string s = vals[statname];
-    return atoi(s.c_str());
+    return std::stoi(get_str_stat(h, h1, statname, statkey));
 }
 
 float get_float_stat(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1, const char *statname,
                      const char *statkey) {
-    vals.clear();
-    check(h1->get_stats(h, NULL, statkey, statkey == NULL ? 0 : strlen(statkey),
-                        add_stats) == ENGINE_SUCCESS, "Failed to get stats.");
-    std::string s = vals[statname];
-    return atof(s.c_str());
+    return std::stof(get_str_stat(h, h1, statname, statkey));
+}
+
+uint32_t get_ul_stat(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1, const char *statname,
+                      const char *statkey) {
+    return std::stoul(get_str_stat(h, h1, statname, statkey));
 }
 
 uint64_t get_ull_stat(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1, const char *statname,
                       const char *statkey) {
-    vals.clear();
-    check(h1->get_stats(h, NULL, statkey, statkey == NULL ? 0 : strlen(statkey),
-                        add_stats) == ENGINE_SUCCESS, "Failed to get stats.");
-    std::string s = vals[statname];
-    return strtoull(s.c_str(), NULL, 10);
+    return std::stoull(get_str_stat(h, h1, statname, statkey));
 }
 
 std::string get_str_stat(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1,
                          const char *statname, const char *statkey) {
+    std::lock_guard<std::mutex> lh(vals_mutex);
+
+    requested_stat_name = statname;
+    actual_stat_value.clear();
+
+    ENGINE_ERROR_CODE err = h1->get_stats(h, NULL, statkey,
+                                          statkey == NULL ? 0 : strlen(statkey),
+                                          add_individual_stat);
+
+    if (err != ENGINE_SUCCESS) {
+        throw engine_error(err);
+    }
+
+    if (actual_stat_value.empty()) {
+        throw std::out_of_range(std::string("Failed to find requested statname '") +
+                                statname + "'");
+    }
+
+    // Here we are explictly forcing a copy of the object to work
+    // around std::string copy-on-write data-race issues seen on some
+    // versions of libstdc++ - see MB-18510 / MB-19688.
+    return std::string(actual_stat_value.begin(), actual_stat_value.end());
+}
+
+bool get_bool_stat(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1, const char *statname,
+                   const char *statkey) {
+    const auto s = get_str_stat(h, h1, statname, statkey);
+
+    if (s == "true") {
+        return true;
+    } else if (s == "false") {
+        return false;
+    } else {
+        throw std::invalid_argument("Unable to convert string '" + s + "' to type bool");
+    }
+}
+
+/* Fetches the value for a given statname in the given statkey set.
+ * @return te value of statname, or default_value if that statname was not
+ * found.
+ */
+int get_int_stat_or_default(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1,
+                            int default_value, const char *statname,
+                            const char *statkey) {
+    try {
+        return get_int_stat(h, h1, statname, statkey);
+    } catch (std::out_of_range&) {
+        return default_value;
+    }
+}
+
+uint64_t get_histo_stat(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1,
+                        const char *statname, const char *statkey,
+                        const Histo_stat_info histo_info)
+{
+    std::lock_guard<std::mutex> lh(vals_mutex);
+
+    histogram_stat_int_value = new HistogramStats<int>();
+    get_histo_stat(h, h1, statname, statkey);
+
+    /* Get the necessary info from the histogram */
+    uint64_t ret_val = 0;
+    switch (histo_info) {
+        case Histo_stat_info::TOTAL_COUNT:
+            ret_val = histogram_stat_int_value->total();
+            break;
+        case Histo_stat_info::NUM_BINS:
+            ret_val =
+                    static_cast<uint64_t>(histogram_stat_int_value->num_bins());
+            break;
+    }
+
+    delete histogram_stat_int_value;
+    return ret_val;
+}
+
+static void get_histo_stat(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1,
+                                  const char *statname, const char *statkey)
+{
+    requested_stat_name = statname;
+    /* Histo stats for tasks are append as task_name_START,END.
+       Hence append _ */
+    requested_stat_name.append("_");
+
+    ENGINE_ERROR_CODE err = h1->get_stats(h, NULL, statkey,
+                                          statkey == NULL ? 0 : strlen(statkey),
+                                          add_individual_histo_stat);
+
+    if (err != ENGINE_SUCCESS) {
+        throw engine_error(err);
+    }
+
+    return;
+}
+
+statistic_map get_all_stats(ENGINE_HANDLE *h,ENGINE_HANDLE_V1 *h1,
+                            const char *statset) {
+    std::lock_guard<std::mutex> lh(vals_mutex);
+
     vals.clear();
-    check(h1->get_stats(h, NULL, statkey, statkey == NULL ? 0 : strlen(statkey),
-                        add_stats) == ENGINE_SUCCESS, "Failed to get stats.");
-    std::string s = vals[statname];
-    return s;
+    ENGINE_ERROR_CODE err = h1->get_stats(h, NULL, statset,
+                                          statset == NULL ? 0 : strlen(statset),
+                                          add_stats);
+
+    if (err != ENGINE_SUCCESS) {
+        throw engine_error(err);
+    }
+
+    return vals;
 }
 
 void verify_curr_items(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1, int exp,
@@ -986,7 +1289,7 @@ void verify_curr_items(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1, int exp,
     }
 }
 
-/** Helper class used when waiting on statistics to each a certain value -
+/** Helper class used when waiting on statistics to reach a certain value -
  * aggregates how long we have been waiting and aborts if the maximum wait time
  * is exceeded.
  */
@@ -996,20 +1299,20 @@ class WaitTimeAccumulator
 public:
     WaitTimeAccumulator(const char* compare_name,
                         const char* stat_, const char* stat_key,
-                        const T final_, const time_t wait_time)
+                        const T final_, const time_t wait_time_in_secs)
     : compareName(compare_name),
       stat(stat_),
       statKey(stat_key),
       final(final_),
-      waitTime(wait_time),
+      maxWaitTime(wait_time_in_secs * 1000 * 1000),
       totalSleepTime(0) {}
 
     void incrementAndAbortIfLimitReached(const useconds_t sleep_time)
     {
         totalSleepTime += sleep_time;
-        if (totalSleepTime >= waitTime * 1000 * 1000 ) {
-            std::cerr << "Exceeded maximum wait time of " << waitTime
-                      << "s waiting for stat '" << stat;
+        if (totalSleepTime >= maxWaitTime) {
+            std::cerr << "Exceeded maximum wait time of " << maxWaitTime
+                      << "us waiting for stat '" << stat;
             if (statKey != NULL) {
                 std::cerr << "(" << statKey << ")";
             }
@@ -1024,17 +1327,18 @@ private:
     const char* stat;
     const char* statKey;
     const T final;
-    const time_t waitTime;
+    const useconds_t maxWaitTime;
     useconds_t totalSleepTime;
 };
 
 
 void wait_for_stat_change(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1,
                           const char *stat, int initial,
-                          const char *statkey, const time_t wait_time) {
+                          const char *statkey,
+                          const time_t max_wait_time_in_secs) {
     useconds_t sleepTime = 128;
     WaitTimeAccumulator<int> accumulator("to change from", stat, statkey,
-                                         initial, wait_time);
+                                         initial, max_wait_time_in_secs);
     while (get_int_stat(h, h1, stat, statkey) == initial) {
         accumulator.incrementAndAbortIfLimitReached(sleepTime);
         decayingSleep(&sleepTime);
@@ -1043,10 +1347,10 @@ void wait_for_stat_change(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1,
 
 void wait_for_stat_to_be(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1,
                          const char *stat, int final, const char* stat_key,
-                         const time_t wait_time) {
+                         const time_t max_wait_time_in_secs) {
     useconds_t sleepTime = 128;
     WaitTimeAccumulator<int> accumulator("to be", stat, stat_key, final,
-                                         wait_time);
+                                         max_wait_time_in_secs);
     while (get_int_stat(h, h1, stat, stat_key) != final) {
         accumulator.incrementAndAbortIfLimitReached(sleepTime);
         decayingSleep(&sleepTime);
@@ -1055,11 +1359,42 @@ void wait_for_stat_to_be(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1,
 
 void wait_for_stat_to_be_gte(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1,
                              const char *stat, int final,
-                             const char* stat_key, const time_t wait_time) {
+                             const char* stat_key,
+                             const time_t max_wait_time_in_secs) {
     useconds_t sleepTime = 128;
     WaitTimeAccumulator<int> accumulator("to be greater or equal than", stat,
-                                         stat_key, final, wait_time);
+                                         stat_key, final,
+                                         max_wait_time_in_secs);
     while (get_int_stat(h, h1, stat, stat_key) < final) {
+        accumulator.incrementAndAbortIfLimitReached(sleepTime);
+        decayingSleep(&sleepTime);
+    }
+}
+
+void wait_for_stat_to_be_lte(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1,
+                             const char *stat, int final,
+                             const char* stat_key,
+                             const time_t max_wait_time_in_secs) {
+    useconds_t sleepTime = 128;
+    WaitTimeAccumulator<int> accumulator("to be less than or equal to", stat,
+                                         stat_key, final,
+                                         max_wait_time_in_secs);
+    while (get_int_stat(h, h1, stat, stat_key) > final) {
+        accumulator.incrementAndAbortIfLimitReached(sleepTime);
+        decayingSleep(&sleepTime);
+    }
+}
+
+void wait_for_expired_items_to_be(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1,
+                                  int final,
+                                  const time_t max_wait_time_in_secs) {
+    useconds_t sleepTime = 128;
+    WaitTimeAccumulator<int> accumulator("to be", "expired items",
+                                         NULL, final,
+                                         max_wait_time_in_secs);
+    while(get_int_stat(h, h1, "ep_expired_access") +
+          get_int_stat(h, h1, "ep_expired_compactor") +
+          get_int_stat(h, h1, "ep_expired_pager") != final) {
         accumulator.incrementAndAbortIfLimitReached(sleepTime);
         decayingSleep(&sleepTime);
     }
@@ -1067,10 +1402,12 @@ void wait_for_stat_to_be_gte(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1,
 
 void wait_for_str_stat_to_be(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1,
                              const char *stat, const char* final,
-                             const char* stat_key, const time_t wait_time) {
+                             const char* stat_key,
+                             const time_t max_wait_time_in_secs) {
     useconds_t sleepTime = 128;
     WaitTimeAccumulator<const char*> accumulator("to be", stat, stat_key,
-                                                 final, wait_time);
+                                                 final,
+                                                 max_wait_time_in_secs);
     while (get_str_stat(h, h1, stat, stat_key).compare(final) != 0) {
         accumulator.incrementAndAbortIfLimitReached(sleepTime);
         decayingSleep(&sleepTime);
@@ -1078,10 +1415,12 @@ void wait_for_str_stat_to_be(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1,
 }
 
 void wait_for_memory_usage_below(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1,
-                                 int mem_threshold, const time_t wait_time) {
+                                 int mem_threshold,
+                                 const time_t max_wait_time_in_secs) {
     useconds_t sleepTime = 128;
     WaitTimeAccumulator<int> accumulator("to be below", "mem_used", NULL,
-                                         mem_threshold, wait_time);
+                                         mem_threshold,
+                                         max_wait_time_in_secs);
     while (get_int_stat(h, h1, "mem_used") > mem_threshold) {
         accumulator.incrementAndAbortIfLimitReached(sleepTime);
         decayingSleep(&sleepTime);
@@ -1090,20 +1429,41 @@ void wait_for_memory_usage_below(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1,
 
 bool wait_for_warmup_complete(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1) {
     useconds_t sleepTime = 128;
-    while (h1->get_stats(h, NULL, "warmup", 6, add_stats) == ENGINE_SUCCESS) {
-        std::string s = vals["ep_warmup_thread"];
-        if (strcmp(s.c_str(), "complete") == 0) {
-            break;
+    do {
+        try {
+            if (get_str_stat(h, h1, "ep_warmup_thread", "warmup") == "complete") {
+                return true;
+            }
+        } catch (engine_error&) {
+            // If the stat call failed then the warmup stats group no longer
+            // exists and hence warmup is complete.
+            return true;
         }
         decayingSleep(&sleepTime);
-        vals.clear();
-    }
-    return true;
+    } while(true);
 }
 
 void wait_for_flusher_to_settle(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1) {
-    useconds_t sleepTime = 128;
+    const useconds_t initial_sleepTime = 128;
+    useconds_t sleepTime = initial_sleepTime;
     while (get_int_stat(h, h1, "ep_queue_size") > 0) {
+        decayingSleep(&sleepTime);
+    }
+
+    // We also need to to wait for any outstanding flushes to disk to
+    // complete - specifically so when in full eviction mode we have
+    // waited for the item counts in each vBucket to be synced with
+    // the number of items on disk. See
+    // EventuallyPersistentStore::commit().
+    sleepTime = initial_sleepTime;
+    while (get_int_stat(h, h1, "ep_flusher_todo") > 0) {
+        decayingSleep(&sleepTime);
+    }
+}
+
+void wait_for_rollback_to_finish(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1) {
+    useconds_t sleepTime = 128;
+    while (get_int_stat(h, h1, "ep_rollback_count") == 0) {
         decayingSleep(&sleepTime);
     }
 }
@@ -1124,17 +1484,6 @@ void wait_for_persisted_value(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1,
     h1->release(h, NULL, i);
 }
 
-void dcp_step(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1, const void* cookie) {
-    struct dcp_message_producers* producers = get_dcp_producers();
-    ENGINE_ERROR_CODE err = h1->dcp.step(h, cookie, producers);
-    check(err == ENGINE_SUCCESS || err == ENGINE_WANT_MORE,
-            "Expected success or engine_want_more");
-    if (err == ENGINE_SUCCESS) {
-        clear_dcp_data();
-    }
-    free(producers);
-}
-
 void set_degraded_mode(ENGINE_HANDLE *h,
                        ENGINE_HANDLE_V1 *h1,
                        const void* cookie,
@@ -1148,6 +1497,7 @@ void set_degraded_mode(ENGINE_HANDLE *h,
     }
 
     ENGINE_ERROR_CODE errcode = h1->unknown_command(h, NULL, pkt, add_response);
+    free(pkt);
     if (errcode != ENGINE_SUCCESS) {
         std::cerr << "Failed to set degraded mode to " << enable
                   << ". api call return engine code: " << errcode << std::endl;
@@ -1157,10 +1507,84 @@ void set_degraded_mode(ENGINE_HANDLE *h,
     if (last_status != PROTOCOL_BINARY_RESPONSE_SUCCESS) {
         std::cerr << "Failed to set degraded mode to " << enable
                   << ". protocol code: " << last_status << std::endl;
-        if (last_body) {
+        if (last_body.size() > 0) {
             std::cerr << "\tBody: [" << last_body << "]" << std::endl;
         }
 
         cb_assert(false);
     }
+}
+
+bool abort_msg(const char *expr, const char *msg, const char *file, int line) {
+    fprintf(stderr, "%s:%d Test failed: `%s' (%s)\n",
+            file, line, msg, expr);
+    abort();
+}
+
+/* Helper function to validate the return from store() */
+void validate_store_resp(ENGINE_ERROR_CODE ret, int& num_items)
+{
+    switch (ret) {
+        case ENGINE_SUCCESS:
+            num_items++;
+            break;
+        case ENGINE_TMPFAIL:
+            /* TMPFAIL means we are hitting high memory usage; retry */
+            break;
+        default:
+            check(false,
+                  ("write_items_upto_mem_perc: Unexpected response from "
+                   "store(): " + std::to_string(ret)).c_str());
+            break;
+    }
+}
+
+/* Helper function to write unique "num_items" starting from keyXX
+   (XX is start_seqno) */
+void write_items(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1, int num_items,
+                 int start_seqno, const char *key_prefix, const char *value)
+{
+    int j = 0;
+    while (1) {
+        if (j == num_items) {
+            break;
+        }
+        item *i = nullptr;
+        std::string key(key_prefix + std::to_string(j + start_seqno));
+        ENGINE_ERROR_CODE ret = store(h, h1, nullptr, OPERATION_SET,
+                                      key.c_str(), value, &i);
+        h1->release(h, nullptr, i);
+        validate_store_resp(ret, j);
+    }
+}
+
+/* Helper function to write unique items starting from keyXX until memory usage
+   hits "mem_thresh_perc" (XX is start_seqno) */
+int write_items_upto_mem_perc(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1,
+                              int mem_thresh_perc, int start_seqno,
+                              const char *key_prefix, const char *value)
+{
+    float maxSize = static_cast<float>(get_int_stat(h, h1, "ep_max_size",
+                                                    "memory"));
+    float mem_thresh = static_cast<float>(mem_thresh_perc) / (100.0);
+    int num_items = 0;
+    while (1) {
+        /* Load items into server until mem_thresh_perc of the mem quota
+         is used. Getting stats is expensive, only check every 100
+         iterations. */
+        if ((num_items % 100) == 0) {
+            float memUsed = float(get_int_stat(h, h1, "mem_used", "memory"));
+            if (memUsed > (maxSize * mem_thresh)) {
+                /* Persist all items written so far. */
+                break;
+            }
+        }
+        item *itm = nullptr;
+        std::string key("key" + std::to_string(num_items + start_seqno));
+        ENGINE_ERROR_CODE ret = store(h, h1, nullptr, OPERATION_SET,
+                                      key.c_str(), "somevalue", &itm);
+        h1->release(h, nullptr, itm);
+        validate_store_resp(ret, num_items);
+    }
+    return num_items;
 }
