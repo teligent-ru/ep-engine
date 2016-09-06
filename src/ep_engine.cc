@@ -537,6 +537,13 @@ extern "C" {
                 } else {
                     throw std::runtime_error("Value out of range [0.0-1.0].");
                 }
+            } else if (strcmp(keyz, "flusher_min_sleep_time") == 0) {
+                float val = atof(valz);
+                if (val >= 0.0 && val <= 10.0) {
+                    e->getConfiguration().setFlusherMinSleepTime(val);
+                } else {
+                    throw std::runtime_error("Value out of range [0.0-10.0].");
+                }
             } else if (strcmp(keyz, "defragmenter_enabled") == 0) {
                 if (strcmp(valz, "true") == 0) {
                     e->getConfiguration().setDefragmenterEnabled(true);
