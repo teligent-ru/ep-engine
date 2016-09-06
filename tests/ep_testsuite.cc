@@ -485,24 +485,44 @@ static enum test_result test_get_miss(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1) {
 static enum test_result test_set(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1) {
     item *i = NULL;
     item_info info;
-    uint64_t vb_uuid = 0;
-    uint32_t high_seqno = 0;
+    uint64_t vb_uuid = 0, high_seqno = 0;
+    const int num_sets = 5, num_keys = 4;
 
-    memset(&info, 0, sizeof(info));
+    std::string key_arr[num_keys] = { "dummy_key",
+                                      "checkpoint_start",
+                                      "checkpoint_end",
+                                      "key" };
 
-    vb_uuid = get_ull_stat(h, h1, "vb_0:0:id", "failovers");
-    high_seqno = get_ull_stat(h, h1, "vb_0:high_seqno", "vbucket-seqno");
 
-    check(ENGINE_SUCCESS ==
-          store(h, h1, NULL, OPERATION_SET, "key", "somevalue", &i),
-          "Error setting.");
+    for (int k = 0; k < num_keys; k++) {
+        for (int j = 0; j < num_sets; j++) {
+            memset(&info, 0, sizeof(info));
+            vb_uuid = get_ull_stat(h, h1, "vb_0:0:id", "failovers");
+            high_seqno = get_ull_stat(h, h1, "vb_0:high_seqno",
+                                      "vbucket-seqno");
 
-    h1->release(h, NULL, i);
+            std::string err_str_store("Error setting " + key_arr[k]);
+            checkeq(ENGINE_SUCCESS,
+                    store(h, h1, NULL, OPERATION_SET, key_arr[k].c_str(),
+                          "somevalue", &i),
+                    err_str_store.c_str());
+            h1->release(h, NULL, i);
 
-    check(get_item_info(h, h1, &info, "key"), "Error getting item info");
+            std::string err_str_get_item_info("Error getting " + key_arr[k]);
+            checkeq(true, get_item_info(h, h1, &info, key_arr[k].c_str()),
+                  err_str_get_item_info.c_str());
 
-    check(vb_uuid == info.vbucket_uuid, "Expected valid vbucket uuid");
-    check(high_seqno + 1 == info.seqno, "Expected valid sequence number");
+            std::string err_str_vb_uuid("Expected valid vbucket uuid for " +
+                                        key_arr[k]);
+            checkeq(vb_uuid, info.vbucket_uuid, err_str_vb_uuid.c_str());
+
+            std::string err_str_seqno("Expected valid sequence number for " +
+                                        key_arr[k]);
+            checkeq(high_seqno + 1, info.seqno, err_str_seqno.c_str());
+        }
+    }
+
+    wait_for_flusher_to_settle(h, h1);
 
     return SUCCESS;
 }
@@ -4188,6 +4208,7 @@ static enum test_result test_dcp_producer_stream_req_disk(ENGINE_HANDLE *h,
     for (int j = 0; j < num_items; ++j) {
         if (j == 200) {
             wait_for_flusher_to_settle(h, h1);
+            wait_for_stat_to_be(h, h1, "ep_items_rm_from_checkpoints", 200);
             stop_persistence(h, h1);
         }
         item *i = NULL;
@@ -4938,8 +4959,8 @@ static enum test_result test_consumer_backoff_stat(ENGINE_HANDLE *h,
 
     uint32_t stream_opaque =
         get_int_stat(h, h1, "eq_dcpq:unittest:stream_0_opaque", "dcp");
-    check(h1->dcp.snapshot_marker(h, cookie, stream_opaque, 0, 0, 20, 1)
-        == ENGINE_SUCCESS, "Failed to send snapshot marker");
+    checkeq(h1->dcp.snapshot_marker(h, cookie, stream_opaque, 0, 0, 20, 1),
+            ENGINE_SUCCESS, "Failed to send snapshot marker");
 
     for (int i = 1; i <= 20; i++) {
         std::stringstream ss;
@@ -5682,6 +5703,11 @@ static enum test_result test_dcp_consumer_mutate(ENGINE_HANDLE *h, ENGINE_HANDLE
                            bySeqno, revSeqno, exprtime,
                            lockTime, NULL, 0, 0) == ENGINE_KEY_ENOENT,
           "Failed to detect invalid DCP opaque value");
+
+    // Send snapshot marker
+    checkeq(h1->dcp.snapshot_marker(h, cookie, opaque, 0, 10, 15, 300),
+            ENGINE_SUCCESS,
+            "Failed to send marker!");
 
     // Consume an DCP mutation
     check(h1->dcp.mutation(h, cookie, opaque, "key", 3, data, dataLen, cas,
@@ -7170,13 +7196,26 @@ static enum test_result test_collapse_checkpoints(ENGINE_HANDLE *h, ENGINE_HANDL
     item *itm;
     stop_persistence(h, h1);
     for (size_t i = 0; i < 5; ++i) {
-        for (size_t j = 0; j < 500; ++j) {
+        for (size_t j = 0; j < 497; ++j) {
             char key[8];
             sprintf(key, "key%ld", j);
             check(store(h, h1, NULL, OPERATION_SET, key, "value", &itm, 0, 0)
                         == ENGINE_SUCCESS, "Failed to store an item.");
             h1->release(h, NULL, itm);
         }
+        /* Test with app keys with special strings */
+        checkeq(ENGINE_SUCCESS, store(h, h1, NULL, OPERATION_SET, "dummy_key",
+                                      "value", &itm, 0, 0),
+                "Failed to store an item.");
+        h1->release(h, NULL, itm);
+        checkeq(ENGINE_SUCCESS, store(h, h1, NULL, OPERATION_SET,
+                                      "checkpoint_start", "value", &itm, 0, 0),
+                "Failed to store an item.");
+        h1->release(h, NULL, itm);
+        checkeq(ENGINE_SUCCESS, store(h, h1, NULL, OPERATION_SET,
+                                      "checkpoint_end", "value", &itm, 0, 0),
+                "Failed to store an item.");
+        h1->release(h, NULL, itm);
     }
     check(set_vbucket_state(h, h1, 0, vbucket_state_replica), "Failed to set vbucket state.");
     wait_for_stat_to_be(h, h1, "vb_0:num_checkpoints", 2, "checkpoint");
@@ -7376,6 +7415,9 @@ static enum test_result test_bg_stats(ENGINE_HANDLE *h, ENGINE_HANDLE_V1 *h1) {
     check(get_int_stat(h, h1, "ep_bg_num_samples") == 2,
           "Expected one sample");
 
+    h1->reset_stats(h, NULL);
+    checkeq(0, get_int_stat(h, h1, "ep_bg_fetched"),
+            "ep_bg_fetched is not reset to 0");
     return SUCCESS;
 }
 
@@ -9283,6 +9325,251 @@ static enum test_result test_dcp_rollback_after_purge(ENGINE_HANDLE *h,
        (that is, start == snap_end_seqno)*/
     dcp_stream_req(h, h1, 1, 0, high_seqno, high_seqno + 10, vb_uuid,
                    0, high_seqno, 0, ENGINE_SUCCESS);
+
+    return SUCCESS;
+}
+
+static enum test_result test_dcp_erroneous_mutations(ENGINE_HANDLE *h,
+                                                     ENGINE_HANDLE_V1 *h1) {
+    check(set_vbucket_state(h, h1, 0, vbucket_state_replica),
+          "Failed to set vbucket state");
+    wait_for_flusher_to_settle(h, h1);
+
+    const void *cookie = testHarness.create_cookie();
+    uint32_t opaque = 0xFFFF0000;
+    uint32_t flags = 0;
+    std::string name("err_mutations");
+
+    checkeq(h1->dcp.open(h, cookie, opaque, 0, flags, (void*)(name.c_str()),
+                         name.size()),
+            ENGINE_SUCCESS,
+            "Failed to open DCP consumer connection!");
+    add_stream_for_consumer(h, h1, cookie, opaque++, 0, 0,
+                            PROTOCOL_BINARY_RESPONSE_SUCCESS);
+
+    std::string opaqueStr("eq_dcpq:" + name + ":stream_0_opaque");
+    uint32_t  stream_opaque = get_int_stat(h, h1, opaqueStr.c_str(), "dcp");
+
+    checkeq(h1->dcp.snapshot_marker(h, cookie, stream_opaque, 0, 5, 10, 300),
+            ENGINE_SUCCESS,
+            "Failed to send snapshot marker!");
+    for (int i = 5; i <= 10; i++) {
+        std::string key("key" + std::to_string(i));
+        checkeq(h1->dcp.mutation(h, cookie, stream_opaque, key.c_str(),
+                                 key.length(), "value", 5, i * 3, 0, 0, 0,
+                                 i, 0, 0, 0, "", 0, INITIAL_NRU_VALUE),
+                ENGINE_SUCCESS,
+                "Unexpected return code for mutation!");
+    }
+
+    // Send a mutation and a deletion both out-of-sequence
+    checkeq(h1->dcp.mutation(h, cookie, stream_opaque, "key", 3, "val", 3,
+                             35, 0, 0, 0, 2, 0, 0, 0, "", 0,
+                             INITIAL_NRU_VALUE),
+            ENGINE_ERANGE,
+            "Mutation should've returned ERANGE!");
+    checkeq(h1->dcp.deletion(h, cookie, stream_opaque, "key5", 4, 40,
+                             0, 3, 0, "", 0),
+            ENGINE_ERANGE,
+            "Deletion should've returned ERANGE!");
+
+    std::string bufferItemsStr("eq_dcpq:" + name + ":stream_0_buffer_items");
+    wait_for_stat_to_be(h, h1, bufferItemsStr.c_str(), 0, "dcp");
+
+    int curr_items = get_int_stat(h, h1, "vb_0:num_items", "vbucket-details 0");
+
+    // Send a mutation that would be accepted initially, but would be
+    // dropped while processing
+    checkeq(h1->dcp.mutation(h, cookie, stream_opaque, "key20", 5, "val", 3,
+                             45, 0, 0, 0, 20, 0, 0, 0, "", 0,
+                             INITIAL_NRU_VALUE),
+            ENGINE_SUCCESS,
+            "Unexpected return code for mutation!");
+
+    wait_for_stat_to_be(h, h1, bufferItemsStr.c_str(), 0, "dcp");
+
+    checkeq(get_int_stat(h, h1, "vb_0:num_items", "vbucket-details 0"),
+            curr_items,
+            "The last mutation should've been dropped!");
+
+    checkeq(h1->dcp.close_stream(h, cookie, stream_opaque, 0),
+            ENGINE_SUCCESS,
+            "Expected to close stream!");
+    testHarness.destroy_cookie(cookie);
+
+    return SUCCESS;
+}
+
+static enum test_result test_dcp_erroneous_marker(ENGINE_HANDLE *h,
+                                                  ENGINE_HANDLE_V1 *h1) {
+
+    check(set_vbucket_state(h, h1, 0, vbucket_state_replica),
+          "Failed to set vbucket state");
+    wait_for_flusher_to_settle(h, h1);
+
+    const void *cookie1 = testHarness.create_cookie();
+    uint32_t opaque = 0xFFFF0000;
+    uint32_t flags = 0;
+    std::string name("first_marker");
+
+    checkeq(h1->dcp.open(h, cookie1, opaque, 0, flags, (void*)(name.c_str()),
+                         name.size()),
+            ENGINE_SUCCESS,
+            "Failed to open DCP consumer connection!");
+    add_stream_for_consumer(h, h1, cookie1, opaque++, 0, 0,
+                            PROTOCOL_BINARY_RESPONSE_SUCCESS);
+
+    std::string opaqueStr("eq_dcpq:" + name + ":stream_0_opaque");
+    uint32_t stream_opaque = get_int_stat(h, h1, opaqueStr.c_str(), "dcp");
+
+    checkeq(h1->dcp.snapshot_marker(h, cookie1, stream_opaque, 0, 1, 10, 300),
+            ENGINE_SUCCESS,
+            "Failed to send snapshot marker!");
+    for (int i = 1; i <= 10; i++) {
+        std::string key("key" + std::to_string(i));
+        checkeq(h1->dcp.mutation(h, cookie1, stream_opaque, key.c_str(),
+                                 key.length(), "value", 5, i * 3, 0, 0, 0,
+                                 i, 0, 0, 0, "", 0, INITIAL_NRU_VALUE),
+                ENGINE_SUCCESS,
+                "Unexpected return code for mutation!");
+    }
+
+    std::string bufferItemsStr("eq_dcpq:" + name + ":stream_0_buffer_items");
+    wait_for_stat_to_be(h, h1, bufferItemsStr.c_str(), 0, "dcp");
+
+    checkeq(h1->dcp.close_stream(h, cookie1, stream_opaque, 0),
+            ENGINE_SUCCESS,
+            "Expected to close stream1!");
+    testHarness.destroy_cookie(cookie1);
+
+    const void *cookie2 = testHarness.create_cookie();
+    opaque = 0xFFFFF000;
+    name.assign("second_marker");
+
+    checkeq(h1->dcp.open(h, cookie2, opaque, 0 ,flags, (void*)(name.c_str()),
+                         name.size()),
+            ENGINE_SUCCESS,
+            "Failed to open DCP consumer connection!");
+    add_stream_for_consumer(h, h1, cookie2, opaque++, 0, 0,
+                            PROTOCOL_BINARY_RESPONSE_SUCCESS);
+
+    opaqueStr.assign("eq_dcpq:" + name + ":stream_0_opaque");
+    stream_opaque = get_int_stat(h , h1, opaqueStr.c_str(), "dcp");
+
+    // Send a snapshot marker that would be rejected
+    checkeq(h1->dcp.snapshot_marker(h, cookie2, stream_opaque, 0, 5, 10, 1),
+            ENGINE_ERANGE,
+            "Snapshot marker should have been dropped!");
+
+    // Send a snapshot marker that would be accepted, but a few of
+    // the mutations that are part of this snapshot will be dropped
+    checkeq(h1->dcp.snapshot_marker(h, cookie2, stream_opaque, 0, 5, 15, 1),
+            ENGINE_SUCCESS,
+            "Failed to send snapshot marker!");
+    for (int i = 5; i <= 15; i++) {
+        std::string key("key_" + std::to_string(i));
+        ENGINE_ERROR_CODE err = h1->dcp.mutation(h, cookie2, stream_opaque,
+                                                 key.c_str(), key.length(),
+                                                 "val", 3, i * 3, 0, 0, 0, i,
+                                                 0, 0, 0, "", 0, INITIAL_NRU_VALUE);
+        if (i <= 10) {
+            checkeq(err, ENGINE_ERANGE, "Mutation should have been dropped!");
+        } else {
+            checkeq(err, ENGINE_SUCCESS, "Failed to send mutation!");
+        }
+    }
+
+    checkeq(h1->dcp.close_stream(h, cookie2, stream_opaque, 0),
+            ENGINE_SUCCESS,
+            "Expected to close stream2!");
+    testHarness.destroy_cookie(cookie2);
+
+    return SUCCESS;
+}
+
+static enum test_result test_dcp_invalid_mutation_deletion(ENGINE_HANDLE* h,
+                                                              ENGINE_HANDLE_V1* h1) {
+
+    check(set_vbucket_state(h, h1, 0, vbucket_state_replica),
+          "Failed to set vbucket state");
+    wait_for_flusher_to_settle(h, h1);
+
+    const void *cookie = testHarness.create_cookie();
+    uint32_t opaque = 0xFFFF0000;
+    uint32_t flags = 0;
+    std::string name("err_mutations");
+
+    checkeq(h1->dcp.open(h, cookie, opaque, 0, flags, (void*)(name.c_str()),
+                         name.size()),
+            ENGINE_SUCCESS,
+            "Failed to open DCP consumer connection!");
+    add_stream_for_consumer(h, h1, cookie, opaque++, 0, 0,
+                            PROTOCOL_BINARY_RESPONSE_SUCCESS);
+
+    std::string opaqueStr("eq_dcpq:" + name + ":stream_0_opaque");
+    uint32_t  stream_opaque = get_int_stat(h, h1, opaqueStr.c_str(), "dcp");
+
+    // Mutation(s) or deletion(s) with seqno 0 are invalid!
+    std::string key("key");
+    std::string val("value");
+    checkeq(h1->dcp.mutation(h, cookie, stream_opaque, key.c_str(),
+                             key.length(), val.c_str(), val.length(), 10, 0, 0,
+                             0, /*seqno*/ 0, 0, 0, 0, "", 0, INITIAL_NRU_VALUE),
+            ENGINE_EINVAL,
+            "Mutation should have returned EINVAL!");
+
+    checkeq(h1->dcp.deletion(h, cookie, stream_opaque, key.c_str(),
+                             key.length(), 10, 0, /*seqno*/ 0, 0, "", 0),
+            ENGINE_EINVAL,
+            "Deletion should have returned EINVAL!");
+
+    testHarness.destroy_cookie(cookie);
+
+    return SUCCESS;
+}
+
+static enum test_result test_dcp_invalid_snapshot_marker(ENGINE_HANDLE* h,
+                                                         ENGINE_HANDLE_V1* h1) {
+    check(set_vbucket_state(h, h1, 0, vbucket_state_replica),
+          "Failed to set vbucket state");
+    wait_for_flusher_to_settle(h, h1);
+
+    const void *cookie = testHarness.create_cookie();
+    uint32_t opaque = 0xFFFF0000;
+    uint32_t flags = 0;
+    std::string name("unittest");
+
+    checkeq(h1->dcp.open(h, cookie, opaque, 0, flags, (void*)(name.c_str()),
+                         name.size()),
+            ENGINE_SUCCESS,
+            "Failed to open DCP consumer connection!");
+    add_stream_for_consumer(h, h1, cookie, opaque++, 0, 0,
+                            PROTOCOL_BINARY_RESPONSE_SUCCESS);
+
+    std::string opaqueStr("eq_dcpq:" + name + ":stream_0_opaque");
+    uint32_t stream_opaque = get_int_stat(h, h1, opaqueStr.c_str(), "dcp");
+
+    checkeq(h1->dcp.snapshot_marker(h, cookie, stream_opaque, 0, 1, 10, 300),
+            ENGINE_SUCCESS,
+            "Failed to send snapshot marker!");
+    for (int i = 1; i <= 10; i++) {
+        std::string key("key" + std::to_string(i));
+        checkeq(h1->dcp.mutation(h, cookie, stream_opaque, key.c_str(),
+                                 key.length(), "value", 5, i * 3, 0, 0, 0,
+                                 i, 0, 0, 0, "", 0, INITIAL_NRU_VALUE),
+                ENGINE_SUCCESS,
+                "Unexpected return code for mutation!");
+    }
+
+    std::string bufferItemsStr("eq_dcpq:" + name + ":stream_0_buffer_items");
+    wait_for_stat_to_be(h, h1, bufferItemsStr.c_str(), 0, "dcp");
+
+    // Invalid snapshot marker with end <= start
+    checkeq(h1->dcp.snapshot_marker(h, cookie, stream_opaque, 0, 11, 8, 300),
+            ENGINE_EINVAL,
+            "Failed to send snapshot marker!");
+
+    testHarness.destroy_cookie(cookie);
 
     return SUCCESS;
 }
@@ -12682,6 +12969,28 @@ static enum test_result test_non_existent_get_and_delete(ENGINE_HANDLE *h,
     return SUCCESS;
 }
 
+static enum test_result test_mb16421(ENGINE_HANDLE *h,
+                                     ENGINE_HANDLE_V1 *h1) {
+    // Store the item!
+    item *itm = NULL;
+    check(store(h, h1, NULL, OPERATION_SET, "mykey", "somevalue", &itm) == ENGINE_SUCCESS,
+          "Failed set.");
+    h1->release(h, NULL, itm);
+    wait_for_flusher_to_settle(h, h1);
+
+    // Evict Item!
+    evict_key(h, h1, "mykey", 0, "Ejected.");
+
+    // Issue Get Meta
+    check(get_meta(h, h1, "mykey"), "Expected to get meta");
+
+    // Issue Get
+    check(h1->get(h, NULL, &itm, "mykey", 5, 0) == ENGINE_SUCCESS, "Item should be there");
+    h1->release(h, NULL, itm);
+
+    return SUCCESS;
+}
+
 static enum test_result test_get_random_key(ENGINE_HANDLE *h,
                                             ENGINE_HANDLE_V1 *h1) {
 
@@ -13150,6 +13459,109 @@ static enum test_result test_get_all_vb_seqnos(ENGINE_HANDLE *h,
 
     /* Check if the response received is correct */
     verify_all_vb_seqnos(h, h1, num_vbuckets/2, num_vbuckets);
+
+    return SUCCESS;
+}
+
+struct mb16357_ctx {
+    mb16357_ctx(ENGINE_HANDLE *_h, ENGINE_HANDLE_V1 *_h1, int _items) :
+        h(_h), h1(_h1), items(_items) { }
+
+    ENGINE_HANDLE *h;
+    ENGINE_HANDLE_V1 *h1;
+    int items;
+};
+
+extern "C" {
+    static void dcp_thread_func(void *args) {
+        struct mb16357_ctx *ctx = static_cast<mb16357_ctx *>(args);
+
+        const void *cookie = testHarness.create_cookie();
+        uint32_t opaque = 0xFFFF0000;
+        uint32_t flags = 0;
+        std::string name = "unittest";
+
+        while (get_int_stat(ctx->h, ctx->h1, "ep_pending_compactions") == 0);
+
+        // Switch to replica
+        check(set_vbucket_state(ctx->h, ctx->h1, 0, vbucket_state_replica),
+                "Failed to set vbucket state.");
+
+        // Open consumer connection
+        checkeq(ctx->h1->dcp.open(ctx->h, cookie, opaque, 0, flags,
+                                  (void*)name.c_str(), name.length()),
+                ENGINE_SUCCESS,
+                "Failed dcp Consumer open connection.");
+
+        add_stream_for_consumer(ctx->h, ctx->h1, cookie, opaque++, 0, 0,
+                PROTOCOL_BINARY_RESPONSE_SUCCESS);
+
+
+        uint32_t stream_opaque = get_int_stat(ctx->h, ctx->h1,
+                                              "eq_dcpq:unittest:stream_0_opaque",
+                                              "dcp");
+
+
+        for (int i = 1; i <= ctx->items; i++) {
+            std::stringstream ss;
+            ss << "kamakeey-" << i;
+
+            // send mutations in single mutation snapshots to race more with compaction
+            checkeq(ctx->h1->dcp.snapshot_marker(ctx->h, cookie,
+                                                 stream_opaque, 0/*vbid*/,
+                                                 ctx->items, ctx->items + i, 2),
+                    ENGINE_SUCCESS,
+                    "Failed to send snapshot marker");
+            checkeq(ctx->h1->dcp.mutation(ctx->h, cookie, stream_opaque,
+                                          ss.str().c_str(), ss.str().length(),
+                                          "value", 5, i * 3, 0, 0, 0,
+                                          i + ctx->items, i + ctx->items,
+                                          0, 0, "", 0, INITIAL_NRU_VALUE),
+                    ENGINE_SUCCESS,
+                    "Failed to send dcp mutation");
+        }
+
+        testHarness.destroy_cookie(cookie);
+    }
+
+    static void compact_thread_func(void *args) {
+        struct mb16357_ctx *ctx = static_cast<mb16357_ctx *>(args);
+        compact_db(ctx->h, ctx->h1, 0, 99, ctx->items, 1);
+    }
+}
+
+static enum test_result test_mb16357(ENGINE_HANDLE *h,
+                                     ENGINE_HANDLE_V1 *h1) {
+
+    // Load up vb0 with n items, expire in 1 second
+    int num_items = 1000;
+
+    for (int j = 0; j < num_items; ++j) {
+        item *i = NULL;
+        std::stringstream ss;
+        ss << "key-" << j;
+        check(store(h, h1, NULL, OPERATION_SET,
+                    ss.str().c_str(), "data", &i, 0, 0, 1/*expire*/, 0)
+                    == ENGINE_SUCCESS, "Failed to store a value"); //expire in 1 second
+
+        h1->release(h, NULL, i);
+    }
+
+    wait_for_flusher_to_settle(h, h1);
+    testHarness.time_travel(3617); // force expiry pushing time forward.
+
+    struct mb16357_ctx ctx(h, h1, num_items);
+    cb_thread_t cp_thread, dcp_thread;
+
+    cb_assert(cb_create_thread(&cp_thread,
+                               compact_thread_func,
+                               &ctx, 0) == 0);
+    cb_assert(cb_create_thread(&dcp_thread,
+                               dcp_thread_func,
+                               &ctx, 0) == 0);
+
+    cb_assert(cb_join_thread(cp_thread) == 0);
+    cb_assert(cb_join_thread(dcp_thread) == 0);
 
     return SUCCESS;
 }
@@ -14090,6 +14502,16 @@ engine_test_t* get_tests(void) {
                  teardown, NULL, prepare, cleanup),
         TestCase("dcp rollback after purge", test_dcp_rollback_after_purge,
                  test_setup, teardown, NULL, prepare, cleanup),
+        TestCase("dcp erroneous mutations scenario", test_dcp_erroneous_mutations,
+                 test_setup, teardown, NULL, prepare, cleanup),
+        TestCase("dcp erroneous snapshot marker scenario", test_dcp_erroneous_marker,
+                 test_setup, teardown, NULL, prepare, cleanup),
+        TestCase("dcp invalid mutation(s)/deletion(s)",
+                 test_dcp_invalid_mutation_deletion,
+                 test_setup, teardown, NULL, prepare, cleanup),
+        TestCase("dcp invalid snapshot marker",
+                 test_dcp_invalid_snapshot_marker,
+                 test_setup, teardown, NULL, prepare, cleanup),
 
         TestCase("test set with item_eviction",
                  test_set_with_item_eviction, test_setup, teardown,
@@ -14137,6 +14559,9 @@ engine_test_t* get_tests(void) {
         TestCase("test get & delete on non existent items",
                  test_non_existent_get_and_delete, test_setup, teardown,
                  "item_eviction_policy=full_eviction", prepare, cleanup),
+        TestCase("test MB-16421", test_mb16421,
+                 test_setup, teardown, "item_eviction_policy=full_eviction",
+                 prepare, cleanup),
 
         TestCase("test get random key", test_get_random_key,
                  test_setup, teardown, NULL, prepare, cleanup),
@@ -14157,6 +14582,10 @@ engine_test_t* get_tests(void) {
                  NULL, prepare, cleanup),
         TestCase("test get all vb seqnos", test_get_all_vb_seqnos, test_setup,
                  teardown, NULL, prepare, cleanup),
+
+        TestCase("test MB-16357", test_mb16357,
+                 test_setup, teardown, "compaction_exp_mem_threshold=85",
+                 prepare, cleanup),
 
         TestCase(NULL, NULL, NULL, NULL, NULL, prepare, cleanup)
     };

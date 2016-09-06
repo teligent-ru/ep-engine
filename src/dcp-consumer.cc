@@ -149,7 +149,7 @@ DcpConsumer::~DcpConsumer() {
 
 ENGINE_ERROR_CODE DcpConsumer::addStream(uint32_t opaque, uint16_t vbucket,
                                          uint32_t flags) {
-    LockHolder lh(streamMutex);
+    LockHolder lh(readyMutex);
     if (doDisconnect()) {
         return ENGINE_DISCONNECT;
     }
@@ -179,6 +179,7 @@ ENGINE_ERROR_CODE DcpConsumer::addStream(uint32_t opaque, uint16_t vbucket,
     uint64_t vbucket_uuid = entry.vb_uuid;
     uint64_t snap_start_seqno = info.range.start;
     uint64_t snap_end_seqno = info.range.end;
+    uint64_t high_seqno = vb->getHighSeqno();
 
     passive_stream_t stream = streams[vbucket];
     if (stream && stream->isActive()) {
@@ -190,7 +191,8 @@ ENGINE_ERROR_CODE DcpConsumer::addStream(uint32_t opaque, uint16_t vbucket,
     streams[vbucket] = new PassiveStream(&engine_, this, getName(), flags,
                                          new_opaque, vbucket, start_seqno,
                                          end_seqno, vbucket_uuid,
-                                         snap_start_seqno, snap_end_seqno);
+                                         snap_start_seqno, snap_end_seqno,
+                                         high_seqno);
     ready.push_back(vbucket);
     opaqueMap_[new_opaque] = std::make_pair(opaque, vbucket);
 
@@ -198,7 +200,6 @@ ENGINE_ERROR_CODE DcpConsumer::addStream(uint32_t opaque, uint16_t vbucket,
 }
 
 ENGINE_ERROR_CODE DcpConsumer::closeStream(uint32_t opaque, uint16_t vbucket) {
-    LockHolder lh(streamMutex);
     if (doDisconnect()) {
         return ENGINE_DISCONNECT;
     }
@@ -231,8 +232,14 @@ ENGINE_ERROR_CODE DcpConsumer::streamEnd(uint32_t opaque, uint16_t vbucket,
     if (stream && stream->getOpaque() == opaque && stream->isActive()) {
         LOG(EXTENSION_LOG_INFO, "%s (vb %d) End stream received with reason %d",
             logHeader(), vbucket, flags);
-        StreamEndResponse* response = new StreamEndResponse(opaque, flags,
-                                                            vbucket);
+
+        StreamEndResponse* response;
+        try {
+            response = new StreamEndResponse(opaque, flags, vbucket);
+        } catch (const std::bad_alloc&) {
+            return ENGINE_ENOMEM;
+        }
+
         err = stream->messageReceived(response);
 
         bool disable = false;
@@ -263,6 +270,12 @@ ENGINE_ERROR_CODE DcpConsumer::mutation(uint32_t opaque, const void* key,
         return ENGINE_DISCONNECT;
     }
 
+    if (bySeqno == 0) {
+        LOG(EXTENSION_LOG_WARNING, "%s (vb %d) Invalid sequence number(0) "
+            "for mutation!", logHeader(), vbucket);
+        return ENGINE_EINVAL;
+    }
+
     ENGINE_ERROR_CODE err = ENGINE_KEY_ENOENT;
     passive_stream_t stream = streams[vbucket];
     if (stream && stream->getOpaque() == opaque && stream->isActive()) {
@@ -283,8 +296,13 @@ ENGINE_ERROR_CODE DcpConsumer::mutation(uint32_t opaque, const void* key,
             }
         }
 
-        MutationResponse* response = new MutationResponse(item, opaque,
-                                                          emd);
+        MutationResponse* response;
+        try {
+            response = new MutationResponse(item, opaque, emd);
+        } catch (const std::bad_alloc&) {
+            return ENGINE_ENOMEM;
+        }
+
         err = stream->messageReceived(response);
 
         bool disable = false;
@@ -312,6 +330,12 @@ ENGINE_ERROR_CODE DcpConsumer::deletion(uint32_t opaque, const void* key,
         return ENGINE_DISCONNECT;
     }
 
+    if (bySeqno == 0) {
+        LOG(EXTENSION_LOG_WARNING, "%s (vb %d) Invalid sequence number(0)"
+            "for deletion!", logHeader(), vbucket);
+        return ENGINE_EINVAL;
+    }
+
     ENGINE_ERROR_CODE err = ENGINE_KEY_ENOENT;
     passive_stream_t stream = streams[vbucket];
     if (stream && stream->getOpaque() == opaque && stream->isActive()) {
@@ -332,8 +356,13 @@ ENGINE_ERROR_CODE DcpConsumer::deletion(uint32_t opaque, const void* key,
             }
         }
 
-        MutationResponse* response = new MutationResponse(item, opaque,
-                                                          emd);
+        MutationResponse* response;
+        try {
+            response = new MutationResponse(item, opaque, emd);
+        } catch (const std::bad_alloc&) {
+            return ENGINE_ENOMEM;
+        }
+
         err = stream->messageReceived(response);
 
         bool disable = false;
@@ -369,12 +398,24 @@ ENGINE_ERROR_CODE DcpConsumer::snapshotMarker(uint32_t opaque,
         return ENGINE_DISCONNECT;
     }
 
+    if (start_seqno > end_seqno) {
+        LOG(EXTENSION_LOG_WARNING, "%s (vb %d) Invalid snapshot marker "
+            "received, snap_start (%llu) <= snap_end (%llu)",
+            logHeader(), vbucket, start_seqno, end_seqno);
+        return ENGINE_EINVAL;
+    }
+
     ENGINE_ERROR_CODE err = ENGINE_KEY_ENOENT;
     passive_stream_t stream = streams[vbucket];
     if (stream && stream->getOpaque() == opaque && stream->isActive()) {
-        SnapshotMarker* response = new SnapshotMarker(opaque, vbucket,
-                                                      start_seqno, end_seqno,
-                                                      flags);
+        SnapshotMarker* response;
+        try {
+            response = new SnapshotMarker(opaque, vbucket, start_seqno,
+                                          end_seqno, flags);
+        } catch (const std::bad_alloc&) {
+            return ENGINE_ENOMEM;
+        }
+
         err = stream->messageReceived(response);
 
         bool disable = false;
@@ -414,7 +455,13 @@ ENGINE_ERROR_CODE DcpConsumer::setVBucketState(uint32_t opaque,
     ENGINE_ERROR_CODE err = ENGINE_KEY_ENOENT;
     passive_stream_t stream = streams[vbucket];
     if (stream && stream->getOpaque() == opaque && stream->isActive()) {
-        SetVBucketState* response = new SetVBucketState(opaque, vbucket, state);
+        SetVBucketState* response;
+        try {
+            response = new SetVBucketState(opaque, vbucket, state);
+        } catch (const std::bad_alloc&) {
+            return ENGINE_ENOMEM;
+        }
+
         err = stream->messageReceived(response);
 
         bool disable = false;
@@ -564,7 +611,12 @@ ENGINE_ERROR_CODE DcpConsumer::handleResponse(
         uint8_t* body = pkt->bytes + sizeof(protocol_binary_response_header);
 
         if (status == PROTOCOL_BINARY_RESPONSE_ROLLBACK) {
-            cb_assert(bodylen == sizeof(uint64_t));
+            if (bodylen != sizeof(uint64_t)) {
+                LOG(EXTENSION_LOG_WARNING, "%s (vb %d) Received rollback "
+                    "request with incorrect bodylen of %llu, disconnecting",
+                    logHeader(), vbid, bodylen);
+                return ENGINE_DISCONNECT;
+            }
             uint64_t rollbackSeqno = 0;
             memcpy(&rollbackSeqno, body, sizeof(uint64_t));
             rollbackSeqno = ntohll(rollbackSeqno);
@@ -613,7 +665,6 @@ bool DcpConsumer::doRollback(uint32_t opaque, uint16_t vbid,
 
     cb_assert(err == ENGINE_SUCCESS);
 
-    LockHolder lh(streamMutex);
     RCPtr<VBucket> vb = engine_.getVBucket(vbid);
     streams[vbid]->reconnectStream(vb, opaque, vb->getHighSeqno());
 
@@ -668,6 +719,13 @@ process_items_error_t DcpConsumer::processBufferedItems() {
         } while (bytes_processed > 0 && process_ret != cannot_process);
     }
 
+    if (isBufferSufficientlyDrained(flowControl.freedBytes.load())) {
+        /* Notify memcached to get flow control buffer ack out. We cannot wait
+           till the ConnManager daemon task notifies the memcached as it would
+           cause delay in buffer ack being sent out to the producer */
+        engine_.getDcpConnMap().notifyPausedConnection(this, false);
+    }
+
     if (process_ret == all_processed && itemsToProcess.load()) {
         return more_to_process;
     }
@@ -676,7 +734,7 @@ process_items_error_t DcpConsumer::processBufferedItems() {
 }
 
 DcpResponse* DcpConsumer::getNextItem() {
-    LockHolder lh(streamMutex);
+    LockHolder lh(readyMutex);
 
     setPaused(false);
     while (!ready.empty()) {
@@ -713,6 +771,7 @@ DcpResponse* DcpConsumer::getNextItem() {
 }
 
 void DcpConsumer::notifyStreamReady(uint16_t vbucket) {
+    LockHolder lh(readyMutex);
     std::list<uint16_t>::iterator iter =
         std::find(ready.begin(), ready.end(), vbucket);
     if (iter != ready.end()) {
@@ -720,13 +779,13 @@ void DcpConsumer::notifyStreamReady(uint16_t vbucket) {
     }
 
     ready.push_back(vbucket);
+    lh.unlock();
 
     engine_.getDcpConnMap().notifyPausedConnection(this, true);
 }
 
 void DcpConsumer::streamAccepted(uint32_t opaque, uint16_t status, uint8_t* body,
                                  uint32_t bodylen) {
-    LockHolder lh(streamMutex);
 
     opaque_map::iterator oitr = opaqueMap_.find(opaque);
     if (oitr != opaqueMap_.end()) {
@@ -760,7 +819,6 @@ void DcpConsumer::streamAccepted(uint32_t opaque, uint16_t status, uint8_t* body
 }
 
 bool DcpConsumer::isValidOpaque(uint32_t opaque, uint16_t vbucket) {
-    LockHolder lh(streamMutex);
     passive_stream_t stream = streams[vbucket];
     return stream && stream->getOpaque() == opaque;
 }
@@ -824,7 +882,7 @@ ENGINE_ERROR_CODE DcpConsumer::handleFlowCtl(struct dcp_message_producers* produ
             ObjectRegistry::onSwitchThread(epe);
             flowControl.pendingControl = false;
             return (ret == ENGINE_SUCCESS) ? ENGINE_WANT_MORE : ret;
-        } else if (ackable_bytes > (flowControl.bufferSize * .2)) {
+        } else if (isBufferSufficientlyDrained(ackable_bytes)) {
             // Send a buffer ack when at least 20% of the buffer is drained
             uint32_t opaque = ++opaqueCounter;
             EventuallyPersistentEngine *epe = ObjectRegistry::onSwitchThread(NULL, true);
@@ -888,4 +946,9 @@ bool DcpConsumer::isStreamPresent(uint16_t vbucket)
         return true;
     }
     return false;
+}
+
+inline bool DcpConsumer::isBufferSufficientlyDrained(uint32_t ackable_bytes)
+{
+    return ackable_bytes > (flowControl.bufferSize * .2);
 }

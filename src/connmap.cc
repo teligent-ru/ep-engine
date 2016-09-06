@@ -755,13 +755,10 @@ void TapConnMap::shutdownAllConnections() {
 
     connNotifier_->stop();
 
-    LockHolder lh(connsLock);
-    // We should pause unless we purged some connections or
-    // all queues have items.
-    if (all.empty()) {
-        return;
-    }
-
+    // Not safe to acquire both connsLock and releaseLock at the same time
+    // (can trigger deadlock), so first acquire releaseLock to release all
+    // the connections (without changing the list/map), then drop releaseLock,
+    // acquire connsLock and actually clear out the list/map.
     LockHolder rlh(releaseLock);
     std::list<connection_t>::iterator ii;
     for (ii = all.begin(); ii != all.end(); ++ii) {
@@ -774,6 +771,7 @@ void TapConnMap::shutdownAllConnections() {
     }
     rlh.unlock();
 
+    LockHolder lh(connsLock);
     all.clear();
     map_.clear();
 }
@@ -964,26 +962,34 @@ DcpConsumer *DcpConnMap::newConsumer(const void* cookie,
 
 }
 
+bool DcpConnMap::isPassiveStreamConnected_UNLOCKED(uint16_t vbucket) {
+    std::list<connection_t>::iterator it;
+    for(it = all.begin(); it != all.end(); it++) {
+        DcpConsumer* dcpConsumer = dynamic_cast<DcpConsumer*>(it->get());
+        if (dcpConsumer && dcpConsumer->isStreamPresent(vbucket)) {
+                LOG(EXTENSION_LOG_DEBUG, "(vb %d) A DCP passive stream "
+                    "is already exists for the vbucket in connection: %s",
+                    vbucket, dcpConsumer->logHeader());
+                return true;
+        }
+    }
+    return false;
+}
+
 ENGINE_ERROR_CODE DcpConnMap::addPassiveStream(ConnHandler* conn,
                                                uint32_t opaque,
                                                uint16_t vbucket,
                                                uint32_t flags)
 {
     cb_assert(conn);
-    LockHolder lh(connsLock);
 
+    LockHolder lh(connsLock);
     /* Check if a stream (passive) for the vbucket is already present */
-    std::list<connection_t>::iterator it;
-    for(it = all.begin(); it != all.end(); it++) {
-        DcpConsumer* dcpConsumer = dynamic_cast<DcpConsumer*>(it->get());
-        if (dcpConsumer) {
-            if (dcpConsumer->isStreamPresent(vbucket)) {
-                LOG(EXTENSION_LOG_WARNING, "%s (vb %d) Passive stream add "
-                    "failed, stream already exists in connection %s",
-                    conn->logHeader(), vbucket, dcpConsumer->logHeader());
-                return ENGINE_KEY_EEXISTS;
-            }
-        }
+    if (isPassiveStreamConnected_UNLOCKED(vbucket)) {
+        LOG(EXTENSION_LOG_WARNING, "%s (vb %d) Failing to add passive stream, "
+            "as one already exists for the vbucket!",
+            conn->logHeader(), vbucket);
+        return ENGINE_KEY_EEXISTS;
     }
 
     return conn->addStream(opaque, vbucket, flags);
@@ -1020,11 +1026,10 @@ void DcpConnMap::shutdownAllConnections() {
 
     connNotifier_->stop();
 
-    LockHolder lh(connsLock);
-    if (all.empty()) {
-        return;
-    }
-
+    // Not safe to acquire both connsLock and releaseLock at the same time
+    // (can trigger deadlock), so first acquire releaseLock to release all
+    // the connections (without changing the list/map), then drop releaseLock,
+    // acquire connsLock and actually clear out the list/map.
     LockHolder rlh(releaseLock);
     std::list<connection_t>::iterator ii;
     for (ii = all.begin(); ii != all.end(); ++ii) {
@@ -1033,6 +1038,7 @@ void DcpConnMap::shutdownAllConnections() {
     }
     rlh.unlock();
 
+    LockHolder lh(connsLock);
     closeAllStreams_UNLOCKED();
     all.clear();
     map_.clear();

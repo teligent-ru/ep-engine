@@ -417,7 +417,8 @@ bool EventuallyPersistentStore::initialize() {
 EventuallyPersistentStore::~EventuallyPersistentStore() {
     stopWarmup();
     stopBgFetcher();
-    ExecutorPool::get()->stopTaskGroup(&engine, NONIO_TASK_IDX);
+    ExecutorPool::get()->stopTaskGroup(&engine, NONIO_TASK_IDX,
+                                       stats.forceShutdown);
 
     ExecutorPool::get()->cancel(statsSnapshotTaskId);
     LockHolder lh(accessScanner.mutex);
@@ -425,7 +426,8 @@ EventuallyPersistentStore::~EventuallyPersistentStore() {
     lh.unlock();
 
     stopFlusher();
-    ExecutorPool::get()->unregisterBucket(ObjectRegistry::getCurrentEngine());
+    ExecutorPool::get()->unregisterBucket(ObjectRegistry::getCurrentEngine(),
+                                          stats.forceShutdown);
 
     delete [] vb_mutexes;
     delete [] schedule_vbstate_persist;
@@ -548,43 +550,48 @@ EventuallyPersistentStore::deleteExpiredItem(uint16_t vbid, std::string &key,
                                              uint64_t revSeqno) {
     RCPtr<VBucket> vb = getVBucket(vbid);
     if (vb) {
-        int bucket_num(0);
-        incExpirationStat(vb);
-        LockHolder lh = vb->ht.getLockedBucket(key, &bucket_num);
-        StoredValue *v = vb->ht.unlocked_find(key, bucket_num, true, false);
-        if (v) {
-            if (v->isTempNonExistentItem() || v->isTempDeletedItem()) {
-                // This is a temporary item whose background fetch for metadata
-                // has completed.
+        // Obtain reader access to the VB state change lock so that
+        // the VB can't switch state whilst we're processing
+        ReaderLockHolder rlh(vb->getStateLock());
+        if (vb->getState() == vbucket_state_active) {
+            int bucket_num(0);
+            incExpirationStat(vb);
+            LockHolder lh = vb->ht.getLockedBucket(key, &bucket_num);
+            StoredValue *v = vb->ht.unlocked_find(key, bucket_num, true, false);
+            if (v) {
+                if (v->isTempNonExistentItem() || v->isTempDeletedItem()) {
+                    // This is a temporary item whose background fetch for metadata
+                    // has completed.
 
-                LOG(EXTENSION_LOG_WARNING, "%s: key[%s] temporary--can not properly notify its expiration. Not notifying at all!", __func__, key.c_str()); /// @TODO maybe wait for it to load all the way and only then report?
+                    LOG(EXTENSION_LOG_WARNING, "%s: key[%s] temporary--can not properly notify its expiration. Not notifying at all!", __func__, key.c_str()); /// @TODO maybe wait for it to load all the way and only then report?
                 
-                bool deleted = vb->ht.unlocked_del(key, bucket_num);
-                cb_assert(deleted);
-            } else if (v->isExpired(startTime) && !v->isDeleted()) {
-                expiryPager.channel.sendNotification(engine.getName(), v);
+                    bool deleted = vb->ht.unlocked_del(key, bucket_num);
+                    cb_assert(deleted);
+                } else if (v->isExpired(startTime) && !v->isDeleted()) {
+                    expiryPager.channel.sendNotification(engine.getName(), v);
                 
-                vb->ht.unlocked_softDelete(v, 0, getItemEvictionPolicy());
-                queueDirty(vb, v, &lh, NULL, false);
-            }
-        } else {
-            LOG(EXTENSION_LOG_WARNING, "%s: key[%s] not found--can not properly notify its expiration. Not notifying at all!", __func__, key.c_str()); /// @TODO maybe BGFETCH and then it will automatically be retried on next expiration pass, and here do not try to do tricky things (below). currently we have 100% resident, so this is of no big importance (YET!)
-
-            if (eviction_policy == FULL_EVICTION) {
-                // Create a temp item and delete and push it
-                // into the checkpoint queue, only if the bloomfilter
-                // predicts that the item may exist on disk.
-                if (vb->maybeKeyExistsInFilter(key)) {
-                    add_type_t rv = vb->ht.unlocked_addTempItem(bucket_num, key,
-                                                               eviction_policy);
-                    if (rv == ADD_NOMEM) {
-                        return;
-                    }
-                    v = vb->ht.unlocked_find(key, bucket_num, true, false);
-                    v->setStoredValueState(StoredValue::state_deleted_key);
-                    v->setRevSeqno(revSeqno);
-                    vb->ht.unlocked_softDelete(v, 0, eviction_policy);
+                    vb->ht.unlocked_softDelete(v, 0, getItemEvictionPolicy());
                     queueDirty(vb, v, &lh, NULL, false);
+                }
+            } else {
+                LOG(EXTENSION_LOG_WARNING, "%s: key[%s] not found--can not properly notify its expiration. Not notifying at all!", __func__, key.c_str()); /// @TODO maybe BGFETCH and then it will automatically be retried on next expiration pass, and here do not try to do tricky things (below). currently we have 100% resident, so this is of no big importance (YET!)
+
+                if (eviction_policy == FULL_EVICTION) {
+                    // Create a temp item and delete and push it
+                    // into the checkpoint queue, only if the bloomfilter
+                    // predicts that the item may exist on disk.
+                    if (vb->maybeKeyExistsInFilter(key)) {
+                        add_type_t rv = vb->ht.unlocked_addTempItem(bucket_num, key,
+                                                                    eviction_policy);
+                        if (rv == ADD_NOMEM) {
+                            return;
+                        }
+                        v = vb->ht.unlocked_find(key, bucket_num, true, false);
+                        v->setStoredValueState(StoredValue::state_deleted_key);
+                        v->setRevSeqno(revSeqno);
+                        vb->ht.unlocked_softDelete(v, 0, eviction_policy);
+                        queueDirty(vb, v, &lh, NULL, false);
+                    }
                 }
             }
         }
@@ -1129,17 +1136,6 @@ bool EventuallyPersistentStore::persistVBState(const Priority &priority,
         return false;
     }
 
-    KVStatsCallback kvcb(this);
-    uint64_t chkId = vbMap.getPersistenceCheckpointId(vbid);
-    std::string failovers = vb->failovers->toJSON();
-
-    snapshot_range_t range;
-    vb->getPersistedSnapshot(range);
-    vbucket_state vb_state(vb->getState(), chkId, 0, vb->getHighSeqno(),
-                           vb->getPurgeSeqno(), range.start, range.end,
-                           vb->getMaxCas(), vb->getDriftCounter(),
-                           failovers);
-
     bool inverse = false;
     LockHolder lh(vb_mutexes[vbid], true /*tryLock*/);
     if (!lh.islocked()) {
@@ -1150,6 +1146,17 @@ bool EventuallyPersistentStore::persistVBState(const Priority &priority,
             return false;
         }
     }
+
+    KVStatsCallback kvcb(this);
+    uint64_t chkId = vbMap.getPersistenceCheckpointId(vbid);
+    std::string failovers = vb->failovers->toJSON();
+
+    snapshot_range_t range;
+    vb->getPersistedSnapshot(range);
+    vbucket_state vb_state(vb->getState(), chkId, 0, vb->getHighSeqno(),
+                           vb->getPurgeSeqno(), range.start, range.end,
+                           vb->getMaxCas(), vb->getDriftCounter(),
+                           failovers);
 
     KVStore *rwUnderlying = getRWUnderlying(vbid);
     if (rwUnderlying->snapshotVBucket(vbid, vb_state, &kvcb)) {
@@ -1659,17 +1666,27 @@ void EventuallyPersistentStore::completeBGFetch(const std::string &key,
                 status = ENGINE_SUCCESS;
             }
         } else {
+            bool restore = false;
             if (v && v->isResident()) {
                 status = ENGINE_SUCCESS;
-            }
-
-            bool restore = false;
-            if (eviction_policy == VALUE_ONLY &&
-                v && !v->isResident() && !v->isDeleted()) {
-                restore = true;
-            } else if (eviction_policy == FULL_EVICTION &&
-                       v && v->isTempInitialItem()) {
-                restore = true;
+            } else {
+                switch (eviction_policy) {
+                    case VALUE_ONLY:
+                        if (v && !v->isResident() && !v->isDeleted()) {
+                            restore = true;
+                        }
+                        break;
+                    case FULL_EVICTION:
+                        if (v) {
+                            if (v->isTempInitialItem() ||
+                                (!v->isResident() && !v->isDeleted())) {
+                                restore = true;
+                            }
+                        }
+                        break;
+                    default:
+                        throw std::logic_error("Unknown eviction policy");
+                }
             }
 
             if (restore) {
@@ -1762,17 +1779,27 @@ void EventuallyPersistentStore::completeBGFetchMulti(uint16_t vbId,
                 status = ENGINE_SUCCESS;
             }
         } else {
+            bool restore = false;
             if (v && v->isResident()) {
                 status = ENGINE_SUCCESS;
-            }
-
-            bool restore = false;
-            if (eviction_policy == VALUE_ONLY &&
-                v && !v->isResident() && !v->isDeleted()) {
-                restore = true;
-            } else if (eviction_policy == FULL_EVICTION &&
-                       v && v->isTempInitialItem()) {
-                restore = true;
+            } else {
+                switch (eviction_policy) {
+                    case VALUE_ONLY:
+                        if (v && !v->isResident() && !v->isDeleted()) {
+                            restore = true;
+                        }
+                        break;
+                    case FULL_EVICTION:
+                        if (v) {
+                            if (v->isTempInitialItem() ||
+                                (!v->isResident() && !v->isDeleted())) {
+                                restore = true;
+                            }
+                        }
+                        break;
+                    default:
+                        throw std::logic_error("Unknown eviction policy");
+                }
             }
 
             if (restore) {

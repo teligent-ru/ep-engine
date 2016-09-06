@@ -1912,7 +1912,7 @@ EventuallyPersistentEngine::EventuallyPersistentEngine(
     workloadPriority(NO_BUCKET_PRIORITY),
     tapThrottle(NULL), getServerApiFunc(get_server_api),
     dcpConnMap_(NULL), tapConnMap(NULL) ,tapConfig(NULL), checkpointConfig(NULL),
-    trafficEnabled(false), flushAllEnabled(false),startupTime(0)
+    trafficEnabled(false), flushAllEnabled(false), startupTime(0)
 {
     interface.interface = 1;
     ENGINE_HANDLE_V1::get_info = EvpGetInfo;
@@ -2621,7 +2621,6 @@ ENGINE_ERROR_CODE EventuallyPersistentEngine::tapNotify(const void *cookie,
             // tap producer is no longer connected..
             return ENGINE_DISCONNECT;
         } else {
-            // Create a new tap consumer...
             connection = tapConnMap->newConsumer(cookie);
             if (connection == NULL) {
                 LOG(EXTENSION_LOG_WARNING, "Failed to create new tap consumer."
@@ -5786,6 +5785,19 @@ EventuallyPersistentEngine::setClusterConfig(const void* cookie,
         lh.unlock();
     }
 
+    // clusterConfig is opaque to ep-engine, but typically there is a rev id
+    // at the start of it. Print the first 100 bytes which hopefully includes
+    // helpful identifying information.
+    const int CONFIG_LIMIT = 100;
+    if (clusterConfig.len > CONFIG_LIMIT) {
+        LOG(EXTENSION_LOG_WARNING, "Updated cluster configuration - first %d "
+                "bytes: '%.*s'...\n", CONFIG_LIMIT, CONFIG_LIMIT,
+                clusterConfig.config);
+    } else {
+        LOG(EXTENSION_LOG_WARNING, "Updated cluster configuration: '%.*s'\n",
+            clusterConfig.len, clusterConfig.config);
+    }
+
     return sendResponse(response, NULL, 0, NULL, 0, NULL, 0,
                         PROTOCOL_BINARY_RAW_BYTES,
                         PROTOCOL_BINARY_RESPONSE_SUCCESS, cas, cookie);
@@ -6018,8 +6030,7 @@ ENGINE_ERROR_CODE EventuallyPersistentEngine::dcpOpen(const void* cookie,
     return ENGINE_SUCCESS;
 }
 
-ENGINE_ERROR_CODE EventuallyPersistentEngine::dcpAddStream(
-                                                           const void* cookie,
+ENGINE_ERROR_CODE EventuallyPersistentEngine::dcpAddStream(const void* cookie,
                                                            uint32_t opaque,
                                                            uint16_t vbucket,
                                                            uint32_t flags)
