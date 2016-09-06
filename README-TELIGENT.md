@@ -100,9 +100,9 @@ function g {
 #https://github.com/couchbase/manifest/blob/master/released/3.0.3.xml
 #https://github.com/couchbase/manifest/blob/master/released/4.0.0.xml
 
-g ssh://git@github.com/teligent-ru ep-engine 4.0.0.teligent.5
-g ssh://git@github.com/teligent-ru platform 4.0.0.teligent.5
-g ssh://git@github.com/teligent-ru tlm 4.0.0.teligent.5
+g ssh://git@github.com/teligent-ru ep-engine 4.0.0.teligent.6
+g ssh://git@github.com/teligent-ru platform 4.0.0.teligent.6
+g ssh://git@github.com/teligent-ru tlm 4.0.0.teligent.6
 \cp -p tlm/{GNUmakefile,Makefile,CMakeLists.txt} .
 g git://github.com/couchbase v8 05120013843918f7e3712159c03b509d3e328cf7
 g git://github.com/couchbase memcached a7a7729d2d46854d2759814167722e0e5618d2fc
