@@ -99,14 +99,15 @@ function g {
 #https://github.com/couchbase/manifest/blob/master/released/3.0.1.xml
 #https://github.com/couchbase/manifest/blob/master/released/3.0.3.xml
 #https://github.com/couchbase/manifest/blob/master/released/4.0.0.xml
+#https://github.com/couchbase/manifest/blob/master/released/4.1.0.xml
 
-g ssh://git@github.com/teligent-ru ep-engine 4.0.0.teligent.6
-g ssh://git@github.com/teligent-ru platform 4.0.0.teligent.6
-g ssh://git@github.com/teligent-ru tlm 4.0.0.teligent.6
+g ssh://git@github.com/teligent-ru ep-engine 4.1.0.teligent.7
+g ssh://git@github.com/teligent-ru platform 4.1.0.teligent.7
+g ssh://git@github.com/teligent-ru tlm 4.1.0.teligent.7
 \cp -p tlm/{GNUmakefile,Makefile,CMakeLists.txt} .
-g git://github.com/couchbase v8 05120013843918f7e3712159c03b509d3e328cf7
-g git://github.com/couchbase memcached a7a7729d2d46854d2759814167722e0e5618d2fc
-g git://github.com/couchbase couchstore dfab1c7a10c469a1bd09e01317ad49d90ac030a9
+g git://github.com/couchbase v8 05120013843918f7e3712159c03b509d3e328cf7 #нет в manifest 4.1.0, TODO понять
+g git://github.com/couchbase memcached 7d88d0bba08f07c667ef167f79d3a81dc5f5a825
+g git://github.com/couchbase couchstore 7d6bc22a15b80f1da6dd169a3e538e985db1b91a
 ~~~
 
 Уберите механизмы сборки memcached и couchstore, сами по себе эти модули не нужны. Нужны только их заголовочные файлы:
@@ -141,7 +142,7 @@ INCLUDE_DIRECTORIES(BEFORE ${CMAKE_INSTALL_PREFIX}/include
                            ${CMAKE_CURRENT_SOURCE_DIR}/include
                            ${CMAKE_CURRENT_SOURCE_DIR}/src
                            ${CMAKE_CURRENT_BINARY_DIR}
-                           ${CMAKE_CURRENT_SOURCE_DIR})
+                           ${CMAKE_CURRENT_SOURCE_DIR}
                            ${Platform_SOURCE_DIR}/include)
 
 [root@rualpe-vm1 couchbase.4.0.0.RHEL7]#
@@ -173,14 +174,14 @@ Install the project...
 
 ~~~
 os=7
-tar -czvf ~/couchbase-4.0.0-patch-to-4.0.0.teligent.6-centos$os.x86_64.tgz /opt/couchbase/lib/{memcached/ep.so,libcJSON*}
-scp ~/couchbase-4.0.0-patch-to-4.0.0.teligent.6-centos$os.x86_64.tgz  alexander.petrossian@gigant:/var/www/kickstarts/3RD_PARTY/couchbase/RHEL$os/x86_64/
+tar -czvf ~/couchbase-4.0.0-patch-to-4.1.0.teligent.7-centos$os.x86_64.tgz /opt/couchbase/lib/{memcached/ep.so,libcJSON*}
+scp ~/couchbase-4.0.0-patch-to-4.1.0.teligent.7-centos$os.x86_64.tgz  alexander.petrossian@gigant:/var/www/kickstarts/3RD_PARTY/couchbase/RHEL$os/x86_64/
 ~~~
 
 ссылка для скачивания
 ---------------------
-http://gigant.teligent.ru/kickstarts/3RD_PARTY/couchbase/RHEL7/x86_64/couchbase-4.0.0-patch-to-4.0.0.teligent.6-centos7.x86_64.tgz
+http://gigant.teligent.ru/kickstarts/3RD_PARTY/couchbase/RHEL7/x86_64/couchbase-4.0.0-patch-to-4.1.0.teligent.7-centos7.x86_64.tgz
 
 установка патча
 ---------------
-tar vxzf ~/couchbase-4.0.0-patch-to-4.0.0.teligent.6-centos7.x86_64.tgz -C /
+tar vxzf ~/couchbase-4.0.0-patch-to-4.1.0.teligent.7-centos7.x86_64.tgz -C /
