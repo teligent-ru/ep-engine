@@ -125,7 +125,7 @@ extern "C" {
                                        couch_file_handle h) {
         StatFile* sf = reinterpret_cast<StatFile*>(h);
         BlockTimer bt(&sf->stats->syncTimeHisto);
-        return sf->orig_ops->sync(errinfo, sf->orig_handle);
+        return COUCHSTORE_SUCCESS; // sf->orig_ops->sync(errinfo, sf->orig_handle);
     }
 
     static couchstore_error_t cfs_advise(couchstore_error_info_t *errinfo,
