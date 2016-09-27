@@ -177,6 +177,7 @@ bool Flusher::step(GlobalTask *task) {
                 flushVB();
                 if (_state == running) {
                     double tosleep = getMinSleepTime();
+//			LOG(EXTENSION_LOG_WARNING, "%s: shard[%d] tosleep[%f]", __func__, (int)shard->getId(), tosleep);
                     if (tosleep > 0) {
                         task->snooze(tosleep);
                     }

@@ -41,10 +41,13 @@ ExpiryChannel::~ExpiryChannel() {
 
 bool ExpiryChannel::open(const std::string& dstAddr, const int dstPort) {
 	LOG(EXTENSION_LOG_INFO, "%s: open(%s:%d)", __func__, dstAddr.c_str(), dstPort);
-	if(mSocket >= 0)
-		close();
+	close();
+	if(dstAddr.empty() || !dstPort) {
+		return false;
+	}
 	mSocket = socket(PF_INET, SOCK_DGRAM, 0);
-	if(mSocket < 0 || dstAddr.empty() || !dstPort) {
+	if(mSocket < 0) {
+		LOG(EXTENSION_LOG_WARNING, "%s: open(%s:%d): failed to open UDP socket errno[%d]", __func__, dstAddr.c_str(), dstPort, errno);
 		return false;
 	}
 	
@@ -60,8 +63,8 @@ bool ExpiryChannel::open(const std::string& dstAddr, const int dstPort) {
 			&htmp, aux_data, sizeof aux_data, &hp, &herr);
 		
 		if(res || !hp) {
-			LOG(EXTENSION_LOG_WARNING, "%s: gethostname_r failed: res=%d, herr[%s (%d)]",
-				__func__, res, strerror(herr), herr);
+			LOG(EXTENSION_LOG_WARNING, "%s: gethostname_r failed: res=%d, herr[%d]",
+				__func__, res, herr);
 			return false;
 		}
 		
@@ -79,8 +82,8 @@ bool ExpiryChannel::open(const std::string& dstAddr, const int dstPort) {
 		
 		int rc;
 		if((rc = connect(mSocket, (sockaddr*)&addr, sizeof(addr))) < 0) {
-			LOG(EXTENSION_LOG_WARNING, "%s: conn(%d,%d)=%d: %d=%s",
-				__func__, addr.sin_addr.s_addr, addr.sin_port, rc, errno, strerror(errno));
+			LOG(EXTENSION_LOG_WARNING, "%s: conn(%d,%d)=%d. errno[%d]",
+				__func__, addr.sin_addr.s_addr, addr.sin_port, rc, errno);
 			close();
 			return false;
 		}
@@ -94,12 +97,13 @@ bool ExpiryChannel::open(const std::string& dstAddr, const int dstPort) {
 }
 
 void ExpiryChannel::sendNotification(const std::string& name, const StoredValue* v) {
-	if(!v) {
-		LOG(EXTENSION_LOG_WARNING, "%s[%s]: called without StoredValue, bailing out...", __func__, name.c_str());
+return;
+	if(!isConnected()) {
+//		LOG(EXTENSION_LOG_WARNING, "%s[%s.%s], but there is no connection (not configured? failed to open?), bailing out...", __func__, name.c_str(), v->getKey().c_str());
 		return;
 	}
-	if(!isConnected()) {
-		LOG(EXTENSION_LOG_WARNING, "%s[%s.%s], but there is no connection (not configured? failed to open?), bailing out...", __func__, name.c_str(), v->getKey().c_str());
+	if(!v) {
+		LOG(EXTENSION_LOG_WARNING, "%s[%s]: called without StoredValue, bailing out...", __func__, name.c_str());
 		return;
 	}
 /*
@@ -116,42 +120,28 @@ void ExpiryChannel::sendNotification(const std::string& name, const StoredValue*
 	cJSON_AddStringToObject(root, "bucket", name.c_str());
 	cJSON_AddStringToObject(root, "id", v->getKey().c_str());
 	cJSON_AddNumberToObject(root, "expiry", v->getExptime());
-	cJSON_AddNumberToObject(root, "cas", v->getCas());
+	//int64->double loses precision, fatal for 'cas', not doing that for now, not really needed // cJSON_AddNumberToObject(root, "cas", v->getCas());
 	cJSON_AddNumberToObject(root, "flags", v->getFlags());
 
 	const value_t& d = v->getValue();
 	uint8_t t = d->getDataType();
+	const std::string sbody(d->getData(), d->vlength());
 	switch(t) {
 		case PROTOCOL_BINARY_DATATYPE_JSON: {
-			size_t vlength = d->vlength();
-			char* bodyz = new char[vlength+1/*terminator for limited cJSON*/];
-			memcpy(bodyz, d->getData(), vlength);
-			bodyz[vlength] = 0; // terminator
-
-			cJSON* jbody = cJSON_Parse(bodyz);
-			if (!jbody) {
+			cJSON* jbody = cJSON_Parse(sbody.c_str());
+			if (jbody)
+				cJSON_AddItemToObject(root, "body", jbody); // assumes responsibility
+			else
 				LOG(EXTENSION_LOG_WARNING, "%s[%.%s]: reported its type as JSON but can not parse it, bailing out...", __func__, name.c_str(), v->getKey().c_str());
-				delete[] bodyz;
-				cJSON_Delete(root);
-				return;
-			}
-			cJSON_AddItemToObject(root, "body", jbody); // assumes responsibility
-			delete[] bodyz;
 			break;
 		}
 		case PROTOCOL_BINARY_RAW_BYTES: {
-			size_t vlength = d->vlength();
-			char* bodyz = new char[vlength+1/*terminator for limited cJSON*/];
-			memcpy(bodyz, d->getData(), vlength);
-			bodyz[vlength] = 0; // terminator
-			cJSON_AddStringToObject(root, "body", bodyz);
-			delete[] bodyz;
+			cJSON_AddStringToObject(root, "body", sbody.c_str());
 			break;
 		}
 		default:
-			LOG(EXTENSION_LOG_WARNING, "%s[%.%s]: can not handle its type[%d] (it's neither RAW=0 nor JSON=1), bailing out...", __func__, name.c_str(), v->getKey().c_str(), t);
-			cJSON_Delete(root);
-			return;
+			LOG(EXTENSION_LOG_WARNING, "%s[%.%s]: can not handle its type[%d] (it's neither RAW=0 nor JSON=1), sending without body", __func__, name.c_str(), v->getKey().c_str(), t);
+			break;
 	}
 
 	char* json_cstr = cJSON_PrintUnformatted(root);
@@ -196,8 +186,8 @@ void ExpiryChannel::sendNotification(const std::string& name, const StoredValue*
 		break;
 	}
 	if(json_length != static_cast<size_t>(written)) {
-		LOG(EXTENSION_LOG_WARNING, "%s[%s.%s]: json_length[%zu] != written[%zd] errno[%s (%d)]",
-			__func__, name.c_str(), v->getKey().c_str(), json_length, written, strerror(errno), errno);
+		LOG(EXTENSION_LOG_WARNING, "%s[%s.%s]: json_length[%zu] != written[%zd] errno[%d]",
+			__func__, name.c_str(), v->getKey().c_str(), json_length, written, errno);
 	}
 
 	cJSON_Free(json_cstr);

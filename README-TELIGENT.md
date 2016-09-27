@@ -58,6 +58,12 @@ gpgcheck=0
 ~~~
 yum install cmake snappy-devel.x86_64 libicu-devel.x86_64  openssl-devel.x86_64 libevent-devel.x86_64
 
+yum install ntpdate http://autobuild.teligent.ru/kickstarts/mrepo/7Server-x86_64/updates/Packages/tzdata-2016f-1.el7.noarch.rpm
+cat>/etc/ntp.cfg
+server 192.168.2.30
+^D
+service ntpdate restart
+
 /usr/include/unicode/uvernum.h
 поправить, чтобы был такой суффикс
 #define U_ICU_VERSION_SUFFIX _44
