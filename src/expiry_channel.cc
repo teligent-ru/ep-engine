@@ -125,7 +125,7 @@ return;
 
 	const value_t& d = v->getValue();
 	uint8_t t = d->getDataType();
-	const std::string sbody(d->getData(), d->vlength());
+	const std::string sbody(d->to_s());
 	switch(t) {
 		case PROTOCOL_BINARY_DATATYPE_JSON: {
 			cJSON* jbody = cJSON_Parse(sbody.c_str());
