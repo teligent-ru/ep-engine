@@ -97,7 +97,6 @@ bool ExpiryChannel::open(const std::string& dstAddr, const int dstPort) {
 }
 
 void ExpiryChannel::sendNotification(const std::string& name, const StoredValue* v) {
-return;
 	if(!isConnected()) {
 //		LOG(EXTENSION_LOG_WARNING, "%s[%s.%s], but there is no connection (not configured? failed to open?), bailing out...", __func__, name.c_str(), v->getKey().c_str());
 		return;
@@ -120,7 +119,7 @@ return;
 	cJSON_AddStringToObject(root, "bucket", name.c_str());
 	cJSON_AddStringToObject(root, "id", v->getKey().c_str());
 	cJSON_AddNumberToObject(root, "expiry", v->getExptime());
-	//int64->double loses precision, fatal for 'cas', not doing that for now, not really needed // cJSON_AddNumberToObject(root, "cas", v->getCas());
+	//int64->double possibly loses precision, fatal for 'cas', not doing that for now, not really needed // cJSON_AddNumberToObject(root, "cas", v->getCas());
 	cJSON_AddNumberToObject(root, "flags", v->getFlags());
 
 	const value_t& d = v->getValue();
