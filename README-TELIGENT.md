@@ -58,7 +58,7 @@ gpgcheck=0
 ~~~
 yum install cmake snappy-devel.x86_64 libicu-devel.x86_64  openssl-devel.x86_64 libevent-devel.x86_64
 
-yum install ntpdate http://autobuild.teligent.ru/kickstarts/mrepo/7Server-x86_64/updates/Packages/tzdata-2016f-1.el7.noarch.rpm
+yum install asciidoc ntpdate http://autobuild.teligent.ru/kickstarts/mrepo/7Server-x86_64/updates/Packages/tzdata-2016f-1.el7.noarch.rpm
 cat>/etc/ntp.cfg
 server 192.168.2.30
 ^D
@@ -181,8 +181,9 @@ Install the project...
 
 ~~~
 os=7
+a2x --doctype manpage --format manpage cb.asciidoc -D /usr/share/man/man1/
 \cp -p ./ep-engine/management/cbepctl /opt/couchbase/lib/python/cbepctl
-tar -czvf ~/couchbase-4.1.0-patch-to-4.1.0.teligent.7-centos$os.x86_64.tgz /opt/couchbase/lib/{memcached/ep.so,libcJSON*} /opt/couchbase/lib/python/cbepctl
+tar -czvf ~/couchbase-4.1.0-patch-to-4.1.0.teligent.7-centos$os.x86_64.tgz /opt/couchbase/lib/{memcached/ep.so,libcJSON*} /opt/couchbase/lib/python/cbepctl /usr/share/man/man1/cb.1
 scp ~/couchbase-4.1.0-patch-to-4.1.0.teligent.7-centos$os.x86_64.tgz  alexander.petrossian@gigant:/var/www/kickstarts/3RD_PARTY/couchbase/RHEL$os/x86_64/
 ~~~
 
@@ -193,3 +194,7 @@ http://gigant.teligent.ru/kickstarts/3RD_PARTY/couchbase/RHEL7/x86_64/couchbase-
 установка патча
 ---------------
 tar vxzf ~/couchbase-4.1.0-patch-to-4.1.0.teligent.7-centos7.x86_64.tgz -C /
+
+сводная инструкция на конечном узле
+-----------------------------------
+man cb
