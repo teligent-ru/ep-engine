@@ -160,6 +160,7 @@ void ExpiryChannel::sendNotification(const std::string& name, const StoredValue*
 	// here discovered errno==ECONNREFUSED to be returned if PREVIOUS message to that destination was not delivered
 	// (came ICMP with error as a reply to PREVIOUS message)
 	// official way to deal with it is to retry that case
+	// here discovered errno==EINTR also for previous message, tried 1.1.1.1
 	static struct previous_tag {
 		std::string name;
 		std::string key;
@@ -167,7 +168,7 @@ void ExpiryChannel::sendNotification(const std::string& name, const StoredValue*
 	ssize_t written = -1;
 	for(int attempt = 0; attempt < 2; attempt++) {
 		written = send(mSocket, json_cstr, json_length, 0);
-		if(written < 0 && errno == ECONNREFUSED) {
+		if(written < 0 && (errno == ECONNREFUSED || errno == EINTR)) {
 			// "probably" because it could be like this:
 			// 1. send(key1). previous.key:=key1
 			// 2. no ICMP error received yet
@@ -178,8 +179,8 @@ void ExpiryChannel::sendNotification(const std::string& name, const StoredValue*
 			//
 			// due to this mess, maybe we should remove this confusing warning
 			// leaving it here for now to see if we will ever see that
-			LOG(EXTENSION_LOG_WARNING, "%s[%s.%s]: probably this notification was not delivered",
-				__func__, previous.name.c_str(), previous.key.c_str());
+			LOG(EXTENSION_LOG_WARNING, "%s[%s.%s]: probably this notification was not delivered. errno[%d]",
+				__func__, previous.name.c_str(), previous.key.c_str(), errno);
 			continue;
 		}
 		break;
