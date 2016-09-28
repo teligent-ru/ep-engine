@@ -181,8 +181,8 @@ Install the project...
 
 ~~~
 os=7
-a2x --doctype manpage --format manpage cb.asciidoc -D /usr/share/man/man1/
-\cp -p ./ep-engine/management/cbepctl /opt/couchbase/lib/python/cbepctl
+a2x --doctype manpage --format manpage ep-engine/cb.asciidoc -D /usr/share/man/man1/
+\cp -p ep-engine/management/cbepctl /opt/couchbase/lib/python/cbepctl
 tar -czvf ~/couchbase-4.1.0-patch-to-4.1.0.teligent.7-centos$os.x86_64.tgz /opt/couchbase/lib/{memcached/ep.so,libcJSON*} /opt/couchbase/lib/python/cbepctl /usr/share/man/man1/cb.1
 scp ~/couchbase-4.1.0-patch-to-4.1.0.teligent.7-centos$os.x86_64.tgz  alexander.petrossian@gigant:/var/www/kickstarts/3RD_PARTY/couchbase/RHEL$os/x86_64/
 ~~~
