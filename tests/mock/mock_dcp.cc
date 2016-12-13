@@ -39,10 +39,13 @@ uint64_t dcp_last_snap_start_seqno;
 uint64_t dcp_last_snap_end_seqno;
 uint64_t dcp_last_byseqno;
 uint64_t dcp_last_revseqno;
-void* dcp_last_meta;
-uint16_t dcp_last_nmeta;
+std::string dcp_last_meta;
+std::string dcp_last_value;
 std::string dcp_last_key;
 vbucket_state_t dcp_last_vbucket_state;
+
+static ENGINE_HANDLE *engine_handle = nullptr;
+static ENGINE_HANDLE_V1 *engine_handle_v1 = nullptr;
 
 extern "C" {
 
@@ -180,12 +183,15 @@ static ENGINE_ERROR_CODE mock_mutation(const void* cookie,
     dcp_last_byseqno = by_seqno;
     dcp_last_revseqno = rev_seqno;
     dcp_last_locktime = lock_time;
-    dcp_last_meta = malloc(sizeof(uint8_t) * nmeta);
-    memcpy(dcp_last_meta, meta, nmeta);
-    dcp_last_nmeta = nmeta;
+    dcp_last_meta.assign(static_cast<const char*>(meta), nmeta);
+    dcp_last_value.assign(static_cast<const char*>(item->getData()),
+                          item->getNBytes());
     dcp_last_nru = nru;
     dcp_last_packet_size = 55 + dcp_last_key.length() +
                            item->getNBytes() + nmeta;
+    if (engine_handle_v1 && engine_handle) {
+        engine_handle_v1->release(engine_handle, NULL, item);
+    }
     return ENGINE_SUCCESS;
 }
 
@@ -208,9 +214,7 @@ static ENGINE_ERROR_CODE mock_deletion(const void* cookie,
     dcp_last_vbucket = vbucket;
     dcp_last_byseqno = by_seqno;
     dcp_last_revseqno = rev_seqno;
-    dcp_last_meta = malloc(sizeof(uint8_t) * nmeta);
-    memcpy(dcp_last_meta, meta, nmeta);
-    dcp_last_nmeta = nmeta;
+    dcp_last_meta.assign(static_cast<const char*>(meta), nmeta);
     dcp_last_packet_size = 42 + nkey + nmeta;
     return ENGINE_SUCCESS;
 }
@@ -295,6 +299,7 @@ static ENGINE_ERROR_CODE mock_control(const void* cookie,
     dcp_last_op = PROTOCOL_BINARY_CMD_DCP_CONTROL;
     dcp_last_opaque = opaque;
     dcp_last_key.assign(static_cast<const char*>(key), nkey);
+    dcp_last_value.assign(static_cast<const char*>(value), nvalue);
     return ENGINE_SUCCESS;
 }
 
@@ -315,16 +320,15 @@ void clear_dcp_data() {
     dcp_last_vbucket_uuid = 0;
     dcp_last_snap_start_seqno = 0;
     dcp_last_snap_end_seqno = 0;
-    free(dcp_last_meta);
-    dcp_last_meta = NULL;
-    dcp_last_nmeta = 0;
+    dcp_last_meta.clear();
+    dcp_last_value.clear();
     dcp_last_key.clear();
     dcp_last_vbucket_state = (vbucket_state_t)0;
 }
 
-struct dcp_message_producers* get_dcp_producers() {
-    dcp_message_producers* producers =
-        (dcp_message_producers*)malloc(sizeof(dcp_message_producers));
+std::unique_ptr<dcp_message_producers> get_dcp_producers(ENGINE_HANDLE *_h,
+                                                         ENGINE_HANDLE_V1 *_h1) {
+    std::unique_ptr<dcp_message_producers> producers(new dcp_message_producers);
 
     producers->get_failover_log = mock_get_failover_log;
     producers->stream_req = mock_stream_req;
@@ -341,5 +345,7 @@ struct dcp_message_producers* get_dcp_producers() {
     producers->buffer_acknowledgement = mock_buffer_acknowledgement;
     producers->control = mock_control;
 
+    engine_handle = _h;
+    engine_handle_v1 = _h1;
     return producers;
 }

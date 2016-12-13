@@ -1,6 +1,6 @@
 /* -*- Mode: C++; tab-width: 4; c-basic-offset: 4; indent-tabs-mode: nil -*- */
 /*
- *     Copyright 2012 Couchbase, Inc
+ *     Copyright 2015 Couchbase, Inc
  *
  *   Licensed under the Apache License, Version 2.0 (the "License");
  *   you may not use this file except in compliance with the License.
@@ -15,18 +15,20 @@
  *   limitations under the License.
  */
 
-#include "config.h"
-
-#include <memcached/engine.h>
-#include <memcached/protocol_binary.h>
-
-#include <iostream>
-
-#include "ep_engine.h"
-#include "histo.h"
-
 #ifndef SRC_STATWRITER_H_
 #define SRC_STATWRITER_H_ 1
+
+#include "config.h"
+
+
+#include "atomic.h"
+#include <platform/histogram.h>
+#include "objectregistry.h"
+
+#include <cstring>
+#include <memcached/engine_common.h>
+
+class EventuallyPersistentEngine;
 
 namespace STATWRITER_NAMESPACE {
 
@@ -44,6 +46,11 @@ void add_casted_stat(const char *k, const T &v,
     std::stringstream vals;
     vals << v;
     add_casted_stat(k, vals.str().c_str(), add_stat, cookie);
+}
+
+inline void add_casted_stat(const char *k, const bool v,
+                            ADD_STAT add_stat, const void *cookie) {
+    add_casted_stat(k, v ? "true" : "false", add_stat, cookie);
 }
 
 template <typename T>

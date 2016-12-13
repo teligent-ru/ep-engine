@@ -19,14 +19,16 @@
 #define SRC_BLOOMFILTER_H_ 1
 
 #include "config.h"
-#include "common.h"
 
-typedef enum {
+#include <string>
+#include <vector>
+
+enum bfilter_status_t {
     BFILTER_DISABLED,
     BFILTER_PENDING,
     BFILTER_COMPACTING,
     BFILTER_ENABLED
-} bfilter_status_t;
+};
 
 /**
  * A bloom filter instance for a vbucket.
@@ -47,12 +49,18 @@ public:
     void addKey(const char *key, size_t keylen);
     bool maybeKeyExists(const char *key, uint32_t keylen);
 
+    size_t getNumOfKeysInFilter();
+    size_t getFilterSize();
+
 private:
     size_t estimateFilterSize(size_t key_count, double false_positive_prob);
     size_t estimateNoOfHashes(size_t key_count);
 
     size_t filterSize;
     size_t noOfHashes;
+
+    size_t keyCounter;
+
     bfilter_status_t status;
     std::vector<bool> bitArray;
 };

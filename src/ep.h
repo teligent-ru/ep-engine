@@ -20,36 +20,15 @@
 
 #include "config.h"
 
-#include <memcached/engine.h>
-#include <stdlib.h>
-#include <string.h>
-#include <time.h>
-
-#include <algorithm>
-#include <iostream>
-#include <limits>
-#include <list>
-#include <map>
-#include <queue>
-#include <set>
-#include <stdexcept>
-#include <string>
-#include <utility>
-#include <vector>
-
-#include "atomic.h"
-#include "bgfetcher.h"
-#include "item_pager.h"
-#include "expiry_channel.h"
-#include "kvstore.h"
-#include "locks.h"
 #include "executorpool.h"
-#include "ext_meta_parser.h"
-#include "stats.h"
 #include "stored-value.h"
+#include "task_type.h"
 #include "vbucket.h"
 #include "vbucketmap.h"
 #include "expiry_channel.h"
+#include "utility.h"
+
+class ExtendedMetaData;
 
 /**
  * vbucket-aware hashtable visitor.
@@ -121,13 +100,13 @@ class Warmup;
 class VBCBAdaptor : public GlobalTask {
 public:
 
-    VBCBAdaptor(EventuallyPersistentStore *s,
-                shared_ptr<VBucketVisitor> v, const char *l, const Priority &p,
+    VBCBAdaptor(EventuallyPersistentStore *s, TaskId id,
+                std::shared_ptr<VBucketVisitor> v, const char *l,
                 double sleep=0);
 
     std::string getDescription() {
         std::stringstream rv;
-        rv << label << " on vb " << currentvb;
+        rv << label << " on vb " << currentvb.load();
         return rv.str();
     }
 
@@ -136,10 +115,10 @@ public:
 private:
     std::queue<uint16_t>        vbList;
     EventuallyPersistentStore  *store;
-    shared_ptr<VBucketVisitor>  visitor;
+    std::shared_ptr<VBucketVisitor>  visitor;
     const char                 *label;
     double                      sleepTime;
-    uint16_t                    currentvb;
+    AtomicValue<uint16_t>       currentvb;
 
     DISALLOW_COPY_AND_ASSIGN(VBCBAdaptor);
 };
@@ -152,7 +131,7 @@ class VBucketVisitorTask : public GlobalTask {
 public:
 
     VBucketVisitorTask(EventuallyPersistentStore *s,
-                       shared_ptr<VBucketVisitor> v, uint16_t sh,
+                       std::shared_ptr<VBucketVisitor> v, uint16_t sh,
                        const char *l, double sleep=0, bool shutdown=true);
 
     std::string getDescription() {
@@ -166,7 +145,7 @@ public:
 private:
     std::queue<uint16_t>         vbList;
     EventuallyPersistentStore   *store;
-    shared_ptr<VBucketVisitor>   visitor;
+    std::shared_ptr<VBucketVisitor>   visitor;
     const char                  *label;
     double                       sleepTime;
     uint16_t                     currentvb;
@@ -177,6 +156,32 @@ const uint16_t EP_PRIMARY_SHARD = 0;
 class KVShard;
 
 typedef std::pair<uint16_t, ExTask> CompTaskEntry;
+
+/**
+ * The following will be used to identify
+ * the source of an item's expiration.
+ */
+enum exp_type_t {
+    EXP_BY_PAGER,
+    EXP_BY_COMPACTOR,
+    EXP_BY_ACCESS
+};
+
+/**
+ * The following options can be specified
+ * for retrieving an item for get calls
+ */
+enum get_options_t {
+    NONE             = 0x0000,  //no option
+    TRACK_STATISTICS = 0x0001,  //whether statistics need to be tracked or not
+    QUEUE_BG_FETCH   = 0x0002,  //whether a background fetch needs to be queued
+    HONOR_STATES     = 0x0004,  //whether a retrieval should depend on the state
+                                //of the vbucket
+    TRACK_REFERENCE  = 0x0008,  //whether NRU bit needs to be set for the item
+    DELETE_TEMP      = 0x0010,  //whether temporary items need to be deleted
+    HIDE_LOCKED_CAS  = 0x0020   //whether locked items should have their CAS
+                                //hidden (return -1).
+};
 
 /**
  * Manager of all interaction with the persistence.
@@ -254,20 +259,17 @@ public:
     /**
      * Retrieve a value.
      *
-     * @param key the key to fetch
+     * @param key     the key to fetch
      * @param vbucket the vbucket from which to retrieve the key
-     * @param cookie the connection cookie
-     * @param queueBG if true, automatically queue a background fetch if necessary
-     * @param honorStates if false, fetch a result regardless of state
-     * @param trackReference true if we want to set the nru bit for the item
+     * @param cookie  the connection cookie
+     * @param options options specified for retrieval
      *
      * @return a GetValue representing the result of the request
      */
     GetValue get(const std::string &key, uint16_t vbucket,
-                 const void *cookie, bool queueBG=true,
-                 bool honorStates=true, bool trackReference=true) {
-        return getInternal(key, vbucket, cookie, queueBG, honorStates,
-                           vbucket_state_active, trackReference);
+                 const void *cookie, get_options_t options) {
+        return getInternal(key, vbucket, cookie, vbucket_state_active,
+                           options);
     }
 
     GetValue getRandomKey(void);
@@ -275,17 +277,23 @@ public:
     /**
      * Retrieve a value from a vbucket in replica state.
      *
-     * @param key the key to fetch
+     * @param key     the key to fetch
      * @param vbucket the vbucket from which to retrieve the key
-     * @param cookie the connection cookie
-     * @param queueBG if true, automatically queue a background fetch if necessary
+     * @param cookie  the connection cookie
+     * @param options options specified for retrieval
      *
      * @return a GetValue representing the result of the request
      */
     GetValue getReplica(const std::string &key, uint16_t vbucket,
-                        const void *cookie, bool queueBG=true) {
-        return getInternal(key, vbucket, cookie, queueBG, true,
-                           vbucket_state_replica);
+                        const void *cookie,
+                        get_options_t options = static_cast<get_options_t>(
+                                                        QUEUE_BG_FETCH |
+                                                        HONOR_STATES |
+                                                        TRACK_REFERENCE |
+                                                        DELETE_TEMP |
+                                                        HIDE_LOCKED_CAS)) {
+        return getInternal(key, vbucket, cookie, vbucket_state_replica,
+                           options);
     }
 
 
@@ -513,10 +521,10 @@ public:
         return vbMap.getPersistenceSeqno(vb);
     }
 
-    void snapshotVBuckets(const Priority &priority, uint16_t shardId);
+    void snapshotVBuckets(VBSnapshotTask::Priority prio, uint16_t shardId);
 
     /* transfer should be set to true *only* if this vbucket is becoming master
-     * as the result of the previous master cleanly handing off contorol. */
+     * as the result of the previous master cleanly handing off control. */
     ENGINE_ERROR_CODE setVBucketState(uint16_t vbid, vbucket_state_t state,
                                       bool transfer, bool notify_dcp = true);
 
@@ -540,24 +548,39 @@ public:
     ENGINE_ERROR_CODE deleteVBucket(uint16_t vbid, const void* c = NULL);
 
     /**
+     * Check for the existence of a vbucket in the case of couchstore
+     * or shard in the case of forestdb. Note that this function will be
+     * deprecated once forestdb is the only backend supported
+     *
+     * @param db_file_id vbucketid for couchstore or shard id in the
+     *                   case of forestdb
+     */
+    ENGINE_ERROR_CODE checkForDBExistence(uint16_t db_file_id);
+
+    /**
      * Triggers compaction of a vbucket
      *
-     * @param vbid The vbucket to compact.
+     * @param vbid The vbucket being compacted
      * @param c The context for compaction of a DB file
      * @param ck cookie used to notify connection of operation completion
      */
-    ENGINE_ERROR_CODE compactDB(uint16_t vbid, compaction_ctx c,
-                                const void *ck);
+    ENGINE_ERROR_CODE compactDB(uint16_t vbid, compaction_ctx c, const void *ck);
 
     /**
      * Callback to do the compaction of a vbucket
      *
-     * @param vbid The Id of the VBucket which needs to be compacted
      * @param ctx Context for couchstore compaction hooks
      * @param ck cookie used to notify connection of operation completion
      */
-    bool compactVBucket(const uint16_t vbid, compaction_ctx *ctx,
-                        const void *ck);
+    bool doCompact(compaction_ctx *ctx, const void *ck);
+
+    /**
+     * Remove completed compaction tasks or wake snoozed tasks
+     *
+     * @param db_file_id vbucket id for couchstore or shard id in the
+     *                   case of forestdb
+     */
+    void updateCompactionTasks(uint16_t db_file_id);
 
     /**
      * Reset a given vbucket from memory and disk. This differs from vbucket deletion in that
@@ -575,11 +598,11 @@ public:
      *
      * Note that this is asynchronous.
      */
-    size_t visit(shared_ptr<VBucketVisitor> visitor, const char *lbl,
-               task_type_t taskGroup, const Priority &prio,
+    size_t visit(std::shared_ptr<VBucketVisitor> visitor, const char *lbl,
+               task_type_t taskGroup, TaskId id,
                double sleepTime=0) {
-        return ExecutorPool::get()->schedule(new VBCBAdaptor(this, visitor,
-                                             lbl, prio, sleepTime), taskGroup);
+        return ExecutorPool::get()->schedule(new VBCBAdaptor(this, id, visitor,
+                                             lbl, sleepTime), taskGroup);
     }
 
     /**
@@ -618,6 +641,7 @@ public:
     Position endPosition() const;
 
     const Flusher* getFlusher(uint16_t shardId);
+
     Warmup* getWarmup(void) const;
 
     ENGINE_ERROR_CODE getKeyStats(const std::string &key, uint16_t vbucket,
@@ -627,10 +651,9 @@ public:
     std::string validateKey(const std::string &key,  uint16_t vbucket,
                             Item &diskItem);
 
-    bool getLocked(const std::string &key, uint16_t vbucket,
-                   Callback<GetValue> &cb,
-                   rel_time_t currentTime, uint32_t lockTimeout,
-                   const void *cookie);
+    GetValue getLocked(const std::string &key, uint16_t vbucket,
+                       rel_time_t currentTime, uint32_t lockTimeout,
+                       const void *cookie);
 
     ENGINE_ERROR_CODE unlockKey(const std::string &key,
                                 uint16_t vbucket,
@@ -639,7 +662,7 @@ public:
 
 
     KVStore* getRWUnderlying(uint16_t vbId) {
-        return vbMap.getShard(vbId)->getRWUnderlying();
+        return vbMap.getShardByVbId(vbId)->getRWUnderlying();
     }
 
     KVStore* getRWUnderlyingByShard(size_t shardId) {
@@ -651,11 +674,13 @@ public:
     }
 
     KVStore* getROUnderlying(uint16_t vbId) {
-        return vbMap.getShard(vbId)->getROUnderlying();
+        return vbMap.getShardByVbId(vbId)->getROUnderlying();
     }
 
-    void deleteExpiredItem(uint16_t, std::string &, time_t, uint64_t );
-    void deleteExpiredItems(std::list<std::pair<uint16_t, std::string> > &);
+    void deleteExpiredItem(uint16_t, std::string &, time_t, uint64_t,
+                           exp_type_t);
+    void deleteExpiredItems(std::list<std::pair<uint16_t, std::string> > &,
+                            exp_type_t);
 
 
     /**
@@ -668,24 +693,24 @@ public:
     /**
      * schedule a vb_state snapshot task for all the shards.
      */
-    bool scheduleVBSnapshot(const Priority &priority);
+    bool scheduleVBSnapshot(VBSnapshotTask::Priority prio);
 
     /**
      * schedule a vb_state snapshot task for a given shard.
      */
-    void scheduleVBSnapshot(const Priority &priority, uint16_t shardId,
+    void scheduleVBSnapshot(VBSnapshotTask::Priority prio, uint16_t shardId,
                             bool force = false);
 
     /**
      * Schedule a vbstate persistence task for a given vbucket.
      */
-    void scheduleVBStatePersist(const Priority &priority, uint16_t vbid,
+    void scheduleVBStatePersist(VBStatePersistTask::Priority prio, uint16_t vbid,
                                 bool force = false);
 
     /**
      * Persist a vbucket's state.
      */
-    bool persistVBState(const Priority &priority, uint16_t vbid);
+    bool persistVBState(uint16_t vbid);
 
     const VBucketMap &getVBuckets() {
         return vbMap;
@@ -701,7 +726,7 @@ public:
     }
 
     size_t getTransactionTimePerItem() {
-        return lastTransTimePerItem;
+        return lastTransTimePerItem.load();
     }
 
     bool isFlushAllScheduled() {
@@ -715,14 +740,20 @@ public:
     void setBackfillMemoryThreshold(double threshold);
 
     void setExpiryPagerSleeptime(size_t val);
+<<<<<<< HEAD
     void setExpiryHost(std::string val);
     void setExpiryPort(size_t val);
     void setFlusherMinSleepTime(float val);
 
+=======
+    void setExpiryPagerTasktime(ssize_t val);
+    void enableExpiryPager();
+    void disableExpiryPager();
+>>>>>>> e9a655b49393e1302bf75aa759b11969545c986a
 
     void enableAccessScannerTask();
     void disableAccessScannerTask();
-    void setAccessScannerSleeptime(size_t val);
+    void setAccessScannerSleeptime(size_t val, bool useStartTime);
     void resetAccessScannerStartTime();
 
     void resetAccessScannerTasktime() {
@@ -741,21 +772,27 @@ public:
 
     bool isMetaDataResident(RCPtr<VBucket> &vb, const std::string &key);
 
-    void incExpirationStat(RCPtr<VBucket> &vb, bool byPager = true) {
-        if (byPager) {
+    void incExpirationStat(RCPtr<VBucket> &vb, exp_type_t source) {
+        switch (source) {
+        case EXP_BY_PAGER:
             ++stats.expired_pager;
-        } else {
+            break;
+        case EXP_BY_COMPACTOR:
+            ++stats.expired_compactor;
+            break;
+        case EXP_BY_ACCESS:
             ++stats.expired_access;
+            break;
         }
         ++vb->numExpiredItems;
     }
 
-    void logQTime(type_id_t taskType, hrtime_t enqTime) {
-        stats.schedulingHisto[taskType].add(enqTime);
+    void logQTime(TaskId taskType, hrtime_t enqTime) {
+        stats.schedulingHisto[static_cast<int>(taskType)].add(enqTime);
     }
 
-    void logRunTime(type_id_t taskType, hrtime_t runTime) {
-        stats.taskRuntimeHisto[taskType].add(runTime);
+    void logRunTime(TaskId taskType, hrtime_t runTime) {
+        stats.taskRuntimeHisto[static_cast<int>(taskType)].add(runTime);
     }
 
     bool multiBGFetchEnabled() {
@@ -780,13 +817,25 @@ public:
     /**
      * Flushes all items waiting for persistence in a given vbucket
      * @param vbid The id of the vbucket to flush
-     * @return The amount of items flushed
+     * @return The number of items flushed
      */
     int flushVBucket(uint16_t vbid);
+
+    void commit(uint16_t shardId);
 
     void addKVStoreStats(ADD_STAT add_stat, const void* cookie);
 
     void addKVStoreTimingStats(ADD_STAT add_stat, const void* cookie);
+
+    /* Given a named KVStore statistic, return the value of that statistic,
+     * accumulated across any shards.
+     *
+     * @param name The name of the statistic
+     * @param[out] value The value of the statistic.
+     * @return True if the statistic was successfully returned via {value},
+     *              else false.
+     */
+    bool getKVStoreStat(const char* name, size_t& value);
 
     void resetUnderlyingStats(void);
     KVStore *getOneROUnderlying(void);
@@ -798,8 +847,10 @@ public:
 
     ENGINE_ERROR_CODE rollback(uint16_t vbid, uint64_t rollbackSeqno);
 
-    ExTask &fetchItemPagerTask() {
-        return itmpTask;
+    void wakeUpItemPager() {
+        if (itmpTask->getState() == TASK_SNOOZED) {
+            ExecutorPool::get()->wake(itmpTask->getId());
+        }
     }
 
     void wakeUpCheckpointRemover() {
@@ -809,6 +860,10 @@ public:
     }
 
     void runDefragmenterTask();
+
+    bool runAccessScannerTask();
+
+    void runVbStatePersistTask(int vbid);
 
     void setCompactionWriteQueueCap(size_t to) {
         compactionWriteQueueCap = to;
@@ -821,17 +876,32 @@ public:
     bool compactionCanExpireItems() {
         // Process expired items only if memory usage is lesser than
         // compaction_exp_mem_threshold and disk queue is small
-        // enough (marked by tap_throttle_queue_cap)
+        // enough (marked by replication_throttle_queue_cap)
 
         bool isMemoryUsageOk = (stats.getTotalMemoryUsed() <
                           (stats.getMaxDataSize() * compactionExpMemThreshold));
 
         size_t queueSize = stats.diskQueueSize.load();
-        bool isQueueSizeOk = ((stats.tapThrottleWriteQueueCap == -1) ||
-             (queueSize < static_cast<size_t>(stats.tapThrottleWriteQueueCap)));
+        bool isQueueSizeOk = ((stats.replicationThrottleWriteQueueCap == -1) ||
+             (queueSize < static_cast<size_t>(stats.replicationThrottleWriteQueueCap)));
 
         return (isMemoryUsageOk && isQueueSizeOk);
     }
+
+    void setCursorDroppingLowerUpperThresholds(size_t maxSize);
+
+    bool isAccessScannerEnabled() {
+        LockHolder lh(accessScanner.mutex);
+        return accessScanner.enabled;
+    }
+
+    bool isExpPagerEnabled() {
+        LockHolder lh(expiryPager.mutex);
+        return expiryPager.enabled;
+    }
+
+    //Check if there were any out-of-memory errors during warmup
+    bool isWarmupOOMFailure(void);
 
 protected:
     // During the warmup phase we might want to enable external traffic
@@ -845,13 +915,9 @@ protected:
     void warmupCompleted();
     void stopWarmup(void);
 
-private:
-
     void scheduleVBDeletion(RCPtr<VBucket> &vb,
                             const void* cookie,
                             double delay = 0);
-
-    RCPtr<VBucket> getVBucket(uint16_t vbid, vbucket_state_t wanted_state);
 
     /* Queue an item for persistence and replication
      *
@@ -917,15 +983,18 @@ private:
                                  bool trackReference=true, bool queueExpired=true);
 
     GetValue getInternal(const std::string &key, uint16_t vbucket,
-                         const void *cookie, bool queueBG,
-                         bool honorStates,
+                         const void *cookie,
                          vbucket_state_t allowedState,
-                         bool trackReference=true);
+                         get_options_t options = TRACK_REFERENCE);
 
     ENGINE_ERROR_CODE addTempItemForBgFetch(LockHolder &lock, int bucket_num,
                                             const std::string &key, RCPtr<VBucket> &vb,
                                             const void *cookie, bool metadataOnly,
                                             bool isReplication = false);
+
+    uint16_t getCommitInterval(uint16_t shardId);
+
+    uint16_t decrCommitInterval(uint16_t shardId);
 
     friend class Warmup;
     friend class Flusher;
@@ -971,13 +1040,18 @@ private:
     uint32_t bgFetchDelay;
     double backfillMemoryThreshold;
     struct ExpiryPagerDelta {
+<<<<<<< HEAD
         ExpiryPagerDelta() : sleeptime(0), port(0), task(0) {}
+=======
+        ExpiryPagerDelta() : sleeptime(0), task(0), enabled(true) {}
+>>>>>>> e9a655b49393e1302bf75aa759b11969545c986a
         Mutex mutex;
         size_t sleeptime;
         std::string host;
         int port;
         ExpiryChannel channel;
         size_t task;
+        bool enabled;
     } expiryPager;
     struct ALogTask {
         ALogTask() : sleeptime(0), task(0), lastTaskRuntime(gethrtime()),
@@ -993,7 +1067,7 @@ private:
         AtomicValue<size_t> replicaRatio;
     } cachedResidentRatio;
     size_t statsSnapshotTaskId;
-    size_t lastTransTimePerItem;
+    AtomicValue<size_t> lastTransTimePerItem;
     item_eviction_policy_t eviction_policy;
 
     Mutex compactionLock;

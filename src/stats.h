@@ -25,10 +25,10 @@
 #include <map>
 
 #include "atomic.h"
-#include "common.h"
-#include "histo.h"
+#include <platform/histogram.h>
 #include "memory_tracker.h"
 #include "mutex.h"
+#include "utility.h"
 
 #ifndef DEFAULT_MAX_DATA_SIZE
 /* Something something something ought to be enough for anybody */
@@ -48,10 +48,9 @@ public:
         warmedUpValues(0),
         warmDups(0),
         warmOOM(0),
-        warmupExpired(0),
         warmupMemUsedCap(0),
         warmupNumReadCap(0),
-        tapThrottleWriteQueueCap(0),
+        replicationThrottleWriteQueueCap(0),
         diskQueueSize(0),
         flusher_todo(0),
         flusherCommits(0),
@@ -64,6 +63,7 @@ public:
         flushFailed(0),
         flushExpired(0),
         expired_access(0),
+        expired_compactor(0),
         expired_pager(0),
         beginFailed(0),
         commitFailed(0),
@@ -73,7 +73,12 @@ public:
         vbucketDeletions(0),
         vbucketDeletionFail(0),
         mem_low_wat(0),
+        mem_low_wat_percent(0),
         mem_high_wat(0),
+        mem_high_wat_percent(0),
+        cursorDroppingLThreshold(0),
+        cursorDroppingUThreshold(0),
+        cursorsDropped(0),
         pagerRuns(0),
         expiryPagerRuns(0),
         itemsRemovedFromCheckpoints(0),
@@ -118,8 +123,8 @@ public:
         numTapFGFetched(0),
         numTapDeletes(0),
         tapBgNumOperations(0),
-        tapThrottled(0),
-        tapThrottleThreshold(0),
+        replicationThrottled(0),
+        replicationThrottleThreshold(0),
         tapBgWait(0),
         tapBgMinWait(0),
         tapBgMaxWait(0),
@@ -139,9 +144,11 @@ public:
         numOpsGetMetaOnSetWithMeta(0),
         mlogCompactorRuns(0),
         alogRuns(0),
+        accessScannerSkips(0),
         alogNumItems(0),
         alogTime(0),
         alogRuntime(0),
+        expPagerTime(0),
         isShutdown(false),
         rollbackCount(0),
         defragNumVisited(0),
@@ -179,8 +186,9 @@ public:
             oldVal = diskQueueSize.load();
             if (oldVal < decrementBy) {
                 LOG(EXTENSION_LOG_DEBUG,
-                    "Cannot decrement diskQueueSize by %lld, "
-                    "the current value is %lld\n", decrementBy, oldVal);
+                    "Cannot decrement diskQueueSize by %" PRIu64 ", "
+                    "the current value is %" PRIu64 "\n",
+                    uint64_t(decrementBy), uint64_t(oldVal));
                 return false;
             }
         } while (!diskQueueSize.compare_exchange_strong(oldVal, oldVal - decrementBy));
@@ -195,8 +203,6 @@ public:
     AtomicValue<size_t> warmDups;
     //! Number of OOM failures at warmup time.
     AtomicValue<size_t> warmOOM;
-    //! Number of expired keys during data loading
-    AtomicValue<size_t> warmupExpired;
 
     //! Fill % of memory used during warmup we're going to enable traffic
     AtomicValue<double> warmupMemUsedCap;
@@ -204,8 +210,8 @@ public:
     //  enable traffic
     AtomicValue<double> warmupNumReadCap;
 
-    //! The tap throttle write queue cap
-    AtomicValue<ssize_t> tapThrottleWriteQueueCap;
+    //! The replication throttle write queue cap
+    AtomicValue<ssize_t> replicationThrottleWriteQueueCap;
 
     //! Amount of items waiting for persistence
     AtomicValue<size_t> diskQueueSize;
@@ -229,10 +235,20 @@ public:
     AtomicValue<size_t> flushFailed;
     //! Number of times an item is not flushed due to the item's expiry
     AtomicValue<size_t> flushExpired;
+
+    // Expiration stats. Note: These stats are not synchronous -
+    // e.g. expired_pager can be incremented /before/ curr_items is
+    // decremented. This is because curr_items is sometimes only
+    // updated long after the expiration action, when delete is
+    // persisted to disk (and callback invoked).
+
     //! Number of times an object was expired on access.
     AtomicValue<size_t> expired_access;
+    //! Number of times an object was expired by compactor.
+    AtomicValue<size_t> expired_compactor;
     //! Number of times an object was expired by pager.
     AtomicValue<size_t> expired_pager;
+
     //! Number of times we failed to start a transaction
     AtomicValue<size_t> beginFailed;
     //! Number of times a commit failed.
@@ -251,8 +267,17 @@ public:
     //! Beyond this point are config items
     //! Pager low water mark.
     AtomicValue<size_t> mem_low_wat;
+    AtomicValue<double> mem_low_wat_percent;
     //! Pager high water mark
     AtomicValue<size_t> mem_high_wat;
+    AtomicValue<double> mem_high_wat_percent;
+
+    //! Cursor dropping thresholds used by checkpoint remover
+    AtomicValue<size_t> cursorDroppingLThreshold;
+    AtomicValue<size_t> cursorDroppingUThreshold;
+
+    //! Number of cursors dropped by checkpoint remover
+    AtomicValue<size_t> cursorsDropped;
 
     //! Number of times we needed to kick in the pager
     AtomicValue<size_t> pagerRuns;
@@ -354,6 +379,15 @@ public:
     //! Histogram of setWithMeta latencies.
     Histogram<hrtime_t> setWithMetaHisto;
 
+    //! Histogram of access scanner run times
+    Histogram<hrtime_t> accessScannerHisto;
+    //! Historgram of checkpoint remover run times
+    Histogram<hrtime_t> checkpointRemoverHisto;
+    //! Histogram of item pager run times
+    Histogram<hrtime_t> itemPagerHisto;
+    //! Histogram of expiry pager run times
+    Histogram<hrtime_t> expiryPagerHisto;
+
     /* TAP related stats */
     //! The total number of tap events sent (not including noops)
     AtomicValue<size_t> numTapFetched;
@@ -367,10 +401,10 @@ public:
     AtomicValue<size_t> numTapDeletes;
     //! The number of samples the tapBgWaitDelta and tapBgLoadDelta contains of
     AtomicValue<size_t> tapBgNumOperations;
-    //! The number of tap notify messages throttled by TapThrottle.
-    AtomicValue<size_t> tapThrottled;
-    //! Percentage of memory in use before we throttle tap input
-    AtomicValue<double> tapThrottleThreshold;
+    //! The number of tap notify messages throttled by replicationThrottle.
+    AtomicValue<size_t> replicationThrottled;
+    //! Percentage of memory in use before we throttle replication input
+    AtomicValue<double> replicationThrottleThreshold;
 
     /** The sum of the deltas (in usec) from a tap item was put in queue until
      *  the dispatcher started the work for this item
@@ -422,14 +456,19 @@ public:
 
     //! The number of tiems the mutation log compactor is exectued
     AtomicValue<size_t> mlogCompactorRuns;
-    //! The number of tiems the access scanner runs
+    //! The number of times the access scanner runs
     AtomicValue<size_t> alogRuns;
+    //! The number of times the access scanner skips generating access log
+    AtomicValue<size_t> accessScannerSkips;
     //! The number of items that last access scanner task swept to log
     AtomicValue<size_t> alogNumItems;
     //! The next access scanner task schedule time (GMT)
     AtomicValue<hrtime_t> alogTime;
     //! The number of seconds that the last access scanner task took
     AtomicValue<rel_time_t> alogRuntime;
+
+    //! The next expiry pager task schedule time (GMT)
+    AtomicValue<hrtime_t> expPagerTime;
 
     AtomicValue<bool> isShutdown;
 
@@ -513,6 +552,9 @@ public:
     //! Histogram of setting vbucket state
     Histogram<hrtime_t> snapshotVbucketHisto;
 
+    //! Histogram of persisting vbucket state
+    Histogram<hrtime_t> persistVBStateHisto;
+
     //! Histogram of mutation log compactor
     Histogram<hrtime_t> mlogCompactorHisto;
 
@@ -552,7 +594,7 @@ public:
         tapBgMaxWait.store(0);
         tapBgMinLoad.store(999999999);
         tapBgMaxLoad.store(0);
-        tapThrottled.store(0);
+        replicationThrottled.store(0);
         oom_errors.store(0);
         tmp_oom_errors.store(0);
         pendingOps.store(0);
@@ -565,6 +607,7 @@ public:
 
         mlogCompactorRuns.store(0);
         alogRuns.store(0);
+        accessScannerSkips.store(0),
         defragNumVisited.store(0),
         defragNumMoved.store(0);
 
@@ -572,6 +615,10 @@ public:
         bgWaitHisto.reset();
         bgLoadHisto.reset();
         setWithMetaHisto.reset();
+        accessScannerHisto.reset();
+        checkpointRemoverHisto.reset();
+        itemPagerHisto.reset();
+        expiryPagerHisto.reset();
         tapBgWaitHisto.reset();
         tapBgLoadHisto.reset();
         getVbucketCmdHisto.reset();
@@ -591,7 +638,8 @@ public:
         diskDelHisto.reset();
         diskVBDelHisto.reset();
         diskCommitHisto.reset();
-
+        snapshotVbucketHisto.reset();
+        persistVBStateHisto.reset();
         itemAllocSizeHisto.reset();
         dirtyAgeHisto.reset();
         mlogCompactorHisto.reset();

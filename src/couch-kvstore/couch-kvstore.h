@@ -1,6 +1,6 @@
 /* -*- Mode: C++; tab-width: 4; c-basic-offset: 4; indent-tabs-mode: nil -*- */
 /*
- *     Copyright 2012 Couchbase, Inc
+ *     Copyright 2015 Couchbase, Inc
  *
  *   Licensed under the Apache License, Version 2.0 (the "License");
  *   you may not use this file except in compliance with the License.
@@ -20,6 +20,7 @@
 
 #include "config.h"
 #include "libcouchstore/couch_db.h"
+#include <relaxed_atomic.h>
 
 #include <map>
 #include <string>
@@ -27,7 +28,8 @@
 
 #include "configuration.h"
 #include "couch-kvstore/couch-fs-stats.h"
-#include "histo.h"
+#include <platform/histogram.h>
+#include <platform/strerror.h>
 #include "item.h"
 #include "kvstore.h"
 #include "tasks.h"
@@ -70,6 +72,7 @@ public:
         writeSizeHisto.reset();
         delTimeHisto.reset();
         compactHisto.reset();
+        snapshotHisto.reset();
         commitHisto.reset();
         saveDocsHisto.reset();
         batchSize.reset();
@@ -98,7 +101,7 @@ public:
     AtomicValue<size_t> io_num_write;
     //! Number of bytes read
     AtomicValue<size_t> io_read_bytes;
-    //! Number of bytes written
+    //! Number of bytes written (key + value + application rev metadata)
     AtomicValue<size_t> io_write_bytes;
 
     /* for flush and vb delete, no error handling in CouchKVStore, such
@@ -122,19 +125,16 @@ public:
     Histogram<hrtime_t> saveDocsHisto;
     // Batch size of saveDocs calls
     Histogram<size_t> batchSize;
+    //Time spent in vbucket snapshot
+    Histogram<hrtime_t> snapshotHisto;
 
     // Stats from the underlying OS file operations done by couchstore.
     CouchstoreStats fsStats;
+    // Underlying stats for OS file operations during compaction.
+    CouchstoreStats fsStatsCompaction;
 };
 
 class EventuallyPersistentEngine;
-
-typedef union {
-    Callback <mutation_result> *setCb;
-    Callback <int> *delCb;
-} CouchRequestCallback;
-
-const size_t CONFLICT_RES_META_LEN = 1;
 
 // Additional 3 Bytes for flex meta, datatype and conflict resolution mode
 const size_t COUCHSTORE_METADATA_SIZE(2 * sizeof(uint32_t) + sizeof(uint64_t) +
@@ -144,7 +144,7 @@ const size_t COUCHSTORE_METADATA_SIZE(2 * sizeof(uint32_t) + sizeof(uint64_t) +
 /**
  * Class representing a document to be persisted in couchstore.
  */
-class CouchRequest
+class CouchRequest : public IORequest
 {
 public:
     /**
@@ -155,7 +155,10 @@ public:
      * @param cb persistence callback
      * @param del flag indicating if it is an item deletion or not
      */
-    CouchRequest(const Item &it, uint64_t rev, CouchRequestCallback &cb, bool del);
+    CouchRequest(const Item &it, uint64_t rev, MutationRequestCallback &cb,
+                 bool del);
+
+    virtual ~CouchRequest() {}
 
     /**
      * Get the vbucket id of a document to be persisted
@@ -181,7 +184,7 @@ public:
      *
      * @return pointer to the couchstore Doc instance of a document
      */
-    Doc *getDbDoc(void) {
+    void *getDbDoc(void) {
         if (deleteItem) {
             return NULL;
         } else {
@@ -196,33 +199,6 @@ public:
      */
     DocInfo *getDbDocInfo(void) {
         return &dbDocInfo;
-    }
-
-    /**
-     * Get the callback instance for SET
-     *
-     * @return callback instance for SET
-     */
-    Callback<mutation_result> *getSetCallback(void) {
-        return callback.setCb;
-    }
-
-    /**
-     * Get the callback instance for DELETE
-     *
-     * @return callback instance for DELETE
-     */
-    Callback<int> *getDelCallback(void) {
-        return callback.delCb;
-    }
-
-    /**
-     * Get the time in ns elapsed since the creation of this instance
-     *
-     * @return time in ns elapsed since the creation of this instance
-     */
-    hrtime_t getDelta() {
-        return (gethrtime() - start) / 1000;
     }
 
     /**
@@ -252,18 +228,12 @@ public:
         return key;
     }
 
-private :
+protected:
     value_t value;
     uint8_t meta[COUCHSTORE_METADATA_SIZE];
-    uint16_t vbucketId;
     uint64_t fileRevNum;
-    std::string key;
     Doc dbDoc;
     DocInfo dbDocInfo;
-    bool deleteItem;
-    CouchRequestCallback callback;
-
-    hrtime_t start;
 };
 
 /**
@@ -279,7 +249,7 @@ public:
      * @param config    Configuration information
      * @param read_only flag indicating if this kvstore instance is for read-only operations
      */
-    CouchKVStore(Configuration &config, bool read_only = false);
+    CouchKVStore(KVStoreConfig &config, bool read_only = false);
 
     /**
      * Copy constructor
@@ -306,7 +276,10 @@ public:
      * @return true if the transaction is started successfully
      */
     bool begin(void) {
-        cb_assert(!isReadOnly());
+        if (isReadOnly()) {
+            throw std::logic_error("CouchKVStore::begin: Not valid on a "
+                    "read-only object.");
+        }
         intransaction = true;
         return intransaction;
     }
@@ -316,15 +289,16 @@ public:
      *
      * @return true if the commit is completed successfully.
      */
-    bool commit(Callback<kvstats_ctx> *cb, uint64_t snapStartSeqno,
-                uint64_t snapEndSeqno, uint64_t maxCas,
-                uint64_t driftCounter);
+    bool commit(Callback<kvstats_ctx> *cb);
 
     /**
      * Rollback a transaction (unless not currently in one).
      */
     void rollback(void) {
-        cb_assert(!isReadOnly());
+        if (isReadOnly()) {
+            throw std::logic_error("CouchKVStore::rollback: Not valid on a "
+                    "read-only object.");
+        }
         if (intransaction) {
             intransaction = false;
         }
@@ -401,59 +375,33 @@ public:
     void getPersistedStats(std::map<std::string, std::string> &stats);
 
     /**
-     * Persist a snapshot of the engine stats in the underlying storage.
-     *
-     * @param engine_stats map instance that contains all the engine stats
-     * @return true if the snapshot is done successfully
-     */
-    bool snapshotStats(const std::map<std::string, std::string> &engine_stats);
-
-    /**
      * Persist a snapshot of the vbucket states in the underlying storage system.
      *
-     * @param vbucketId vbucket id
-     * @param vbstate vbucket state
-     * @param cb - call back for updating kv stats
+     * @param vbucketId - vbucket id
+     * @param vbstate   - vbucket state
+     * @param cb        - call back for updating kv stats
+     * @param persist   - whether to persist snapshot state or not
      * @return true if the snapshot is done successfully
      */
     bool snapshotVBucket(uint16_t vbucketId, vbucket_state &vbstate,
-                         Callback<kvstats_ctx> *cb);
+                         Callback<kvstats_ctx> *cb, bool persist);
 
      /**
-     * Compact a vbucket in the underlying storage system.
+     * Compact a database file in the underlying storage system.
      *
-     * @param vbid   - which vbucket needs to be compacted
-     * @param hook_ctx - details of vbucket which needs to be compacted
-     * @param cb - callback to help process newly expired items
+     * @param ctx - compaction context that holds the identifier of the
+                    underlying database file, options and callbacks
+                    that need to invoked.
      * @param kvcb - callback to update kvstore stats
      * @return true if successful
      */
-    bool compactVBucket(const uint16_t vbid, compaction_ctx *cookie,
-                        Callback<compaction_ctx> &cb,
-                        Callback<kvstats_ctx> &kvcb);
+    bool compactDB(compaction_ctx *ctx, Callback<kvstats_ctx> &kvcb);
 
-    /**
-     * Does the underlying storage system support key-only retrieval operations?
-     *
-     * @return true if key-only retrieval is supported
-     */
-    bool isKeyDumpSupported() {
-        return true;
-    }
+    vbucket_state *getVBucketState(uint16_t vbid);
 
-    /**
-     * Get the number of deleted items that are persisted to a vbucket file
-     *
-     * @param vbid The vbucket if of the file to get the number of deletes for
-     */
-    size_t getNumPersistedDeletes(uint16_t vbid);
+    virtual size_t getNumPersistedDeletes(uint16_t vbid);
 
-    /**
-     * Get the vbucket pertaining stats from a vbucket database file
-     *
-     * @param vbid The vbucket of the file to get the number of docs for
-     */
-    DBFileInfo getDbFileInfo(uint16_t vbid);
+    virtual DBFileInfo getDbFileInfo(uint16_t vbid);
 
     /**
      * Get the number of non-deleted items from a vbucket database file
@@ -473,14 +421,7 @@ public:
      * @param cb getvalue callback
      */
     RollbackResult rollback(uint16_t vbid, uint64_t rollbackSeqno,
-                            shared_ptr<RollbackCB> cb);
-
-    /**
-     * Perform the pre-optimizations before persisting dirty items
-     *
-     * @param items list of dirty items that can be pre-optimized
-     */
-    void optimizeWrites(std::vector<queued_item> &items);
+                            std::shared_ptr<RollbackCB> cb);
 
     /**
      * Perform pending tasks after persisting dirty items
@@ -506,6 +447,8 @@ public:
     void addTimingStats(const std::string &prefix, ADD_STAT add_stat,
                         const void *c);
 
+    virtual bool getStat(const char* name, size_t& value);
+
     /**
      * Resets couchstore stats
      */
@@ -516,7 +459,7 @@ public:
     static int recordDbDump(Db *db, DocInfo *docinfo, void *ctx);
     static int recordDbStat(Db *db, DocInfo *docinfo, void *ctx);
     static int getMultiCb(Db *db, DocInfo *docinfo, void *ctx);
-    void readVBState(Db *db, uint16_t vbId);
+    ENGINE_ERROR_CODE readVBState(Db *db, uint16_t vbId);
 
     couchstore_error_t fetchDoc(Db *db, DocInfo *docinfo,
                                 GetValue &docValue, uint16_t vbId,
@@ -531,26 +474,22 @@ public:
      * Get all_docs API, to return the list of all keys in the store
      */
     ENGINE_ERROR_CODE getAllKeys(uint16_t vbid, std::string &start_key,
-                                 uint32_t count, AllKeysCB *cb);
+                                 uint32_t count,
+                                 std::shared_ptr<Callback<uint16_t&, char*&> > cb);
 
-    ScanContext* initScanContext(shared_ptr<Callback<GetValue> > cb,
-                                 shared_ptr<Callback<CacheLookup> > cl,
+    ScanContext* initScanContext(std::shared_ptr<Callback<GetValue> > cb,
+                                 std::shared_ptr<Callback<CacheLookup> > cl,
                                  uint16_t vbid, uint64_t startSeqno,
-                                 bool keysOnly, bool noDeletes,
-                                 bool deletesOnly);
+                                 DocumentFilter options,
+                                 ValueFilter valOptions);
 
     scan_error_t scan(ScanContext* sctx);
 
     void destroyScanContext(ScanContext* ctx);
 
-private:
-
+protected:
     bool setVBucketState(uint16_t vbucketId, vbucket_state &vbstate,
                          Callback<kvstats_ctx> *cb, bool reset=false);
-    bool resetVBucket(uint16_t vbucketId, vbucket_state &vbstate) {
-        cachedDocCount[vbucketId] = 0;
-        return setVBucketState(vbucketId, vbstate, NULL, true);
-    }
 
     template <typename T>
     void addStat(const std::string &prefix, const char *nm, T &val,
@@ -558,11 +497,8 @@ private:
 
     void operator=(const CouchKVStore &from);
 
-    void open();
     void close();
-    bool commit2couchstore(Callback<kvstats_ctx> *cb, uint64_t snapStartSeqno,
-                           uint64_t snapEndSeqno, uint64_t maxCas,
-                           uint64_t driftCounter);
+    bool commit2couchstore(Callback<kvstats_ctx> *cb);
 
     uint64_t checkNewRevNum(std::string &dbname, bool newFile = false);
     void populateFileNameMap(std::vector<std::string> &filenames,
@@ -571,17 +507,13 @@ private:
     void updateDbFileMap(uint16_t vbucketId, uint64_t newFileRev);
     couchstore_error_t openDB(uint16_t vbucketId, uint64_t fileRev, Db **db,
                               uint64_t options, uint64_t *newFileRev = NULL,
-                              bool reset=false);
+                              bool reset=false, const couch_file_ops* ops = nullptr);
     couchstore_error_t openDB_retry(std::string &dbfile, uint64_t options,
                                     const couch_file_ops *ops,
                                     Db **db, uint64_t *newFileRev);
     couchstore_error_t saveDocs(uint16_t vbid, uint64_t rev, Doc **docs,
                                 DocInfo **docinfos, size_t docCount,
-                                kvstats_ctx &kvctx,
-                                uint64_t snapStartSeqno,
-                                uint64_t snapEndSeqno,
-                                uint64_t maxCas,
-                                uint64_t driftCounter);
+                                kvstats_ctx &kvctx);
     void commitCallback(std::vector<CouchRequest *> &committedReqs,
                         kvstats_ctx &kvctx,
                         couchstore_error_t errCode);
@@ -607,22 +539,44 @@ private:
 
     void removeCompactFile(const std::string &filename);
 
-    Configuration &configuration;
     const std::string dbname;
-    std::vector<uint64_t>dbFileRevMap;
+
+    // Map of the fileRev for each vBucket. Using RelaxedAtomic so
+    // stats gathering (doDcpVbTakeoverStats) can get a snapshot
+    // without having to lock.
+    std::vector<Couchbase::RelaxedAtomic<uint64_t>> dbFileRevMap;
+
     uint16_t numDbFiles;
     std::vector<CouchRequest *> pendingReqsQ;
     bool intransaction;
 
     /* all stats */
     CouchKVStoreStats   st;
+
+    /**
+     * couch_file_ops implementation for couchstore which tracks
+     * all bytes read/written by couchstore *except* compaction.
+     *
+     * Backed by this->st.fsStats
+     */
     couch_file_ops statCollectingFileOps;
-    /* vbucket state cache*/
-    std::vector<vbucket_state *> cachedVBStates;
-    /* deleted docs in each file*/
-    unordered_map<uint16_t, size_t> cachedDeleteCount;
-    /* non-deleted docs in each file */
-    unordered_map<uint16_t, size_t> cachedDocCount;
+
+    /**
+     * couch_file_ops implementation for couchstore which tracks
+     * all bytes read/written by couchstore just for compaction
+     *
+     * Backed by this->st.fsStatsCompaction
+     */
+    couch_file_ops statCollectingFileOpsCompaction;
+
+    /* deleted docs in each file, indexed by vBucket. RelaxedAtomic
+       to allow stats access witout lock */
+    std::vector<Couchbase::RelaxedAtomic<size_t>> cachedDeleteCount;
+
+    /* non-deleted docs in each file, indexed by vBucket.
+       RelaxedAtomic to allow stats access witout lock. */
+    std::vector<Couchbase::RelaxedAtomic<size_t>> cachedDocCount;
+
     /* pending file deletions */
     AtomicQueue<std::string> pendingFileDeletions;
 

@@ -19,20 +19,22 @@
 #define SRC_WORKLOAD_H_ 1
 
 #include "config.h"
-#include <string>
-#include "common.h"
 
-typedef enum {
+#include "atomic.h"
+
+#include <string>
+
+enum bucket_priority_t {
     HIGH_BUCKET_PRIORITY=6,
     LOW_BUCKET_PRIORITY=2,
     NO_BUCKET_PRIORITY=0
-} bucket_priority_t;
+};
 
-typedef enum {
+enum workload_pattern_t {
     READ_HEAVY,
     WRITE_HEAVY,
     MIXED
-} workload_pattern_t;
+};
 
 /**
  * Workload optimization policy
@@ -58,11 +60,11 @@ public:
     }
 
     workload_pattern_t getWorkLoadPattern(void) {
-        return workloadPattern;
+        return workloadPattern.load();
     }
 
     std::string stringOfWorkLoadPattern(void) {
-        switch (workloadPattern) {
+        switch (workloadPattern.load()) {
         case READ_HEAVY:
             return "read_heavy";
         case WRITE_HEAVY:
@@ -73,14 +75,14 @@ public:
     }
 
     void setWorkLoadPattern(workload_pattern_t pattern) {
-        workloadPattern = pattern;
+        workloadPattern.store(pattern);
     }
 
 private:
 
     int maxNumWorkers;
     int maxNumShards;
-    volatile workload_pattern_t workloadPattern;
+    AtomicValue<workload_pattern_t> workloadPattern;
 };
 
 #endif  // SRC_WORKLOAD_H_

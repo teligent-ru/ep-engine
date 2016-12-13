@@ -31,17 +31,14 @@ void BgFetcher::start() {
     bool inverse = false;
     pendingFetch.compare_exchange_strong(inverse, true);
     ExecutorPool* iom = ExecutorPool::get();
-    ExTask task = new BgFetcherTask(&(store->getEPEngine()), this,
-                                      Priority::BgFetcherPriority, false);
+    ExTask task = new MultiBGFetcherTask(&(store->getEPEngine()), this, false);
     this->setTaskId(task->getId());
     iom->schedule(task, READER_TASK_IDX);
-    cb_assert(taskId > 0);
 }
 
 void BgFetcher::stop() {
     bool inverse = true;
     pendingFetch.compare_exchange_strong(inverse, false);
-    cb_assert(taskId > 0);
     ExecutorPool::get()->cancel(taskId);
 }
 
@@ -49,16 +46,15 @@ void BgFetcher::notifyBGEvent(void) {
     ++stats.numRemainingBgJobs;
     bool inverse = false;
     if (pendingFetch.compare_exchange_strong(inverse, true)) {
-        cb_assert(taskId > 0);
         ExecutorPool::get()->wake(taskId);
     }
 }
 
-size_t BgFetcher::doFetch(uint16_t vbId) {
+size_t BgFetcher::doFetch(VBucket::id_type vbId) {
     hrtime_t startTime(gethrtime());
     LOG(EXTENSION_LOG_DEBUG, "BgFetcher is fetching data, vBucket = %d "
-        "numDocs = %d, startTime = %lld\n", vbId, items2fetch.size(),
-        startTime/1000000);
+        "numDocs = %" PRIu64 ", startTime = %" PRIu64,
+        vbId, uint64_t(items2fetch.size()), startTime/1000000);
 
     shard->getROUnderlying()->getMulti(vbId, items2fetch);
 
@@ -66,7 +62,8 @@ size_t BgFetcher::doFetch(uint16_t vbId) {
     std::vector<bgfetched_item_t> fetchedItems;
     vb_bgfetch_queue_t::iterator itr = items2fetch.begin();
     for (; itr != items2fetch.end(); ++itr) {
-        std::list<VBucketBGFetchItem *> &requestedItems = (*itr).second;
+        vb_bgfetch_item_ctx_t &bg_item_ctx = (*itr).second;
+        std::list<VBucketBGFetchItem *> &requestedItems = bg_item_ctx.bgfetched_list;
         std::list<VBucketBGFetchItem *>::iterator itm = requestedItems.begin();
         for(; itm != requestedItems.end(); ++itm) {
             const std::string &key = (*itr).first;
@@ -85,13 +82,14 @@ size_t BgFetcher::doFetch(uint16_t vbId) {
     return totalfetches;
 }
 
-void BgFetcher::clearItems(uint16_t vbId) {
+void BgFetcher::clearItems(VBucket::id_type vbId) {
     vb_bgfetch_queue_t::iterator itr = items2fetch.begin();
 
     for(; itr != items2fetch.end(); ++itr) {
         // every fetched item belonging to the same key shares
         // a single data buffer, just delete it from the first fetched item
-        std::list<VBucketBGFetchItem *> &doneItems = (*itr).second;
+        vb_bgfetch_item_ctx_t& bg_item_ctx = (*itr).second;
+        std::list<VBucketBGFetchItem *> &doneItems = bg_item_ctx.bgfetched_list;
         VBucketBGFetchItem *firstItem = doneItems.front();
         firstItem->delValue();
 
@@ -153,10 +151,8 @@ bool BgFetcher::run(GlobalTask *task) {
 }
 
 bool BgFetcher::pendingJob() {
-    std::vector<int> vbIds = shard->getVBuckets();
-    size_t numVbuckets = vbIds.size();
-    for (size_t i = 0; i < numVbuckets; ++i) {
-        RCPtr<VBucket> vb = shard->getBucket(vbIds[i]);
+    for (auto vbid : shard->getVBuckets()) {
+        RCPtr<VBucket> vb = shard->getBucket(vbid);
         if (vb && vb->hasPendingBGFetchItems()) {
             return true;
         }

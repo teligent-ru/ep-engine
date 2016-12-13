@@ -20,16 +20,20 @@
 
 #include "config.h"
 
+#include "atomic.h"
+
 #include <libcouchstore/couch_db.h>
 
-#include "histo.h"
+#include <platform/histogram.h>
 
 struct CouchstoreStats {
 public:
     CouchstoreStats() :
         readSeekHisto(ExponentialGenerator<size_t>(1, 2), 50),
         readSizeHisto(ExponentialGenerator<size_t>(1, 2), 25),
-        writeSizeHisto(ExponentialGenerator<size_t>(1, 2), 25) { }
+        writeSizeHisto(ExponentialGenerator<size_t>(1, 2), 25),
+        totalBytesRead(0),
+        totalBytesWritten(0) { }
 
     //Read time length
     Histogram<hrtime_t> readTimeHisto;
@@ -44,6 +48,11 @@ public:
     //Time spent in sync
     Histogram<hrtime_t> syncTimeHisto;
 
+    // total bytes read from disk.
+    AtomicValue<size_t> totalBytesRead;
+    // Total bytes written to disk.
+    AtomicValue<size_t> totalBytesWritten;
+
     void reset() {
         readTimeHisto.reset();
         readSeekHisto.reset();
@@ -51,6 +60,8 @@ public:
         writeTimeHisto.reset();
         writeSizeHisto.reset();
         syncTimeHisto.reset();
+        totalBytesRead = 0;
+        totalBytesWritten = 0;
     }
 };
 

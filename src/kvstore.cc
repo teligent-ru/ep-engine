@@ -19,19 +19,40 @@
 
 #include <map>
 #include <string>
+#include <fcntl.h>
 
 #include "common.h"
 #include "couch-kvstore/couch-kvstore.h"
-#include "ep_engine.h"
+#include "forest-kvstore/forest-kvstore.h"
 #include "kvstore.h"
-#include "warmup.h"
+#include "vbucket.h"
+#include <platform/dirutils.h>
+#include <sys/types.h>
+#include <sys/stat.h>
 
+using namespace CouchbaseDirectoryUtilities;
 
-KVStore *KVStoreFactory::create(Configuration &config, bool read_only) {
+KVStoreConfig::KVStoreConfig(Configuration& config, uint16_t shardid)
+    : maxVBuckets(config.getMaxVbuckets()), maxShards(config.getMaxNumShards()),
+      dbname(config.getDbname()), backend(config.getBackend()), shardId(shardid) {
+
+}
+KVStoreConfig::KVStoreConfig(uint16_t _maxVBuckets, uint16_t _maxShards,
+                             const std::string& _dbname,
+                             const std::string& _backend,
+                             uint16_t _shardId)
+    : maxVBuckets(_maxVBuckets), maxShards(_maxShards), dbname(_dbname),
+      backend(_backend), shardId(_shardId) {
+
+}
+
+KVStore *KVStoreFactory::create(KVStoreConfig &config, bool read_only) {
     KVStore *ret = NULL;
     std::string backend = config.getBackend();
     if (backend.compare("couchdb") == 0) {
         ret = new CouchKVStore(config, read_only);
+    } else if (backend.compare("forestdb") == 0) {
+        ret = new ForestKVStore(config);
     } else {
         LOG(EXTENSION_LOG_WARNING, "Unknown backend: [%s]", backend.c_str());
     }
@@ -39,108 +60,143 @@ KVStore *KVStoreFactory::create(Configuration &config, bool read_only) {
     return ret;
 }
 
-void RollbackCB::callback(GetValue &val) {
-    cb_assert(val.getValue());
-    cb_assert(dbHandle);
-    Item *itm = val.getValue();
-    RCPtr<VBucket> vb = engine_.getVBucket(itm->getVBucketId());
-    int bucket_num(0);
-    RememberingCallback<GetValue> gcb;
-    engine_.getEpStore()->getROUnderlying(itm->getVBucketId())->
-                                          getWithHeader(dbHandle,
-                                                        itm->getKey(),
-                                                        itm->getVBucketId(),
-                                                        gcb);
-    gcb.waitForValue();
-    cb_assert(gcb.fired);
-    if (gcb.val.getStatus() == ENGINE_SUCCESS) {
-        Item *it = gcb.val.getValue();
-        if (it->isDeleted()) {
-            LockHolder lh = vb->ht.getLockedBucket(it->getKey(),
-                    &bucket_num);
-            bool ret = vb->ht.unlocked_del(it->getKey(), bucket_num);
-            if(!ret) {
-                setStatus(ENGINE_KEY_ENOENT);
-            } else {
-                setStatus(ENGINE_SUCCESS);
-            }
-        } else {
-            mutation_type_t mtype = vb->ht.set(*it, it->getCas(),
-                                               true, true,
-                                               engine_.getEpStore()->
-                                                    getItemEvictionPolicy(),
-                                               INITIAL_NRU_VALUE);
-            if (mtype == NOMEM) {
-                setStatus(ENGINE_ENOMEM);
-            }
+void KVStore::createDataDir(const std::string& dbname) {
+    if (!mkdirp(dbname.c_str())) {
+        if (errno != EEXIST) {
+            std::stringstream ss;
+            ss << "Failed to create data directory ["
+               << dbname << "]: " << strerror(errno);
+            throw std::runtime_error(ss.str());
         }
-        delete it;
-    } else if (gcb.val.getStatus() == ENGINE_KEY_ENOENT) {
-        LockHolder lh = vb->ht.getLockedBucket(itm->getKey(), &bucket_num);
-        bool ret = vb->ht.unlocked_del(itm->getKey(), bucket_num);
-        if (!ret) {
-            setStatus(ENGINE_KEY_ENOENT);
+    }
+}
+
+bool KVStore::updateCachedVBState(uint16_t vbid, const vbucket_state& newState) {
+
+    vbucket_state *vbState = cachedVBStates[vbid];
+
+    bool state_change_detected = true;
+    if (vbState != nullptr) {
+        //Check if there's a need for persistence
+        if (vbState->needsToBePersisted(newState)) {
+            vbState->state = newState.state;
+            vbState->failovers = newState.failovers;
         } else {
-            setStatus(ENGINE_SUCCESS);
+            state_change_detected = false;
         }
+
+        vbState->checkpointId = newState.checkpointId;
+
+        if (newState.maxDeletedSeqno > 0 &&
+                vbState->maxDeletedSeqno < newState.maxDeletedSeqno) {
+            vbState->maxDeletedSeqno = newState.maxDeletedSeqno;
+        }
+
+        vbState->highSeqno = newState.highSeqno;
+        vbState->lastSnapStart = newState.lastSnapStart;
+        vbState->lastSnapEnd = newState.lastSnapEnd;
+        vbState->maxCas = std::max(vbState->maxCas, newState.maxCas);
+        vbState->driftCounter = newState.driftCounter;
     } else {
-        LOG(EXTENSION_LOG_WARNING, "Unexpected Error Status: %d",
-                gcb.val.getStatus());
+        cachedVBStates[vbid] = new vbucket_state(newState);
     }
-    delete itm;
+
+    return state_change_detected;
 }
 
-void BfilterCB::addKeyToFilter(const char *key, size_t keylen, bool isDeleted) {
-    cb_assert(store);
-    RCPtr<VBucket> vb = store->getVBucket(vbucketId);
-    if (vb) {
-        if (vb->isTempFilterAvailable()) {
-            if (store->getItemEvictionPolicy() == VALUE_ONLY) {
-                /**
-                 * VALUE-ONLY EVICTION POLICY
-                 * Consider deleted items only.
-                 */
-                if (isDeleted) {
-                    std::string theKey(key, keylen);
-                    vb->addToTempFilter(theKey);
-                }
-            } else {
-                /**
-                 * FULL EVICTION POLICY
-                 * If vbucket's resident ratio is found to be less than
-                 * the residency threshold, consider all items, otherwise
-                 * consider deleted and non-resident items only.
-                 */
-                std::string theKey(key, keylen);
-                if (residentRatioLessThanThreshold) {
-                    vb->addToTempFilter(theKey);
-                } else {
-                    if (isDeleted || !store->isMetaDataResident(vb, theKey)) {
-                        vb->addToTempFilter(theKey);
-                    }
-                }
-            }
+bool KVStore::snapshotStats(const std::map<std::string,
+                            std::string> &stats) {
+    if (isReadOnly()) {
+        throw std::logic_error("KVStore::snapshotStats: Cannot perform "
+                        "on a read-only instance.");
+    }
+
+    size_t count = 0;
+    size_t size = stats.size();
+    std::stringstream stats_buf;
+    stats_buf << "{";
+    std::map<std::string, std::string>::const_iterator it = stats.begin();
+    for (; it != stats.end(); ++it) {
+        stats_buf << "\"" << it->first << "\": \"" << it->second << "\"";
+        ++count;
+        if (count < size) {
+            stats_buf << ", ";
         }
     }
+    stats_buf << "}";
+    std::string dbname = configuration.getDBName();
+    std::string next_fname = dbname + "/stats.json.new";
+
+    FILE *new_stats = fopen(next_fname.c_str(), "w");
+    if (new_stats == nullptr) {
+        LOG(EXTENSION_LOG_NOTICE, "Failed to log the engine stats to "
+                "file \"%s\" due to an error \"%s\"; Not critical because new "
+                "stats will be dumped later, please ignore.",
+            next_fname.c_str(), strerror(errno));
+        return false;
+    }
+
+    bool rv = true;
+    if (fprintf(new_stats, "%s\n", stats_buf.str().c_str()) < 0) {
+        LOG(EXTENSION_LOG_NOTICE, "Failed to log the engine stats to "
+                "file \"%s\" due to an error \"%s\"; Not critical because new "
+                "stats will be dumped later, please ignore.",
+            next_fname.c_str(), strerror(errno));
+        rv = false;
+    }
+    fclose(new_stats);
+
+    if (rv) {
+        std::string old_fname = dbname + "/stats.json.old";
+        std::string stats_fname = dbname + "/stats.json";
+        if (access(old_fname.c_str(), F_OK) == 0 && remove(old_fname.c_str()) != 0) {
+            LOG(EXTENSION_LOG_WARNING, "Failed to remove '%s': %s",
+                old_fname.c_str(), strerror(errno));
+            remove(next_fname.c_str());
+            rv = false;
+        } else if (access(stats_fname.c_str(), F_OK) == 0 &&
+                   rename(stats_fname.c_str(), old_fname.c_str()) != 0) {
+            LOG(EXTENSION_LOG_WARNING,
+                "Failed to rename '%s' to '%s': %s",
+                stats_fname.c_str(), old_fname.c_str(), strerror(errno));
+            remove(next_fname.c_str());
+            rv = false;
+        } else if (rename(next_fname.c_str(), stats_fname.c_str()) != 0) {
+            LOG(EXTENSION_LOG_WARNING,
+                "Failed to rename '%s' to '%s': %s",
+                next_fname.c_str(), stats_fname.c_str(), strerror(errno));
+            remove(next_fname.c_str());
+            rv = false;
+        }
+    }
+
+    return rv;
 }
 
-void AllKeysCB::addtoAllKeys(uint16_t len, char *buf) {
-    if (length + len + sizeof(uint16_t) > buffersize) {
-        buffersize *= 2;
-        char *temp = (char *) malloc (buffersize);
-        memcpy (temp, buffer, length);
-        free (buffer);
-        buffer = temp;
-    }
-    len = htons(len);
-    memcpy (buffer + length, &len, sizeof(uint16_t));
-    len = ntohs(len);
-    memcpy (buffer + length + sizeof(uint16_t), buf, len);
-    length += len + sizeof(uint16_t);
+std::string vbucket_state::toJSON() const {
+    std::stringstream jsonState;
+    jsonState << "{\"state\": \"" << VBucket::toString(state) << "\""
+              << ",\"checkpoint_id\": \"" << checkpointId << "\""
+              << ",\"max_deleted_seqno\": \"" << maxDeletedSeqno << "\""
+              << ",\"failover_table\": " << failovers
+              << ",\"snap_start\": \"" << lastSnapStart << "\""
+              << ",\"snap_end\": \"" << lastSnapEnd << "\""
+              << ",\"max_cas\": \"" << maxCas << "\""
+              << ",\"drift_counter\": \"" << driftCounter << "\""
+              << "}";
+
+    return jsonState.str();
 }
 
-void NotifyFlusherCB::callback(uint16_t &vb) {
-    if (shard->getBucket(vb)) {
-        shard->notifyFlusher();
+IORequest::IORequest(uint16_t vbId, MutationRequestCallback &cb , bool del,
+                     const std::string &itmKey)
+    : vbucketId(vbId), deleteItem(del), key(itmKey) {
+
+    if (del) {
+        callback.delCb = cb.delCb;
+    } else {
+        callback.setCb = cb.setCb;
     }
+
+    start = gethrtime();
 }

@@ -24,30 +24,10 @@
 #include <set>
 #include <string>
 
-#include "common.h"
 #include "item.h"
+#include "kvstore.h"
 #include "stats.h"
-
-class VBucketBGFetchItem {
-public:
-    VBucketBGFetchItem(const void *c, bool meta_only) :
-        cookie(c), initTime(gethrtime()), metaDataOnly(meta_only)
-    { }
-    ~VBucketBGFetchItem() {}
-
-    void delValue() {
-        delete value.getValue();
-        value.setValue(NULL);
-    }
-
-    GetValue value;
-    const void * cookie;
-    hrtime_t initTime;
-    bool metaDataOnly;
-};
-
-typedef unordered_map<std::string, std::list<VBucketBGFetchItem *> > vb_bgfetch_queue_t;
-typedef std::pair<std::string, VBucketBGFetchItem *> bgfetched_item_t;
+#include "vbucket.h"
 
 // Forward declarations.
 class EventuallyPersistentStore;
@@ -62,10 +42,11 @@ class BgFetcher {
 public:
     static const double sleepInterval;
     /**
-     * Construct a BgFetcher task.
+     * Construct a BgFetcher
      *
-     * @param s the store
-     * @param d the dispatcher
+     * @param s  The store
+     * @param k  The shard to which this background fetcher belongs
+     * @param st reference to statistics
      */
     BgFetcher(EventuallyPersistentStore *s, KVShard *k, EPStats &st) :
         store(s), shard(k), taskId(0), stats(st), pendingFetch(false) {}
@@ -73,7 +54,7 @@ public:
         LockHolder lh(queueMutex);
         if (!pendingVbs.empty()) {
             LOG(EXTENSION_LOG_DEBUG,
-                    "Warning: terminating database reader without completing "
+                    "Terminating database reader without completing "
                     "background fetches for %ld vbuckets.\n", pendingVbs.size());
             pendingVbs.clear();
         }
@@ -85,14 +66,14 @@ public:
     bool pendingJob(void);
     void notifyBGEvent(void);
     void setTaskId(size_t newId) { taskId = newId; }
-    void addPendingVB(uint16_t vbId) {
+    void addPendingVB(VBucket::id_type vbId) {
         LockHolder lh(queueMutex);
         pendingVbs.insert(vbId);
     }
 
 private:
-    size_t doFetch(uint16_t vbId);
-    void clearItems(uint16_t vbId);
+    size_t doFetch(VBucket::id_type vbId);
+    void clearItems(VBucket::id_type vbId);
 
     EventuallyPersistentStore *store;
     KVShard *shard;
@@ -102,7 +83,7 @@ private:
     EPStats &stats;
 
     AtomicValue<bool> pendingFetch;
-    std::set<uint16_t> pendingVbs;
+    std::set<VBucket::id_type> pendingVbs;
 };
 
 #endif  // SRC_BGFETCHER_H_

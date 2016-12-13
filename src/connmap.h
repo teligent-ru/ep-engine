@@ -20,6 +20,7 @@
 
 #include "config.h"
 
+#include <climits>
 #include <iterator>
 #include <list>
 #include <map>
@@ -27,17 +28,18 @@
 #include <string>
 #include <vector>
 
-#include "common.h"
+#include "ep_engine.h"
 #include "locks.h"
 #include "syncobject.h"
+#include "tapconnection.h"
 #include "atomicqueue.h"
+#include "dcp/consumer.h"
+#include "dcp/producer.h"
 
 // Forward declaration
 class ConnNotifier;
 class TapConsumer;
 class TapProducer;
-class DcpConsumer;
-class DcpProducer;
 class Item;
 class EventuallyPersistentEngine;
 
@@ -109,10 +111,10 @@ public:
 /**
  * Connection notifier type.
  */
-typedef enum {
+enum conn_notifier_type {
     TAP_CONN_NOTIFIER, //!< TAP connection notifier
     DCP_CONN_NOTIFIER  //!< DCP connection notifier
-} conn_notifier_type;
+};
 
 /**
  * A collection of tap or dcp connections.
@@ -176,6 +178,15 @@ public:
 
     virtual void shutdownAllConnections() = 0;
 
+    virtual bool isDeadConnectionsEmpty() {
+        return true;
+    }
+
+    bool isAllEmpty() {
+        LockHolder lh(connsLock);
+        return all.empty();
+    }
+
     void updateVBConnections(connection_t &conn,
                              const std::vector<uint16_t> &vbuckets);
 
@@ -188,9 +199,9 @@ public:
     void removeVBConnByVBId(connection_t &conn, int16_t vbid);
 
     /**
-     * Notify a given paused Producer.
+     * Notify a given paused connection.
      *
-     * @param tc Producer to be notified
+     * @param tc connection to be notified
      * @param schedule true if a notification event is pushed into a queue.
      *        Otherwise, directly notify the paused connection.
      */
@@ -218,7 +229,8 @@ protected:
     // ConnHandler objects is guarded by {releaseLock}.
     Mutex                                    connsLock;
 
-    std::map<const void*, connection_t>      map_;
+    using CookieToConnectionMap = std::map<const void*, connection_t>;
+    CookieToConnectionMap map_;
     std::list<connection_t>                  all;
 
     SpinLock *vbConnLocks;
@@ -301,11 +313,6 @@ public:
      */
     void notifyVBConnections(uint16_t vbid);
 
-    /**
-     * Set some backfilled events for a named conn.
-     */
-    bool setEvents(const std::string &name, std::list<queued_item> *q);
-
     void resetReplicaChain();
 
     /**
@@ -387,7 +394,12 @@ public:
         connection_t tc = findByName_UNLOCKED(name);
         if (tc.get()) {
             TapProducer *tp = dynamic_cast<TapProducer*>(tc.get());
-            cb_assert(tp != NULL);
+            if (tp == nullptr) {
+                throw std::logic_error(
+                        "TapConnMap::performOp: name (which is " + name +
+                        ") refers to a connection_t which is not a TapProducer. "
+                        "Connection logHeader is '" + tc.get()->logHeader() + "'");
+            }
             tapop.perform(tp, arg);
             lh.unlock();
             notifyPausedConnection(tp, false);
@@ -430,9 +442,7 @@ private:
 
 };
 
-
 class DcpConnMap : public ConnMap {
-
 public:
 
     DcpConnMap(EventuallyPersistentEngine &engine);
@@ -459,9 +469,31 @@ public:
 
     void removeVBConnections(connection_t &conn);
 
-    void vbucketStateChanged(uint16_t vbucket, vbucket_state_t state);
+    /**
+     * Close outbound (active) streams for a vbucket whenever a state
+     * change is detected. In case of failovers, close inbound (passive)
+     * streams as well.
+     *
+     * @param vbucket the vbucket id
+     * @param state the new state of the vbucket
+     * @closeInboundStreams bool flag indicating failover
+     */
+    void vbucketStateChanged(uint16_t vbucket, vbucket_state_t state,
+                             bool closeInboundStreams = true);
 
     void shutdownAllConnections();
+
+    bool isDeadConnectionsEmpty() {
+        LockHolder lh(connsLock);
+        return deadConnections.empty();
+    }
+
+    /**
+     * Handles the slow stream with the specified name.
+     * Returns true if the stream dropped its cursors on the
+     * checkpoint.
+     */
+    bool handleSlowStream(uint16_t vbid, const std::string &name);
 
     void disconnect(const void *cookie);
 
@@ -473,38 +505,58 @@ public:
 
     void updateMaxActiveSnoozingBackfills(size_t maxDataSize);
 
-    uint16_t getNumActiveSnoozingBackfills () const {
+    uint16_t getNumActiveSnoozingBackfills () {
+        SpinLockHolder lh(&numBackfillsLock);
         return numActiveSnoozingBackfills;
     }
 
-    uint16_t getMaxActiveSnoozingBackfills () const {
+    uint16_t getMaxActiveSnoozingBackfills () {
+        SpinLockHolder lh(&numBackfillsLock);
         return maxActiveSnoozingBackfills;
     }
 
-    size_t getAggrDcpConsumerBufferSize () const {
-        return aggrDcpConsumerBufferSize.load();
-    }
-
-    void incAggrDcpConsumerBufferSize (size_t bufSize) {
-        aggrDcpConsumerBufferSize.fetch_add(bufSize);
-    }
-
-    void decAggrDcpConsumerBufferSize (size_t bufSize) {
-        aggrDcpConsumerBufferSize.fetch_sub(bufSize);
-    }
-
-    ENGINE_ERROR_CODE addPassiveStream(ConnHandler* conn, uint32_t opaque,
+    ENGINE_ERROR_CODE addPassiveStream(ConnHandler& conn, uint32_t opaque,
                                        uint16_t vbucket, uint32_t flags);
 
-private:
+    /* Use this only for any quick direct stats from DcpConnMap. To collect
+       individual conn stats from conn lists please use ConnStatBuilder */
+    void addStats(ADD_STAT add_stat, const void *c);
+
+    /* Updates the minimum compression ratio to be achieved for docs by
+     * all the producers, which will be in effect if the producer side
+     * value compression is enabled */
+    void updateMinCompressionRatioForProducers(float value);
+
+    float getMinCompressionRatio();
+
+protected:
+    /*
+     * deadConnections is protected (as opposed to private) because
+     * of the module test ep-engine_dead_connections_test
+     */
+    std::list<connection_t> deadConnections;
+
+    /*
+     * Change the value at which a DcpConsumer::Processor task will yield
+     */
+    void consumerYieldConfigChanged(size_t newValue);
+
+    /*
+     * Change the batchsize that the DcpConsumer::Processor operates with
+     */
+    void consumerBatchSizeConfigChanged(size_t newValue);
 
     bool isPassiveStreamConnected_UNLOCKED(uint16_t vbucket);
 
-    void disconnect_UNLOCKED(const void *cookie);
+    /*
+     * Closes all streams associated with each connection in `map`.
+     */
+    static void closeStreams(CookieToConnectionMap& map);
 
-    void closeAllStreams_UNLOCKED();
-
-    std::list<connection_t> deadConnections;
+    /*
+     * Cancels all tasks assocuated with each connection in `map`.
+     */
+    static void cancelTasks(CookieToConnectionMap& map);
 
     SpinLock numBackfillsLock;
     /* Db file memory */
@@ -515,8 +567,20 @@ private:
     static const uint16_t numBackfillsThreshold;
     /* Max percentage of memory we want backfills to occupy */
     static const uint8_t numBackfillsMemThreshold;
+
+    AtomicValue<float> minCompressionRatioForProducer;
+
     /* Total memory used by all DCP consumer buffers */
     AtomicValue<size_t> aggrDcpConsumerBufferSize;
+
+    class DcpConfigChangeListener : public ValueChangedListener {
+    public:
+        DcpConfigChangeListener(DcpConnMap& connMap);
+        virtual ~DcpConfigChangeListener() { }
+        virtual void sizeValueChanged(const std::string &key, size_t value);
+    private:
+        DcpConnMap& myConnMap;
+    };
 };
 
 

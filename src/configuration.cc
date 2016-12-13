@@ -1,6 +1,6 @@
 /* -*- Mode: C++; tab-width: 4; c-basic-offset: 4; indent-tabs-mode: nil -*- */
 /*
- *     Copyright 2011 Couchbase, Inc
+ *     Copyright 2015 Couchbase, Inc
  *
  *   Licensed under the Apache License, Version 2.0 (the "License");
  *   you may not use this file except in compliance with the License.
@@ -45,7 +45,12 @@ std::string Configuration::getString(const std::string &key) const {
     if ((iter = attributes.find(key)) == attributes.end()) {
         return std::string();
     }
-    cb_assert(iter->second.datatype == DT_STRING);
+    if (iter->second.datatype != DT_STRING) {
+        throw std::invalid_argument("Configuration::getString: key (which is " +
+                        std::to_string(iter->second.datatype) +
+                        ") is not DT_STRING");
+    }
+
     if (iter->second.val.v_string) {
         return std::string(iter->second.val.v_string);
     }
@@ -60,7 +65,11 @@ bool Configuration::getBool(const std::string &key) const {
     if ((iter = attributes.find(key)) == attributes.end()) {
         return false;
     }
-    cb_assert(iter->second.datatype == DT_BOOL);
+    if (iter->second.datatype != DT_BOOL) {
+        throw std::invalid_argument("Configuration::getBool: key (which is " +
+                        std::to_string(iter->second.datatype) +
+                        ") is not DT_BOOL");
+    }
     return iter->second.val.v_bool;
 }
 
@@ -72,7 +81,11 @@ float Configuration::getFloat(const std::string &key) const {
     if ((iter = attributes.find(key)) == attributes.end()) {
         return 0;
     }
-    cb_assert(iter->second.datatype == DT_FLOAT);
+    if (iter->second.datatype != DT_FLOAT) {
+        throw std::invalid_argument("Configuration::getFloat: key (which is " +
+                        std::to_string(iter->second.datatype) +
+                        ") is not DT_FLOAT");
+    }
     return iter->second.val.v_float;
 }
 
@@ -84,7 +97,11 @@ size_t Configuration::getInteger(const std::string &key) const {
     if ((iter = attributes.find(key)) == attributes.end()) {
         return 0;
     }
-    cb_assert(iter->second.datatype == DT_SIZE);
+    if (iter->second.datatype != DT_SIZE) {
+        throw std::invalid_argument("Configuration::getInteger: key (which is " +
+                        std::to_string(iter->second.datatype) +
+                        ") is not DT_SIZE");
+    }
     return iter->second.val.v_size;
 }
 
@@ -96,7 +113,11 @@ ssize_t Configuration::getSignedInteger(const std::string &key) const {
     if ((iter = attributes.find(key)) == attributes.end()) {
         return 0;
     }
-    cb_assert(iter->second.datatype == DT_SSIZE);
+    if (iter->second.datatype != DT_SSIZE) {
+        throw std::invalid_argument("Configuration::getSignedInteger: key "
+                        "(which is " + std::to_string(iter->second.datatype) +
+                        ") is not DT_SSIZE");
+    }
     return iter->second.val.v_ssize;
 }
 
@@ -146,9 +167,7 @@ void Configuration::setParameter(const std::string &key, bool value) {
     std::map<std::string, value_t>::iterator validator = attributes.find(key);
     if (validator != attributes.end()) {
         if (validator->second.validator != NULL) {
-            if (!validator->second.validator->validateBool(key, value)) {
-                throw std::runtime_error("value out of range.");
-            }
+            validator->second.validator->validateBool(key, value);
         }
     }
     attributes[key].datatype = DT_BOOL;
@@ -166,9 +185,7 @@ void Configuration::setParameter(const std::string &key, size_t value) {
     std::map<std::string, value_t>::iterator validator = attributes.find(key);
     if (validator != attributes.end()) {
         if (validator->second.validator != NULL) {
-            if (!validator->second.validator->validateSize(key, value)) {
-                throw std::runtime_error("value out of range.");
-            }
+            validator->second.validator->validateSize(key, value);
         }
     }
     attributes[key].datatype = DT_SIZE;
@@ -191,9 +208,7 @@ void Configuration::setParameter(const std::string &key, ssize_t value) {
     std::map<std::string, value_t>::iterator validator = attributes.find(key);
     if (validator != attributes.end()) {
         if (validator->second.validator != NULL) {
-            if (!validator->second.validator->validateSSize(key, value)) {
-                throw std::runtime_error("value out of range.");
-            }
+            validator->second.validator->validateSSize(key, value);
         }
     }
     attributes[key].datatype = DT_SSIZE;
@@ -217,9 +232,7 @@ void Configuration::setParameter(const std::string &key, float value) {
     std::map<std::string, value_t>::iterator validator = attributes.find(key);
     if (validator != attributes.end()) {
         if (validator->second.validator != NULL) {
-            if (!validator->second.validator->validateFloat(key, value)) {
-                throw std::runtime_error("value out of range.");
-            }
+            validator->second.validator->validateFloat(key, value);
         }
     }
 
@@ -247,9 +260,7 @@ void Configuration::setParameter(const std::string &key, const char *value) {
     std::map<std::string, value_t>::iterator validator = attributes.find(key);
     if (validator != attributes.end()) {
         if (validator->second.validator != NULL) {
-            if (!validator->second.validator->validateString(key, value)) {
-                throw std::runtime_error("value out of range.");
-            }
+            validator->second.validator->validateString(key, value);
         }
     }
 
@@ -281,7 +292,7 @@ void Configuration::addValueChangedListener(const std::string &key,
 
 ValueChangedValidator *Configuration::setValueValidator(const std::string &key,
                                             ValueChangedValidator *validator) {
-    ValueChangedValidator *ret = 0;
+    ValueChangedValidator *ret = nullptr;
     LockHolder lh(mutex);
     if (attributes.find(key) != attributes.end()) {
         ret = attributes[key].validator;
@@ -298,7 +309,7 @@ void Configuration::addStats(ADD_STAT add_stat, const void *c) const {
         std::stringstream value;
         switch (iter->second.datatype) {
         case DT_BOOL:
-            value << iter->second.val.v_bool;
+            value << std::boolalpha << iter->second.val.v_bool << std::noboolalpha;
             break;
         case DT_STRING:
             value << iter->second.val.v_string;

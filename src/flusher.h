@@ -24,11 +24,10 @@
 #include <map>
 #include <queue>
 #include <string>
-#include <vector>
 
-#include "common.h"
 #include "ep.h"
 #include "executorthread.h"
+#include "utility.h"
 
 #define NO_VBUCKETS_INSTANTIATED 0xFFFF
 #define RETRY_FLUSH_VBUCKET (-1)
@@ -52,10 +51,11 @@ class KVShard;
 class Flusher {
 public:
 
-    Flusher(EventuallyPersistentStore *st, KVShard *k) :
+    Flusher(EventuallyPersistentStore *st, KVShard *k, uint16_t commitInt) :
         store(st), _state(initializing), taskId(0), minSleepTime(0.1),
-        forceShutdownReceived(false), doHighPriority(false),
-        numHighPriority(0), pendingMutation(false), shard(k) { }
+        initCommitInterval(commitInt), currCommitInterval(commitInt),
+        forceShutdownReceived(false), doHighPriority(false), numHighPriority(0),
+        pendingMutation(false), shard(k) { }
 
     ~Flusher() {
         if (_state != stopped) {
@@ -69,7 +69,6 @@ public:
     void wait();
     bool pause();
     bool resume();
-    void initialize(size_t tid);
     void start();
     void wake(void);
     bool step(GlobalTask *task);
@@ -89,10 +88,21 @@ public:
     void setTaskId(size_t newId) { taskId = newId; }
     void setMinSleepTime(double val);
 
+    uint16_t getCommitInterval(void) {
+        return currCommitInterval;
+    }
+
+    uint16_t decrCommitInterval(void);
+
+    void resetCommitInterval(void) {
+        currCommitInterval = initCommitInterval;
+    }
+
 private:
     bool transition_state(enum flusher_state to);
     void flushVB();
     void completeFlush();
+    void initialize();
     void schedule_UNLOCKED();
     double getMinSleepTime();
 
@@ -104,10 +114,15 @@ private:
 
     EventuallyPersistentStore   *store;
     AtomicValue<enum flusher_state> _state;
+
+    // Used for serializaling attempts to start the flusher from
+    // different threads.
     Mutex                        taskMutex;
-    size_t                       taskId;
+    AtomicValue<size_t>      taskId;
 
     double                   minSleepTime;
+    uint16_t                 initCommitInterval;
+    uint16_t                 currCommitInterval;
     rel_time_t               flushStart;
     AtomicValue<bool> forceShutdownReceived;
     std::queue<uint16_t> hpVbs;

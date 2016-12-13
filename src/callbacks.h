@@ -23,6 +23,8 @@
 #include <string>
 
 #include "locks.h"
+#include "syncobject.h"
+#include "utility.h"
 
 class Item;
 
@@ -103,7 +105,7 @@ private:
 /**
  * Interface for callbacks from storage APIs.
  */
-template <typename RV>
+template <typename... RV>
 class Callback {
 public:
 
@@ -114,7 +116,7 @@ public:
     /**
      * Method called on callback.
      */
-    virtual void callback(RV &value) = 0;
+    virtual void callback(RV&... value) = 0;
 
     virtual void setStatus(int status) {
         myStatus = status;
@@ -151,10 +153,10 @@ public:
      * The callback implementation -- just store a value.
      */
     void callback(T &value) {
-        LockHolder lh(so);
+        std::unique_lock<std::mutex> lh(so);
         val = value;
         fired = true;
-        so.notify();
+        so.notify_all();
     }
 
     /**
@@ -165,11 +167,14 @@ public:
      * to arrive.
      */
     void waitForValue() {
-        LockHolder lh(so);
+        std::unique_lock<std::mutex> lh(so);
         if (!fired) {
-            so.wait();
+            so.wait(lh);
         }
-        cb_assert(fired);
+        if (!fired) {
+            throw std::logic_error("RememberingCallback::waitForValue: "
+                    "fired is false even after waiting on sync object");
+        }
     }
 
     /**

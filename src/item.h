@@ -28,6 +28,8 @@
 #include <string>
 
 #include "atomic.h"
+#include "compress.h"
+#include "ep_time.h"
 #include "locks.h"
 #include "mutex.h"
 #include "objectregistry.h"
@@ -72,7 +74,6 @@ public:
         size_t total_len = len + sizeof(Blob) + FLEX_DATA_OFFSET + ext_len;
         Blob *t = new (::operator new(total_len)) Blob(start, len, ext_meta,
                                                        ext_len);
-        cb_assert(t->vlength() == len);
         return t;
     }
 
@@ -90,7 +91,6 @@ public:
         size_t total_len = len + sizeof(Blob) + FLEX_DATA_OFFSET + ext_len;
         Blob *t = new (::operator new(total_len)) Blob(NULL, len, ext_meta,
                                                        ext_len);
-        cb_assert(t->vlength() == len);
         return t;
     }
 
@@ -106,7 +106,6 @@ public:
     static Blob* New(const size_t len, uint8_t ext_len) {
         size_t total_len = len + sizeof(Blob) + FLEX_DATA_OFFSET + ext_len;
         Blob *t = new (::operator new(total_len)) Blob(len, ext_len);
-        cb_assert(t->vlength() == len);
         return t;
     }
 
@@ -153,7 +152,6 @@ public:
      * Return the pointer to exteneded metadata, stored in the Blob.
      */
     const char* getExtMeta() const {
-        cb_assert(data);
         return extMetaLen > 0 ? data + FLEX_DATA_OFFSET : NULL;
     }
 
@@ -341,7 +339,9 @@ public:
         nru(nru_value),
         conflictResMode(conflict_res_value)
     {
-        cb_assert(bySeqno != 0);
+        if (bySeqno == 0) {
+            throw std::invalid_argument("Item(): bySeqno must be non-zero");
+        }
         ObjectRegistry::onCreateItem(this);
     }
 
@@ -370,7 +370,9 @@ public:
         nru(nru_value),
         conflictResMode(conflict_res_value)
     {
-        cb_assert(bySeqno != 0);
+        if (bySeqno == 0) {
+            throw std::invalid_argument("Item(): bySeqno must be non-zero");
+        }
         setData(static_cast<const char*>(dta), nb, ext_meta, ext_len);
         ObjectRegistry::onCreateItem(this);
     }
@@ -388,15 +390,16 @@ public:
        nru(nru_value),
        conflictResMode(conflict_res_value)
     {
-       cb_assert(bySeqno >= 0);
+       if (bySeqno < 0) {
+           throw std::invalid_argument("Item(): bySeqno must be non-negative");
+       }
        metaData.revSeqno = revSeq;
        ObjectRegistry::onCreateItem(this);
     }
 
     /* Copy constructor */
-    Item(const Item& other) :
+    Item(const Item& other, bool copyKeyOnly = false) :
         metaData(other.metaData),
-        value(other.value),
         key(other.key),
         bySeqno(other.bySeqno),
         queuedTime(other.queuedTime),
@@ -405,11 +408,69 @@ public:
         nru(other.nru),
         conflictResMode(other.conflictResMode)
     {
+        if (copyKeyOnly) {
+            setData(nullptr, 0, nullptr, 0);
+        } else {
+            value = other.value;
+        }
         ObjectRegistry::onCreateItem(this);
     }
 
     ~Item() {
         ObjectRegistry::onDeleteItem(this);
+    }
+
+    /* Snappy compress value and update datatype */
+    bool compressValue(float minCompressionRatio = 1.0) {
+        uint8_t datatype = getDataType();
+        if (datatype == PROTOCOL_BINARY_RAW_BYTES ||
+            datatype == PROTOCOL_BINARY_DATATYPE_JSON) {
+            // Attempt compression only if datatype indicates
+            // that the value is not compressed already.
+            snap_buf output;
+            snap_ret_t ret = doSnappyCompress(getData(), getNBytes(),
+                                              output);
+            if (ret == SNAP_SUCCESS) {
+                if (output.len > minCompressionRatio * getNBytes()) {
+                    // No point doing the compression if the desired
+                    // compression ratio isn't achieved.
+                    return true;
+                }
+                setData(output.buf.get(), output.len,
+                        (uint8_t *)(getExtMeta()),
+                        getExtMetaLen());
+                setDataType((datatype == PROTOCOL_BINARY_RAW_BYTES)
+                            ? PROTOCOL_BINARY_DATATYPE_COMPRESSED
+                            : PROTOCOL_BINARY_DATATYPE_COMPRESSED_JSON);
+            } else {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /* Snappy uncompress value and update datatype */
+    bool decompressValue() {
+        uint8_t datatype = getDataType();
+        if (datatype == PROTOCOL_BINARY_DATATYPE_COMPRESSED ||
+            datatype == PROTOCOL_BINARY_DATATYPE_COMPRESSED_JSON) {
+            // Attempt decompression only if datatype indicates
+            // that the value is compressed.
+            snap_buf output;
+            snap_ret_t ret = doSnappyUncompress(getData(), getNBytes(),
+                                                output);
+            if (ret == SNAP_SUCCESS) {
+                setData(output.buf.get(), output.len,
+                        (uint8_t *)(getExtMeta()),
+                        getExtMetaLen());
+                setDataType((datatype == PROTOCOL_BINARY_DATATYPE_COMPRESSED)
+                            ? PROTOCOL_BINARY_RAW_BYTES
+                            : PROTOCOL_BINARY_DATATYPE_JSON);
+            } else {
+                return false;
+            }
+        }
+        return true;
     }
 
     const char *getData() const {
@@ -569,10 +630,6 @@ public:
 
     uint32_t getQueuedTime(void) const { return queuedTime; }
 
-    void setQueuedTime(uint32_t queued_time) {
-        queuedTime = queued_time;
-    }
-
     enum queue_operation getOperation(void) const {
         return static_cast<enum queue_operation>(op);
     }
@@ -601,6 +658,15 @@ public:
         return gethrtime() + (++casCounter);
     }
 
+    /* Returns true if the specified CAS is valid */
+    static bool isValidCas(const uint64_t& itmCas) {
+        if (itmCas == 0 || itmCas == static_cast<uint64_t>(-1)) {
+            return false;
+        }
+        return true;
+    }
+
+
     void setConflictResMode(enum conflict_resolution_mode conf_res_value) {
         conflictResMode = static_cast<uint8_t>(conf_res_value);
     }
@@ -622,7 +688,6 @@ private:
         } else {
             data = Blob::New(dta, nb, ext_meta, ext_len);
         }
-        cb_assert(data);
         value.reset(data);
     }
 
@@ -644,7 +709,7 @@ private:
 typedef SingleThreadedRCPtr<Item> queued_item;
 
 /**
- * Order queued_item objects pointed by shared_ptr by their keys.
+ * Order queued_item objects pointed by std::shared_ptr by their keys.
  */
 class CompareQueuedItemsByKey {
 public:

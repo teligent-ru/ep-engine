@@ -1,6 +1,6 @@
 /* -*- Mode: C++; tab-width: 4; c-basic-offset: 4; indent-tabs-mode: nil -*- */
 /*
- *     Copyright 2014 Couchbase, Inc.
+ *     Copyright 2015 Couchbase, Inc.
  *
  *   Licensed under the Apache License, Version 2.0 (the "License");
  *   you may not use this file except in compliance with the License.
@@ -65,18 +65,19 @@ void TaskQueue::_doWake_UNLOCKED(size_t &numToWake) {
     if (sleepers && numToWake)  {
         if (numToWake < sleepers) {
             for (; numToWake; --numToWake) {
-                mutex.notifyOne(); // cond_signal 1
+                mutex.notify_one(); // cond_signal 1
             }
         } else {
-            mutex.notify(); // cond_broadcast
+            mutex.notify_all(); // cond_broadcast
             numToWake -= sleepers;
         }
     }
 }
 
-bool TaskQueue::_doSleep(ExecutorThread &t) {
-    gettimeofday(&t.now, NULL);
-    if (less_tv(t.now, t.waketime) && manager->trySleep(queueType)) {
+bool TaskQueue::_doSleep(ExecutorThread &t,
+                         std::unique_lock<std::mutex>& lock) {
+    t.now = gethrtime();
+    if (t.now < t.waketime && manager->trySleep(queueType)) {
         // Atomically switch from running to sleeping; iff we were previously
         // running.
         executor_state_t expected_state = EXECUTOR_RUNNING;
@@ -86,12 +87,12 @@ bool TaskQueue::_doSleep(ExecutorThread &t) {
         }
         sleepers++;
         // zzz....
-        struct timeval waketime = t.now;
-        advance_tv(waketime, MIN_SLEEP_TIME); // avoid sleeping more than this
-        if (less_tv(waketime, t.waketime)) { // to prevent losing posts
-            mutex.wait(waketime);
+        hrtime_t snooze_nsecs = t.waketime - t.now;
+
+        if (snooze_nsecs > MIN_SLEEP_TIME * 1000000000) {
+            mutex.wait_for(lock, MIN_SLEEP_TIME);
         } else {
-            mutex.wait(t.waketime);
+            mutex.wait_for(lock, snooze_nsecs);
         }
         // ... woke!
         sleepers--;
@@ -104,29 +105,29 @@ bool TaskQueue::_doSleep(ExecutorThread &t) {
                                              EXECUTOR_RUNNING)) {
             return false;
         }
-        gettimeofday(&t.now, NULL);
+        t.now = gethrtime();
     }
-    set_max_tv(t.waketime);
+    t.waketime = hrtime_t(-1);
     return true;
 }
 
 bool TaskQueue::_fetchNextTask(ExecutorThread &t, bool toSleep) {
     bool ret = false;
-    LockHolder lh(mutex);
+    std::unique_lock<std::mutex> lh(mutex);
 
-    if (toSleep && !_doSleep(t)) {
+    if (toSleep && !_doSleep(t, lh)) {
         return ret; // shutting down
     }
 
     size_t numToWake = _moveReadyTasks(t.now);
 
     if (!futureQueue.empty() && t.startIndex == queueType &&
-        less_tv(futureQueue.top()->waketime, t.waketime)) {
-        t.waketime = futureQueue.top()->waketime; // record earliest waketime
+        futureQueue.top()->getWaketime() < t.waketime) {
+        t.waketime = futureQueue.top()->getWaketime(); // record earliest waketime
     }
 
     if (!readyQueue.empty() && readyQueue.top()->isdead()) {
-        t.currentTask = _popReadyTask(); // clean out dead tasks first
+        t.setCurrentTask(_popReadyTask()); // clean out dead tasks first
         ret = true;
     } else if (!readyQueue.empty() || !pendingQueue.empty()) {
         t.curTaskType = manager->tryNewWork(queueType);
@@ -138,14 +139,13 @@ bool TaskQueue::_fetchNextTask(ExecutorThread &t, bool toSleep) {
             _checkPendingQueue();
 
             ExTask tid = _popReadyTask(); // and pop out the top task
-            t.currentTask = tid; // assign task to thread
+            t.setCurrentTask(tid);
             ret = true;
         } else if (!readyQueue.empty()) { // We hit limit on max # workers
             ExTask tid = _popReadyTask(); // that can work on current Q type!
             pendingQueue.push_back(tid);
             numToWake = numToWake ? numToWake - 1 : 0; // 1 fewer task ready
         } else { // Let the task continue waiting in pendingQueue
-            cb_assert(!pendingQueue.empty());
             numToWake = numToWake ? numToWake - 1 : 0; // 1 fewer task ready
         }
     }
@@ -158,12 +158,12 @@ bool TaskQueue::_fetchNextTask(ExecutorThread &t, bool toSleep) {
 
 bool TaskQueue::fetchNextTask(ExecutorThread &thread, bool toSleep) {
     EventuallyPersistentEngine *epe = ObjectRegistry::onSwitchThread(NULL, true);
-    size_t rv = _fetchNextTask(thread, toSleep);
+    bool rv = _fetchNextTask(thread, toSleep);
     ObjectRegistry::onSwitchThread(epe);
     return rv;
 }
 
-size_t TaskQueue::_moveReadyTasks(struct timeval tv) {
+size_t TaskQueue::_moveReadyTasks(hrtime_t tv) {
     if (!readyQueue.empty()) {
         return 0;
     }
@@ -171,7 +171,7 @@ size_t TaskQueue::_moveReadyTasks(struct timeval tv) {
     size_t numReady = 0;
     while (!futureQueue.empty()) {
         ExTask tid = futureQueue.top();
-        if (less_eq_tv(tid->waketime, tv)) {
+        if (tid->getWaketime() <= tv) {
             futureQueue.pop();
             readyQueue.push(tid);
             numReady++;
@@ -195,25 +195,25 @@ void TaskQueue::_checkPendingQueue(void) {
     }
 }
 
-struct timeval TaskQueue::_reschedule(ExTask &task, task_type_t &curTaskType) {
-    struct timeval waktime;
+hrtime_t TaskQueue::_reschedule(ExTask &task, task_type_t &curTaskType) {
+    hrtime_t wakeTime;
     manager->doneWork(curTaskType);
 
     LockHolder lh(mutex);
 
     futureQueue.push(task);
     if (curTaskType == queueType) {
-        waktime = futureQueue.top()->waketime;
+        wakeTime = futureQueue.top()->getWaketime();
     } else {
-        set_max_tv(waktime);
+        wakeTime = hrtime_t(-1);
     }
 
-    return waktime;
+    return wakeTime;
 }
 
-struct timeval TaskQueue::reschedule(ExTask &task, task_type_t &curTaskType) {
+hrtime_t TaskQueue::reschedule(ExTask &task, task_type_t &curTaskType) {
     EventuallyPersistentEngine *epe = ObjectRegistry::onSwitchThread(NULL, true);
-    struct timeval rv = _reschedule(task, curTaskType);
+    hrtime_t rv = _reschedule(task, curTaskType);
     ObjectRegistry::onSwitchThread(epe);
     return rv;
 }
@@ -223,8 +223,8 @@ void TaskQueue::_schedule(ExTask &task) {
 
     futureQueue.push(task);
 
-    LOG(EXTENSION_LOG_DEBUG, "%s: Schedule a task \"%s\" id %d",
-            name.c_str(), task->getDescription().c_str(), task->getId());
+    LOG(EXTENSION_LOG_DEBUG, "%s: Schedule a task \"%s\" id %" PRIu64,
+        name.c_str(), task->getDescription().c_str(), uint64_t(task->getId()));
 
     size_t numToWake = 1;
     TaskQueue *sleepQ = manager->getSleepQ(queueType);
@@ -242,13 +242,12 @@ void TaskQueue::schedule(ExTask &task) {
 }
 
 void TaskQueue::_wake(ExTask &task) {
-    struct  timeval    now;
     size_t numReady = 0;
-    gettimeofday(&now, NULL);
+    const hrtime_t now = gethrtime();
 
     LockHolder lh(mutex);
-    LOG(EXTENSION_LOG_DEBUG, "%s: Wake a task \"%s\" id %d", name.c_str(),
-            task->getDescription().c_str(), task->getId());
+    LOG(EXTENSION_LOG_DEBUG, "%s: Wake a task \"%s\" id %" PRIu64,
+        name.c_str(), task->getDescription().c_str(), uint64_t(task->getId()));
 
     // MB-9986: Re-sort futureQueue for now. TODO: avoid this O(N) overhead
     std::queue<ExTask> notReady;
@@ -271,22 +270,21 @@ void TaskQueue::_wake(ExTask &task) {
     }
 
     // Note that this task that we are waking may nor may not be blocked in Q
-    task->waketime = now;
+    task->updateWaketime(now);
     task->setState(TASK_RUNNING, TASK_SNOOZED);
 
     while (!notReady.empty()) {
         ExTask tid = notReady.front();
-        if (less_eq_tv(tid->waketime, now) || tid->isdead()) {
-            readyQueue.push(tid);
+        if (tid->getWaketime() <= now || tid->isdead()) {
             numReady++;
-        } else {
-            futureQueue.push(tid);
         }
+
+        // MB-18453: Only push to the futureQueue
+        futureQueue.push(tid);
         notReady.pop();
     }
 
     if (numReady) {
-        manager->addWork(numReady, queueType);
         _doWake_UNLOCKED(numReady);
         TaskQueue *sleepQ = manager->getSleepQ(queueType);
         lh.unlock();

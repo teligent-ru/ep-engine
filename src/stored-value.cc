@@ -1,6 +1,6 @@
 /* -*- Mode: C++; tab-width: 4; c-basic-offset: 4; indent-tabs-mode: nil -*- */
 /*
- *     Copyright 2010 Couchbase, Inc
+ *     Copyright 2015 Couchbase, Inc
  *
  *   Licensed under the Apache License, Version 2.0 (the "License");
  *   you may not use this file except in compliance with the License.
@@ -117,7 +117,7 @@ bool StoredValue::unlocked_restoreMeta(Item *itm, ENGINE_ERROR_CODE status,
         exptime = itm->getExptime();
         revSeqno = itm->getRevSeqno();
         if (itm->isDeleted()) {
-            setStoredValueState(state_deleted_key);
+            setDeleted();
         } else { // Regular item with the full eviction
             --ht.numTempItems;
             ++ht.numItems;
@@ -133,7 +133,7 @@ bool StoredValue::unlocked_restoreMeta(Item *itm, ENGINE_ERROR_CODE status,
         conflictResMode = itm->getConflictResMode();
         return true;
     case ENGINE_KEY_ENOENT:
-        setStoredValueState(state_non_existent_key);
+        setNonExistent();
         return true;
     default:
         LOG(EXTENSION_LOG_WARNING,
@@ -144,7 +144,10 @@ bool StoredValue::unlocked_restoreMeta(Item *itm, ENGINE_ERROR_CODE status,
 
 bool HashTable::unlocked_ejectItem(StoredValue*& vptr,
                                    item_eviction_policy_t policy) {
-    cb_assert(vptr);
+    if (vptr == nullptr) {
+        throw std::invalid_argument("HashTable::unlocked_ejectItem: "
+                "Unable to delete NULL StoredValue");
+    }
 
     if (policy == VALUE_ONLY) {
         bool rv = vptr->ejectValue(*this, policy);
@@ -202,7 +205,10 @@ bool HashTable::unlocked_ejectItem(StoredValue*& vptr,
 
 mutation_type_t HashTable::insert(Item &itm, item_eviction_policy_t policy,
                                   bool eject, bool partial) {
-    cb_assert(isActive());
+    if (!isActive()) {
+        throw std::logic_error("HashTable::insert: Cannot call on a "
+                "non-active object");
+    }
     if (!StoredValue::hasAvailableSpace(stats, itm)) {
         return NOMEM;
     }
@@ -296,7 +302,10 @@ HashTableStatVisitor HashTable::clear(bool deactivate) {
 
     if (!deactivate) {
         // If not deactivating, assert we're already active.
-        cb_assert(isActive());
+        if (!isActive()) {
+            throw std::logic_error("HashTable::clear: Cannot call on a "
+                    "non-active object");
+        }
     }
     MultiLockHolder mlh(mutexes, n_locks);
     if (deactivate) {
@@ -312,7 +321,6 @@ HashTableStatVisitor HashTable::clear(bool deactivate) {
     }
 
     stats.currentSize.fetch_sub(rv.memSize - rv.valSize);
-    cb_assert(stats.currentSize.load() < GIGANTOR);
 
     numTotalItems.store(0);
     numItems.store(0);
@@ -325,7 +333,10 @@ HashTableStatVisitor HashTable::clear(bool deactivate) {
 }
 
 void HashTable::resize(size_t newSize) {
-    cb_assert(isActive());
+    if (!isActive()) {
+        throw std::logic_error("HashTable::resize: Cannot call on a "
+                "non-active object");
+    }
 
     // Due to the way hashing works, we can't fit anything larger than
     // an int.
@@ -380,7 +391,6 @@ void HashTable::resize(size_t newSize) {
     values = newValues;
 
     stats.memOverhead.fetch_add(memorySize());
-    cb_assert(stats.memOverhead.load() < GIGANTOR);
 }
 
 static size_t distance(size_t a, size_t b) {
@@ -429,17 +439,37 @@ void HashTable::visit(HashTableVisitor &visitor) {
     if ((numItems.load() + numTempItems.load()) == 0 || !isActive()) {
         return;
     }
+
+    // Acquire one (any) of the mutexes before incrementing {visitors}, this
+    // prevents any race between this visitor and the HashTable resizer.
+    // See comments in pauseResumeVisit() for further details.
+    LockHolder lh(mutexes[0]);
     VisitorTracker vt(&visitors);
+    lh.unlock();
+
     bool aborted = !visitor.shouldContinue();
     size_t visited = 0;
     for (int l = 0; isActive() && !aborted && l < static_cast<int>(n_locks);
          l++) {
-        LockHolder lh(mutexes[l]);
         for (int i = l; i < static_cast<int>(size); i+= n_locks) {
-            cb_assert(l == mutexForBucket(i));
+            // (re)acquire mutex on each HashBucket, to minimise any impact
+            // on front-end threads.
+            LockHolder lh(mutexes[l]);
+
             StoredValue *v = values[i];
-            cb_assert(v == NULL || i == getBucketForHash(hash(v->getKeyBytes(),
-                                                           v->getKeyLen())));
+            if (v) {
+                // TODO: Perf: This check seems costly - do we think it's still
+                // worth keeping?
+                auto hashbucket = getBucketForHash(hash(v->getKeyBytes(),
+                                                        v->getKeyLen()));
+                if (i != hashbucket) {
+                    throw std::logic_error("HashTable::visit: inconsistency "
+                            "between StoredValue's calculated hashbucket "
+                            "(which is " + std::to_string(hashbucket) +
+                            ") and bucket is is located in (which is " +
+                            std::to_string(i) + ")");
+                }
+            }
             while (v) {
                 StoredValue *tmp = v->next;
                 visitor.visit(v);
@@ -450,7 +480,6 @@ void HashTable::visit(HashTableVisitor &visitor) {
         lh.unlock();
         aborted = !visitor.shouldContinue();
     }
-    cb_assert(aborted || visited == size);
 }
 
 void HashTable::visitDepth(HashTableDepthVisitor &visitor) {
@@ -465,8 +494,19 @@ void HashTable::visitDepth(HashTableDepthVisitor &visitor) {
         for (int i = l; i < static_cast<int>(size); i+= n_locks) {
             size_t depth = 0;
             StoredValue *p = values[i];
-            cb_assert(p == NULL || i == getBucketForHash(hash(p->getKeyBytes(),
-                                                           p->getKeyLen())));
+            if (p) {
+                // TODO: Perf: This check seems costly - do we think it's still
+                // worth keeping?
+                auto hashbucket = getBucketForHash(hash(p->getKeyBytes(),
+                                                        p->getKeyLen()));
+                if (i != hashbucket) {
+                    throw std::logic_error("HashTable::visit: inconsistency "
+                            "between StoredValue's calculated hashbucket "
+                            "(which is " + std::to_string(hashbucket) +
+                            ") and bucket it is located in (which is " +
+                            std::to_string(i) + ")");
+                }
+            }
             size_t mem(0);
             while (p) {
                 depth++;
@@ -477,8 +517,6 @@ void HashTable::visitDepth(HashTableDepthVisitor &visitor) {
             ++visited;
         }
     }
-
-    cb_assert(visited == size);
 }
 
 HashTable::Position
@@ -575,7 +613,8 @@ add_type_t HashTable::unlocked_add(int &bucket_num,
         }
 
         if (v) {
-            if (v->isTempInitialItem() && policy == FULL_EVICTION) {
+            if (v->isTempInitialItem() && policy == FULL_EVICTION
+                && maybeKeyExists) {
                 // Need to figure out if an item exists on disk
                 return ADD_BG_FETCH;
             }
@@ -633,7 +672,6 @@ add_type_t HashTable::unlocked_add(int &bucket_num,
             unlocked_ejectItem(v, policy);
         }
         if (v && v->isTempItem()) {
-            v->markNotResident();
             v->setNRUValue(MAX_NRU_VALUE);
         }
     }
@@ -646,7 +684,10 @@ add_type_t HashTable::unlocked_addTempItem(int &bucket_num,
                                            item_eviction_policy_t policy,
                                            bool isReplication) {
 
-    cb_assert(isActive());
+    if (!isActive()) {
+        throw std::logic_error("HashTable::unlocked_addTempItem: Cannot call on a "
+                "non-active object");
+    }
     uint8_t ext_meta[1];
     uint8_t ext_len = EXT_META_LEN;
     *(ext_meta) = PROTOCOL_BINARY_RAW_BYTES;
@@ -672,30 +713,22 @@ void StoredValue::setMutationMemoryThreshold(double memThreshold) {
 
 void StoredValue::increaseCacheSize(HashTable &ht, size_t by) {
     ht.cacheSize.fetch_add(by);
-    cb_assert(ht.cacheSize.load() < GIGANTOR);
     ht.memSize.fetch_add(by);
-    cb_assert(ht.memSize.load() < GIGANTOR);
 }
 
 void StoredValue::reduceCacheSize(HashTable &ht, size_t by) {
     ht.cacheSize.fetch_sub(by);
-    cb_assert(ht.cacheSize.load() < GIGANTOR);
     ht.memSize.fetch_sub(by);
-    cb_assert(ht.memSize.load() < GIGANTOR);
 }
 
 void StoredValue::increaseMetaDataSize(HashTable &ht, EPStats &st, size_t by) {
     ht.metaDataMemory.fetch_add(by);
-    cb_assert(ht.metaDataMemory.load() < GIGANTOR);
     st.currentSize.fetch_add(by);
-    cb_assert(st.currentSize.load() < GIGANTOR);
 }
 
 void StoredValue::reduceMetaDataSize(HashTable &ht, EPStats &st, size_t by) {
     ht.metaDataMemory.fetch_sub(by);
-    cb_assert(ht.metaDataMemory.load() < GIGANTOR);
     st.currentSize.fetch_sub(by);
-    cb_assert(st.currentSize.load() < GIGANTOR);
 }
 
 /**
@@ -707,7 +740,7 @@ bool StoredValue::hasAvailableSpace(EPStats &st, const Item &itm,
                                          sizeof(StoredValue) + itm.getNKey());
     double maxSize = static_cast<double>(st.getMaxDataSize());
     if (isReplication) {
-        return newSize <= (maxSize * st.tapThrottleThreshold);
+        return newSize <= (maxSize * st.replicationThrottleThreshold);
     } else {
         return newSize <= (maxSize * mutation_mem_threshold);
     }
@@ -728,6 +761,13 @@ Item* StoredValue::toItem(bool lck, uint16_t vbucket) const {
           static_cast<enum conflict_resolution_mode>(conflictResMode));
 
     return itm;
+}
+
+Item* StoredValue::toValuelessItem(uint16_t vbucket) const {
+    return new Item((void *)getKeyBytes(), getKeyLen(), getFlags(),
+                    getExptime(), NULL /* valuePtr */, 0 /* valuelen */,
+                    NULL /* ext_meta*/, 0 /* ext_len */, getCas(),
+                    getBySeqno(), vbucket, getRevSeqno());
 }
 
 void StoredValue::reallocate() {

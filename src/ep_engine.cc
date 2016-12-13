@@ -30,27 +30,38 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <platform/checked_snprintf.h>
 #include <string>
 #include <vector>
+#include <mutex>
+#include <memcached/extension.h>
+#include <JSON_checker.h>
 
 #include "backfill.h"
+#include "dcp/flow-control-manager.h"
 #include "ep_engine.h"
 #include "failover-table.h"
 #include "flusher.h"
 #include "connmap.h"
+#include "common.h"
 #include "htresizer.h"
+#include "logger.h"
 #include "memory_tracker.h"
 #include "stats-info.h"
 #define STATWRITER_NAMESPACE core_engine
 #include "statwriter.h"
 #undef STATWRITER_NAMESPACE
-#include "tapthrottle.h"
-#include "dcp-consumer.h"
-#include "dcp-producer.h"
+#include "replicationthrottle.h"
+#include "dcp/consumer.h"
+#include "dcp/producer.h"
 #include "warmup.h"
+#include "string_utils.h"
 
-static ALLOCATOR_HOOKS_API *hooksApi;
-static SERVER_LOG_API *loggerApi;
+static AtomicValue<ALLOCATOR_HOOKS_API*> hooksApi;
+
+// The global logger instance, used by LOG() when components don't specify
+// their own more specific logger.
+static Logger global_logger;
 
 static size_t percentOf(size_t val, double percent) {
     return static_cast<size_t>(static_cast<double>(val) * percent);
@@ -198,8 +209,16 @@ extern "C" {
                                     const int nkey,
                                     uint16_t vbucket)
     {
+        get_options_t options = static_cast<get_options_t>(QUEUE_BG_FETCH |
+                                                           HONOR_STATES |
+                                                           TRACK_REFERENCE |
+                                                           DELETE_TEMP |
+                                                           HIDE_LOCKED_CAS |
+                                                           TRACK_STATISTICS);
+
         ENGINE_ERROR_CODE err_code = getHandle(handle)->get(cookie, itm, key,
-                                                            nkey, vbucket, true);
+                                                            nkey, vbucket,
+                                                            options);
         releaseHandle(handle);
         return err_code;
     }
@@ -301,30 +320,40 @@ extern "C" {
                                                  EventuallyPersistentEngine *e,
                                                  const char *keyz,
                                                  const char *valz,
-                                                 const char **msg, size_t *) {
+                                                 std::string &msg) {
         protocol_binary_response_status rv = PROTOCOL_BINARY_RESPONSE_SUCCESS;
 
         try {
-            int v = atoi(valz);
             if (strcmp(keyz, "tap_keepalive") == 0) {
-                checkNumeric(valz);
+                int v = std::stoi(valz);
                 validate(v, 0, MAX_TAP_KEEP_ALIVE);
                 e->setTapKeepAlive(static_cast<uint32_t>(v));
-            } else if (strcmp(keyz, "tap_throttle_threshold") == 0) {
-                checkNumeric(valz);
-                e->getConfiguration().setTapThrottleThreshold(v);
-            } else if (strcmp(keyz, "tap_throttle_queue_cap") == 0) {
-                checkNumeric(valz);
-                e->getConfiguration().setTapThrottleQueueCap(v);
-            } else if (strcmp(keyz, "tap_throttle_cap_pcnt") == 0) {
-                checkNumeric(valz);
-                e->getConfiguration().setTapThrottleCapPcnt(v);
+            } else if (strcmp(keyz, "replication_throttle_threshold") == 0) {
+                e->getConfiguration().setReplicationThrottleThreshold(std::stoull(valz));
+            } else if (strcmp(keyz, "replication_throttle_queue_cap") == 0) {
+                e->getConfiguration().setReplicationThrottleQueueCap(std::stoll(valz));
+            } else if (strcmp(keyz, "replication_throttle_cap_pcnt") == 0) {
+                e->getConfiguration().setReplicationThrottleCapPcnt(std::stoull(valz));
             } else {
-                *msg = "Unknown config param";
+                msg = "Unknown config param";
                 rv = PROTOCOL_BINARY_RESPONSE_KEY_ENOENT;
             }
-        } catch(std::runtime_error &) {
-            *msg = "Value out of range.";
+        // Handles exceptions thrown by the standard
+        // library stoi/stoul style functions when not numeric
+        } catch(std::invalid_argument& ) {
+            msg = "Argument was not numeric";
+            rv = PROTOCOL_BINARY_RESPONSE_EINVAL;
+
+        // Handles exceptions thrown by the standard library stoi/stoul
+        // style functions when the conversion does not fit in the datatype
+        } catch(std::out_of_range& ) {
+            msg = "Argument was out of range";
+            rv = PROTOCOL_BINARY_RESPONSE_EINVAL;
+
+        // Handles any miscellaenous exceptions in addition to the range_error
+        // exceptions thrown by the configuration::set<param>() methods
+        } catch(std::exception& error) {
+            msg = error.what();
             rv = PROTOCOL_BINARY_RESPONSE_EINVAL;
         }
 
@@ -335,49 +364,57 @@ extern "C" {
                                                  EventuallyPersistentEngine *e,
                                                               const char *keyz,
                                                               const char *valz,
-                                                              const char **msg,
-                                                              size_t *) {
+                                                             std::string &msg) {
         protocol_binary_response_status rv = PROTOCOL_BINARY_RESPONSE_SUCCESS;
 
         try {
-            int v = atoi(valz);
             if (strcmp(keyz, "chk_max_items") == 0) {
-                checkNumeric(valz);
-                validate(v, MIN_CHECKPOINT_ITEMS, MAX_CHECKPOINT_ITEMS);
+                size_t v = std::stoull(valz);
+                validate(v, size_t(MIN_CHECKPOINT_ITEMS),
+                         size_t(MAX_CHECKPOINT_ITEMS));
                 e->getConfiguration().setChkMaxItems(v);
             } else if (strcmp(keyz, "chk_period") == 0) {
-                checkNumeric(valz);
-                validate(v, MIN_CHECKPOINT_PERIOD, MAX_CHECKPOINT_PERIOD);
+                size_t v = std::stoull(valz);
+                validate(v, size_t(MIN_CHECKPOINT_PERIOD),
+                         size_t(MAX_CHECKPOINT_PERIOD));
                 e->getConfiguration().setChkPeriod(v);
             } else if (strcmp(keyz, "max_checkpoints") == 0) {
-                checkNumeric(valz);
-                validate(v, DEFAULT_MAX_CHECKPOINTS,
-                         MAX_CHECKPOINTS_UPPER_BOUND);
+                size_t v = std::stoull(valz);
+                validate(v, size_t(DEFAULT_MAX_CHECKPOINTS),
+                         size_t(MAX_CHECKPOINTS_UPPER_BOUND));
                 e->getConfiguration().setMaxCheckpoints(v);
             } else if (strcmp(keyz, "item_num_based_new_chk") == 0) {
-                if (strcmp(valz, "true") == 0) {
-                    e->getConfiguration().setItemNumBasedNewChk(true);
-                } else {
-                    e->getConfiguration().setItemNumBasedNewChk(false);
-                }
+                e->getConfiguration().setItemNumBasedNewChk(cb_stob(valz));
             } else if (strcmp(keyz, "keep_closed_chks") == 0) {
-                if (strcmp(valz, "true") == 0) {
-                    e->getConfiguration().setKeepClosedChks(true);
-                } else {
-                    e->getConfiguration().setKeepClosedChks(false);
-                }
+                e->getConfiguration().setKeepClosedChks(cb_stob(valz));
             } else if (strcmp(keyz, "enable_chk_merge") == 0) {
-                if (strcmp(valz, "true") == 0) {
-                    e->getConfiguration().setEnableChkMerge(true);
-                } else {
-                    e->getConfiguration().setEnableChkMerge(false);
-                }
+                e->getConfiguration().setEnableChkMerge(cb_stob(valz));
             } else {
-                *msg = "Unknown config param";
+                msg = "Unknown config param";
                 rv = PROTOCOL_BINARY_RESPONSE_KEY_ENOENT;
             }
-        } catch(std::runtime_error &) {
-            *msg = "Value out of range.";
+
+        // Handles exceptions thrown by the cb_stob function
+        } catch(invalid_argument_bool& error) {
+            msg = error.what();
+            rv = PROTOCOL_BINARY_RESPONSE_EINVAL;
+
+        // Handles exceptions thrown by the standard
+        // library stoi/stoul style functions when not numeric
+        } catch(std::invalid_argument& ) {
+            msg = "Argument was not numeric";
+            rv = PROTOCOL_BINARY_RESPONSE_EINVAL;
+
+        // Handles exceptions thrown by the standard library stoi/stoul
+        // style functions when the conversion does not fit in the datatype
+        } catch(std::out_of_range& ) {
+            msg = "Argument was out of range";
+            rv = PROTOCOL_BINARY_RESPONSE_EINVAL;
+
+        // Handles any miscellaenous exceptions in addition to the range_error
+        // exceptions thrown by the configuration::set<param>() methods
+        } catch(std::exception& error) {
+            msg = error.what();
             rv = PROTOCOL_BINARY_RESPONSE_EINVAL;
         }
 
@@ -388,59 +425,37 @@ extern "C" {
                                                  EventuallyPersistentEngine *e,
                                                  const char *keyz,
                                                  const char *valz,
-                                                 const char **msg,
-                                                 size_t *) {
+                                                 std::string &msg) {
         protocol_binary_response_status rv = PROTOCOL_BINARY_RESPONSE_SUCCESS;
 
         // Handle the actual mutation.
         try {
-            int v = atoi(valz);
             if (strcmp(keyz, "bg_fetch_delay") == 0) {
-                checkNumeric(valz);
-                e->getConfiguration().setBgFetchDelay(v);
+                e->getConfiguration().setBgFetchDelay(std::stoull(valz));
             } else if (strcmp(keyz, "flushall_enabled") == 0) {
-                if (strcmp(valz, "true") == 0) {
-                    e->getConfiguration().setFlushallEnabled(true);
-                } else if(strcmp(valz, "false") == 0) {
-                    e->getConfiguration().setFlushallEnabled(false);
-                } else {
-                    throw std::runtime_error("value out of range.");
-                }
+                e->getConfiguration().setFlushallEnabled(cb_stob(valz));
             } else if (strcmp(keyz, "max_size") == 0) {
-                char *ptr = NULL;
-                checkNumeric(valz);
-                uint64_t vsize = strtoull(valz, &ptr, 10);
-                validate(vsize, static_cast<uint64_t>(0),
-                         std::numeric_limits<uint64_t>::max());
+                size_t vsize = std::stoull(valz);
+
                 e->getConfiguration().setMaxSize(vsize);
-                e->getConfiguration().setMemLowWat(percentOf(vsize, 0.75));
-                e->getConfiguration().setMemHighWat(percentOf(vsize, 0.85));
+                EPStats &st = e->getEpStats();
+                e->getConfiguration().setMemLowWat(percentOf(vsize,
+                                                   st.mem_low_wat_percent));
+                e->getConfiguration().setMemHighWat(percentOf(vsize,
+                                                   st.mem_high_wat_percent));
             } else if (strcmp(keyz, "mem_low_wat") == 0) {
-                char *ptr = NULL;
-                checkNumeric(valz);
-                uint64_t vsize = strtoull(valz, &ptr, 10);
-                validate(vsize, static_cast<uint64_t>(0),
-                         std::numeric_limits<uint64_t>::max());
-                e->getConfiguration().setMemLowWat(vsize);
+                e->getConfiguration().setMemLowWat(std::stoull(valz));
             } else if (strcmp(keyz, "mem_high_wat") == 0) {
-                char *ptr = NULL;
-                checkNumeric(valz);
-                uint64_t vsize = strtoull(valz, &ptr, 10);
-                validate(vsize, static_cast<uint64_t>(0),
-                         std::numeric_limits<uint64_t>::max());
-                e->getConfiguration().setMemHighWat(vsize);
+                e->getConfiguration().setMemHighWat(std::stoull(valz));
             } else if (strcmp(keyz, "backfill_mem_threshold") == 0) {
-                checkNumeric(valz);
-                validate(v, 0, 100);
-                e->getConfiguration().setBackfillMemThreshold(v);
+                e->getConfiguration().setBackfillMemThreshold(
+                        std::stoull(valz));
             } else if (strcmp(keyz, "compaction_exp_mem_threshold") == 0) {
-                checkNumeric(valz);
-                validate(v, 0, 100);
-                e->getConfiguration().setCompactionExpMemThreshold(v);
+                e->getConfiguration().setCompactionExpMemThreshold(
+                        std::stoull(valz));
             } else if (strcmp(keyz, "mutation_mem_threshold") == 0) {
-                checkNumeric(valz);
-                validate(v, 0, 100);
-                e->getConfiguration().setMutationMemThreshold(v);
+                e->getConfiguration().setMutationMemThreshold(
+                        std::stoull(valz));
             } else if (strcmp(keyz, "timing_log") == 0) {
                 EPStats &stats = e->getEpStats();
                 std::ostream *old = stats.timingLog;
@@ -461,13 +476,10 @@ extern "C" {
                         delete tmp;
                     }
                 }
+            } else if (strcmp(keyz, "exp_pager_enabled") == 0) {
+                e->getConfiguration().setExpPagerEnabled(cb_stob(valz));
             } else if (strcmp(keyz, "exp_pager_stime") == 0) {
-                char *ptr = NULL;
-                checkNumeric(valz);
-                uint64_t vsize = strtoull(valz, &ptr, 10);
-                validate(vsize, static_cast<uint64_t>(0),
-                         std::numeric_limits<uint64_t>::max());
-                e->getConfiguration().setExpPagerStime((size_t)vsize);
+                e->getConfiguration().setExpPagerStime(std::stoull(valz));
             } else if (strcmp(keyz, "expiry_host") == 0) {
                 e->getConfiguration().setExpiryHost(valz);
             } else if (strcmp(keyz, "expiry_port") == 0) {
@@ -477,66 +489,44 @@ extern "C" {
                 validate(vsize, static_cast<uint64_t>(0),
                          static_cast<uint64_t>(std::numeric_limits<uint16_t>::max()));
                 e->getConfiguration().setExpiryPort((size_t)vsize);
+            } else if (strcmp(keyz, "exp_pager_initial_run_time") == 0) {
+                e->getConfiguration().setExpPagerInitialRunTime(
+                        std::stoll(valz));
             } else if (strcmp(keyz, "access_scanner_enabled") == 0) {
-                if (strcmp(valz, "true") == 0) {
-                    e->getConfiguration().setAccessScannerEnabled(true);
-                } else if (strcmp(valz, "false") == 0) {
-                    e->getConfiguration().setAccessScannerEnabled(false);
-                } else {
-                    throw std::runtime_error("Value expected: true/false.");
-                }
+                e->getConfiguration().setAccessScannerEnabled(cb_stob(valz));
             } else if (strcmp(keyz, "alog_sleep_time") == 0) {
-                checkNumeric(valz);
-                e->getConfiguration().setAlogSleepTime(v);
+                e->getConfiguration().setAlogSleepTime(std::stoull(valz));
             } else if (strcmp(keyz, "alog_task_time") == 0) {
-                checkNumeric(valz);
-                e->getConfiguration().setAlogTaskTime(v);
+                e->getConfiguration().setAlogTaskTime(std::stoull(valz));
             } else if (strcmp(keyz, "pager_active_vb_pcnt") == 0) {
-                checkNumeric(valz);
-                e->getConfiguration().setPagerActiveVbPcnt(v);
+                e->getConfiguration().setPagerActiveVbPcnt(std::stoull(valz));
             } else if (strcmp(keyz, "warmup_min_memory_threshold") == 0) {
-                checkNumeric(valz);
-                validate(v, 0, std::numeric_limits<int>::max());
-                e->getConfiguration().setWarmupMinMemoryThreshold(v);
+                e->getConfiguration().setWarmupMinMemoryThreshold(
+                        std::stoull(valz));
             } else if (strcmp(keyz, "warmup_min_items_threshold") == 0) {
-                checkNumeric(valz);
-                validate(v, 0, std::numeric_limits<int>::max());
-                e->getConfiguration().setWarmupMinItemsThreshold(v);
+                e->getConfiguration().setWarmupMinItemsThreshold(
+                        std::stoull(valz));
             } else if (strcmp(keyz, "max_num_readers") == 0) {
-                checkNumeric(valz);
-                validate(v, 0, std::numeric_limits<int>::max());
-                e->getConfiguration().setMaxNumReaders(v);
-                ExecutorPool::get()->setMaxReaders(v);
+                size_t value = std::stoull(valz);
+                e->getConfiguration().setMaxNumReaders(value);
+                ExecutorPool::get()->setMaxReaders(value);
             } else if (strcmp(keyz, "max_num_writers") == 0) {
-                checkNumeric(valz);
-                validate(v, 0, std::numeric_limits<int>::max());
-                e->getConfiguration().setMaxNumWriters(v);
-                ExecutorPool::get()->setMaxWriters(v);
+                size_t value = std::stoull(valz);
+                e->getConfiguration().setMaxNumWriters(value);
+                ExecutorPool::get()->setMaxWriters(value);
             } else if (strcmp(keyz, "max_num_auxio") == 0) {
-                checkNumeric(valz);
-                validate(v, 0, std::numeric_limits<int>::max());
-                e->getConfiguration().setMaxNumAuxio(v);
-                ExecutorPool::get()->setMaxAuxIO(v);
+                size_t value = std::stoull(valz);
+                e->getConfiguration().setMaxNumAuxio(value);
+                ExecutorPool::get()->setMaxAuxIO(value);
             } else if (strcmp(keyz, "max_num_nonio") == 0) {
-                checkNumeric(valz);
-                validate(v, 0, std::numeric_limits<int>::max());
-                e->getConfiguration().setMaxNumNonio(v);
-                ExecutorPool::get()->setMaxNonIO(v);
+                size_t value = std::stoull(valz);
+                e->getConfiguration().setMaxNumNonio(value);
+                ExecutorPool::get()->setMaxNonIO(value);
             } else if (strcmp(keyz, "bfilter_enabled") == 0) {
-                if (strcmp(valz, "true") == 0) {
-                    e->getConfiguration().setBfilterEnabled(true);
-                } else if (strcmp(valz, "false") == 0) {
-                    e->getConfiguration().setBfilterEnabled(false);
-                } else {
-                    throw std::runtime_error("Value expected: true/false.");
-                }
+                e->getConfiguration().setBfilterEnabled(cb_stob(valz));
             } else if (strcmp(keyz, "bfilter_residency_threshold") == 0) {
-                float val = atof(valz);
-                if (val >= 0.0 && val <= 1.0) {
-                    e->getConfiguration().setBfilterResidencyThreshold(val);
-                } else {
-                    throw std::runtime_error("Value out of range [0.0-1.0].");
-                }
+                e->getConfiguration().setBfilterResidencyThreshold(
+                        std::stof(valz));
             } else if (strcmp(keyz, "flusher_min_sleep_time") == 0) {
                 float val = atof(valz);
                 if (val >= 0.0 && val <= 10.0) {
@@ -545,35 +535,88 @@ extern "C" {
                     throw std::runtime_error("Value out of range [0.0-10.0].");
                 }
             } else if (strcmp(keyz, "defragmenter_enabled") == 0) {
-                if (strcmp(valz, "true") == 0) {
-                    e->getConfiguration().setDefragmenterEnabled(true);
-                } else {
-                    e->getConfiguration().setDefragmenterEnabled(false);
-                }
+                e->getConfiguration().setDefragmenterEnabled(cb_stob(valz));
             } else if (strcmp(keyz, "defragmenter_interval") == 0) {
-                checkNumeric(valz);
-                validate(v, 1, std::numeric_limits<int>::max());
+                size_t v = std::stoull(valz);
+                // Adding separate validation as external limit is minimum 1
+                // to prevent setting defragmenter to constantly run
+                validate(v, size_t(1), std::numeric_limits<size_t>::max());
                 e->getConfiguration().setDefragmenterInterval(v);
             } else if (strcmp(keyz, "defragmenter_age_threshold") == 0) {
-                checkNumeric(valz);
-                validate(v, 0, std::numeric_limits<int>::max());
-                e->getConfiguration().setDefragmenterAgeThreshold(v);
+                e->getConfiguration().setDefragmenterAgeThreshold(
+                        std::stoull(valz));
             } else if (strcmp(keyz, "defragmenter_chunk_duration") == 0) {
-                checkNumeric(valz);
-                validate(v, 1, std::numeric_limits<int>::max());
-                e->getConfiguration().setDefragmenterChunkDuration(v);
+                e->getConfiguration().setDefragmenterChunkDuration(
+                        std::stoull(valz));
             } else if (strcmp(keyz, "defragmenter_run") == 0) {
                 e->runDefragmenterTask();
             } else if (strcmp(keyz, "compaction_write_queue_cap") == 0) {
-                checkNumeric(valz);
-                validate(v, 1, std::numeric_limits<int>::max());
-                e->getConfiguration().setCompactionWriteQueueCap(v);
+                e->getConfiguration().setCompactionWriteQueueCap(
+                        std::stoull(valz));
+            } else if (strcmp(keyz, "dcp_min_compression_ratio") == 0) {
+                e->getConfiguration().setDcpMinCompressionRatio(
+                        std::stof(valz));
+            } else if (strcmp(keyz, "access_scanner_run") == 0) {
+                if (!(e->runAccessScannerTask())) {
+                    rv = PROTOCOL_BINARY_RESPONSE_ETMPFAIL;
+                }
+            } else if (strcmp(keyz, "vb_state_persist_run") == 0) {
+                e->runVbStatePersistTask(std::stoi(valz));
             } else {
-                *msg = "Unknown config param";
+                msg = "Unknown config param";
                 rv = PROTOCOL_BINARY_RESPONSE_KEY_ENOENT;
             }
-        } catch(std::runtime_error& ex) {
-            *msg = "Value out of range.";
+        // Handles exceptions thrown by the cb_stob function
+        } catch(invalid_argument_bool& error) {
+            msg = error.what();
+            rv = PROTOCOL_BINARY_RESPONSE_EINVAL;
+
+        // Handles exceptions thrown by the standard
+        // library stoi/stoul style functions when not numeric
+        } catch(std::invalid_argument& ) {
+            msg = "Argument was not numeric";
+            rv = PROTOCOL_BINARY_RESPONSE_EINVAL;
+
+        // Handles exceptions thrown by the standard library stoi/stoul
+        // style functions when the conversion does not fit in the datatype
+        } catch(std::out_of_range& ) {
+            msg = "Argument was out of range";
+            rv = PROTOCOL_BINARY_RESPONSE_EINVAL;
+
+        // Handles any miscellaneous exceptions in addition to the range_error
+        // exceptions thrown by the configuration::set<param>() methods
+        } catch(std::exception& error) {
+            msg = error.what();
+            rv = PROTOCOL_BINARY_RESPONSE_EINVAL;
+        }
+
+        return rv;
+    }
+
+    static protocol_binary_response_status setDcpParam(
+                                                    EventuallyPersistentEngine *e,
+                                                    const char *keyz,
+                                                    const char *valz,
+                                                    std::string& msg) {
+        protocol_binary_response_status rv = PROTOCOL_BINARY_RESPONSE_SUCCESS;
+        try {
+
+            if (strcmp(keyz, "dcp_consumer_process_buffered_messages_yield_limit") == 0) {
+                size_t v = atoi(valz);
+                checkNumeric(valz);
+                validate(v, size_t(1), std::numeric_limits<size_t>::max());
+                e->getConfiguration().setDcpConsumerProcessBufferedMessagesYieldLimit(v);
+            } else if (strcmp(keyz, "dcp_consumer_process_buffered_messages_batch_size") == 0) {
+                size_t v = atoi(valz);
+                checkNumeric(valz);
+                validate(v, size_t(1), std::numeric_limits<size_t>::max());
+                e->getConfiguration().setDcpConsumerProcessBufferedMessagesBatchSize(v);
+            } else {
+                msg = "Unknown config param";
+                rv = PROTOCOL_BINARY_RESPONSE_KEY_ENOENT;
+            }
+        } catch (std::runtime_error& ex) {
+            msg = "Value out of range.";
             rv = PROTOCOL_BINARY_RESPONSE_EINVAL;
         }
 
@@ -642,7 +685,6 @@ extern "C" {
         std::string key(keyp, ntohs(req->request.keylen));
         uint16_t vbucket = ntohs(req->request.vbucket);
 
-        RememberingCallback<GetValue> getCb;
         uint32_t max_timeout = (unsigned int)e->getGetlMaxTimeout();
         uint32_t default_timeout = (unsigned int)e->getGetlDefaultTimeout();
         uint32_t lockTimeout = default_timeout;
@@ -657,41 +699,45 @@ extern "C" {
             lockTimeout = default_timeout;
         }
 
-        bool gotLock = e->getLocked(key, vbucket, getCb,
-                                    ep_current_time(),
-                                    lockTimeout, cookie);
+        GetValue result = e->getLocked(key, vbucket, ep_current_time(),
+                                       lockTimeout, cookie);
 
-        getCb.waitForValue();
-        ENGINE_ERROR_CODE rv = getCb.val.getStatus();
-
-        if (rv == ENGINE_SUCCESS) {
-            *itm = getCb.val.getValue();
+        switch (result.getStatus()) {
+        case ENGINE_SUCCESS:
+            *itm = result.getValue();
             ++(e->getEpStats().numOpsGet);
-        } else if (rv == ENGINE_EWOULDBLOCK) {
+            break;
 
+        case ENGINE_EWOULDBLOCK:
             // need to wait for value
-            return rv;
-        } else if (rv == ENGINE_NOT_MY_VBUCKET) {
+            break;
+
+        case ENGINE_NOT_MY_VBUCKET:
             *msg = "That's not my bucket.";
             *res = PROTOCOL_BINARY_RESPONSE_NOT_MY_VBUCKET;
-            return ENGINE_NOT_MY_VBUCKET;
-        } else if (!gotLock){
-            *msg =  "LOCK_ERROR";
-            *res = PROTOCOL_BINARY_RESPONSE_ETMPFAIL;
-            return ENGINE_TMPFAIL;
-        } else {
+            break;
+
+        case ENGINE_TMPFAIL:
             if (e->isDegradedMode()) {
                 *msg = "LOCK_TMP_ERROR";
-                *res = PROTOCOL_BINARY_RESPONSE_ETMPFAIL;
-                return ENGINE_TMPFAIL;
+            } else {
+                *msg = "LOCK_ERROR";
             }
+            *res = PROTOCOL_BINARY_RESPONSE_ETMPFAIL;
+            break;
 
+        case ENGINE_KEY_ENOENT:
             *msg = "NOT_FOUND";
             *res = PROTOCOL_BINARY_RESPONSE_KEY_ENOENT;
-            return ENGINE_KEY_ENOENT;
+            break;
+
+        default:
+            // Unexpected / unhandled status code.
+            *res = PROTOCOL_BINARY_RESPONSE_EINTERNAL;
+            break;
         }
 
-        return rv;
+        return result.getStatus();
     }
 
     static protocol_binary_response_status unlockKey(
@@ -743,9 +789,10 @@ extern "C" {
             if (!vb) {
                 *msg = "That's not my bucket.";
                 res =  PROTOCOL_BINARY_RESPONSE_NOT_MY_VBUCKET;
+            } else {
+                *msg = "NOT_FOUND";
+                res = PROTOCOL_BINARY_RESPONSE_KEY_ENOENT;
             }
-            *msg = "NOT_FOUND";
-            res =  PROTOCOL_BINARY_RESPONSE_KEY_ENOENT;
         }
 
         return res;
@@ -755,8 +802,7 @@ extern "C" {
                                             EventuallyPersistentEngine *e,
                                             protocol_binary_request_set_param
                                                                      *req,
-                                            const char **msg,
-                                            size_t *msg_size) {
+                                            std::string &msg) {
 
         size_t keylen = ntohs(req->message.header.request.keylen);
         uint8_t extlen = req->message.header.request.extlen;
@@ -773,12 +819,12 @@ extern "C" {
         const char *valuep = keyp + keylen;
         vallen -= (keylen + extlen);
 
-        char keyz[32];
+        char keyz[128];
         char valz[512];
 
         // Read the key.
         if (keylen >= sizeof(keyz)) {
-            *msg = "Key is too large.";
+            msg = "Key is too large.";
             return PROTOCOL_BINARY_RESPONSE_EINVAL;
         }
         memcpy(keyz, keyp, keylen);
@@ -786,7 +832,7 @@ extern "C" {
 
         // Read the value.
         if (vallen >= sizeof(valz)) {
-            *msg = "Value is too large.";
+            msg = "Value is too large.";
             return PROTOCOL_BINARY_RESPONSE_EINVAL;
         }
         memcpy(valz, valuep, vallen);
@@ -796,13 +842,16 @@ extern "C" {
 
         switch (paramtype) {
         case protocol_binary_engine_param_flush:
-            rv = setFlushParam(e, keyz, valz, msg, msg_size);
+            rv = setFlushParam(e, keyz, valz, msg);
             break;
         case protocol_binary_engine_param_tap:
-            rv = setTapParam(e, keyz, valz, msg, msg_size);
+            rv = setTapParam(e, keyz, valz, msg);
             break;
         case protocol_binary_engine_param_checkpoint:
-            rv = setCheckpointParam(e, keyz, valz, msg, msg_size);
+            rv = setCheckpointParam(e, keyz, valz, msg);
+            break;
+        case protocol_binary_engine_param_dcp:
+            rv = setDcpParam(e, keyz, valz, msg);
             break;
         default:
             rv = PROTOCOL_BINARY_RESPONSE_UNKNOWN_COMMAND;
@@ -817,18 +866,15 @@ extern "C" {
                                        ADD_RESPONSE response) {
         protocol_binary_request_get_vbucket *req =
             reinterpret_cast<protocol_binary_request_get_vbucket*>(request);
-        cb_assert(req);
+        if (req == nullptr) {
+            throw std::invalid_argument("getVBucket: Unable to convert req"
+                    " to protocol_binary_request_get_vbucket");
+        }
 
         uint16_t vbucket = ntohs(req->message.header.request.vbucket);
         RCPtr<VBucket> vb = e->getVBucket(vbucket);
         if (!vb) {
-            LockHolder lh(e->clusterConfig.lock);
-            return sendResponse(response, NULL, 0, NULL, 0,
-                                e->clusterConfig.config,
-                                e->clusterConfig.len,
-                                PROTOCOL_BINARY_RAW_BYTES,
-                                PROTOCOL_BINARY_RESPONSE_NOT_MY_VBUCKET, 0,
-                                cookie);
+            return e->sendNotMyVBucketResponse(response, cookie, 0);
         } else {
             vbucket_state_t state = (vbucket_state_t)ntohl(vb->getState());
             return sendResponse(response, NULL, 0, NULL, 0, &state,
@@ -931,7 +977,7 @@ extern "C" {
         }
         switch (err) {
         case ENGINE_SUCCESS:
-            LOG(EXTENSION_LOG_WARNING,
+            LOG(EXTENSION_LOG_NOTICE,
                 "Deletion of vbucket %d was completed.", vbucket);
             break;
         case ENGINE_NOT_MY_VBUCKET:
@@ -946,7 +992,7 @@ extern "C" {
             res = PROTOCOL_BINARY_RESPONSE_EINVAL;
             break;
         case ENGINE_EWOULDBLOCK:
-            LOG(EXTENSION_LOG_WARNING, "Request for vbucket %d deletion is in"
+            LOG(EXTENSION_LOG_NOTICE, "Request for vbucket %d deletion is in"
                 " EWOULDBLOCK until the database file is removed from disk",
                 vbucket);
             e->storeEngineSpecific(cookie, req);
@@ -963,14 +1009,8 @@ extern "C" {
                                 msg.length(), PROTOCOL_BINARY_RAW_BYTES,
                                 res, cas, cookie);
         } else {
-            LockHolder lh(e->clusterConfig.lock);
-            return sendResponse(response, NULL, 0, NULL, 0,
-                                e->clusterConfig.config,
-                                e->clusterConfig.len,
-                                PROTOCOL_BINARY_RAW_BYTES,
-                                res, cas, cookie);
+            return e->sendNotMyVBucketResponse(response, cookie, cas);
         }
-
     }
 
     static ENGINE_ERROR_CODE getReplicaCmd(EventuallyPersistentEngine *e,
@@ -988,7 +1028,7 @@ extern "C" {
         std::string keystr(((char *)request) + sizeof(req->message.header),
                             keylen);
 
-        GetValue rv(eps->getReplica(keystr, vbucket, cookie, true));
+        GetValue rv(eps->getReplica(keystr, vbucket, cookie));
 
         if ((error_code = rv.getStatus()) != ENGINE_SUCCESS) {
             if (error_code == ENGINE_NOT_MY_VBUCKET) {
@@ -1008,6 +1048,17 @@ extern "C" {
         return ENGINE_SUCCESS;
     }
 
+    /**
+     * TODO: This function returns vbucket id as couchstore is the only
+     * supported backend. Once forestdb is supported, this function
+     * should return the database file id (shard id) from the request
+     * header
+     */
+    static uint16_t getDbFileId(EventuallyPersistentEngine *e,
+                                protocol_binary_request_compact_db *req) {
+        return ntohs(req->message.header.request.vbucket);
+    }
+
     static ENGINE_ERROR_CODE compactDB(EventuallyPersistentEngine *e,
                                        const void *cookie,
                                        protocol_binary_request_compact_db *req,
@@ -1016,14 +1067,13 @@ extern "C" {
         std::string msg = "";
         protocol_binary_response_status res = PROTOCOL_BINARY_RESPONSE_SUCCESS;
         compaction_ctx compactreq;
-        uint16_t vbucket = ntohs(req->message.header.request.vbucket);
         uint64_t cas = ntohll(req->message.header.request.cas);
 
         if (ntohs(req->message.header.request.keylen) > 0 ||
              req->message.header.request.extlen != 24) {
             LOG(EXTENSION_LOG_WARNING,
-                    "Compaction of vbucket %d received bad ext/key len %d/%d.",
-                    vbucket, req->message.header.request.extlen,
+                    "Compaction received bad ext/key len %d/%d.",
+                    req->message.header.request.extlen,
                     ntohs(req->message.header.request.keylen));
             msg = "Incorrect packet format.";
             return sendResponse(response, NULL, 0, NULL, 0, msg.c_str(),
@@ -1037,14 +1087,15 @@ extern "C" {
         compactreq.purge_before_seq =
                                     ntohll(req->message.body.purge_before_seq);
         compactreq.drop_deletes     = req->message.body.drop_deletes;
-        compactreq.bfcb             = NULL;
+        compactreq.db_file_id       = getDbFileId(e, req);
+        uint16_t vbid = ntohs(req->message.header.request.vbucket);
 
         ENGINE_ERROR_CODE err;
         void* es = e->getEngineSpecific(cookie);
         if (es == NULL) {
             ++stats.pendingCompactions;
             e->storeEngineSpecific(cookie, e);
-            err = e->compactDB(vbucket, compactreq, cookie);
+            err = e->compactDB(vbid, compactreq, cookie);
         } else {
             e->storeEngineSpecific(cookie, NULL);
             err = ENGINE_SUCCESS;
@@ -1052,34 +1103,39 @@ extern "C" {
 
         switch (err) {
             case ENGINE_SUCCESS:
-                LOG(EXTENSION_LOG_INFO,
-                    "Compaction of vbucket %d completed.", vbucket);
+                LOG(EXTENSION_LOG_NOTICE,
+                    "Compaction of db file id: %d completed.", compactreq.db_file_id);
                 break;
             case ENGINE_NOT_MY_VBUCKET:
                 --stats.pendingCompactions;
-                LOG(EXTENSION_LOG_WARNING, "Compaction of vbucket %d failed "
-                    "because the vbucket doesn't exist!!!", vbucket);
+                LOG(EXTENSION_LOG_WARNING, "Compaction of db file id: %d failed "
+                    "because the db file doesn't exist!!!", compactreq.db_file_id);
                 res = PROTOCOL_BINARY_RESPONSE_NOT_MY_VBUCKET;
                 break;
+            case ENGINE_EINVAL:
+                --stats.pendingCompactions;
+                LOG(EXTENSION_LOG_WARNING, "Compaction of db file id: %d failed "
+                    "because of an invalid argument", compactreq.db_file_id);
+                res = PROTOCOL_BINARY_RESPONSE_EINVAL;
+                break;
             case ENGINE_EWOULDBLOCK:
-                LOG(EXTENSION_LOG_INFO, "Request to compact vbucket %d is "
-                        "in EWOULDBLOCK state until the database file is "
-                        "compacted on disk",
-                        vbucket);
+                LOG(EXTENSION_LOG_NOTICE,
+                    "Compaction of db file id: %d scheduled "
+                            "(awaiting completion).", compactreq.db_file_id);
                 e->storeEngineSpecific(cookie, req);
                 return ENGINE_EWOULDBLOCK;
             case ENGINE_TMPFAIL:
-                LOG(EXTENSION_LOG_WARNING, "Request to compact vbucket %d hit"
+                LOG(EXTENSION_LOG_WARNING, "Request to compact db file id: %d hit"
                         " a temporary failure and may need to be retried",
-                        vbucket);
-                msg = "Temporary failure in compacting vbucket.";
+                        compactreq.db_file_id);
+                msg = "Temporary failure in compacting db file.";
                 res = PROTOCOL_BINARY_RESPONSE_ETMPFAIL;
                 break;
             default:
                 --stats.pendingCompactions;
-                LOG(EXTENSION_LOG_WARNING, "Compaction of vbucket %d failed "
-                    "because of unknown reasons\n", vbucket);
-                msg = "Failed to compact vbucket.  Unknown reason.";
+                LOG(EXTENSION_LOG_WARNING, "Compaction of db file id: %d failed "
+                    "because of unknown reasons\n", compactreq.db_file_id);
+                msg = "Failed to compact db file.  Unknown reason.";
                 res = PROTOCOL_BINARY_RESPONSE_EINTERNAL;
                 break;
         }
@@ -1089,12 +1145,7 @@ extern "C" {
                                 msg.length(), PROTOCOL_BINARY_RAW_BYTES,
                                 res, cas, cookie);
         } else {
-            LockHolder lh(e->clusterConfig.lock);
-            return sendResponse(response, NULL, 0, NULL, 0,
-                                e->clusterConfig.config,
-                                e->clusterConfig.len,
-                                PROTOCOL_BINARY_RAW_BYTES,
-                                res, cas, cookie);
+            return e->sendNotMyVBucketResponse(response, cookie, cas);
         }
     }
 
@@ -1106,6 +1157,7 @@ extern "C" {
     {
         protocol_binary_response_status res =
                                       PROTOCOL_BINARY_RESPONSE_UNKNOWN_COMMAND;
+        std::string dynamic_msg;
         const char *msg = NULL;
         size_t msg_size = 0;
         Item *itm = NULL;
@@ -1186,7 +1238,9 @@ extern "C" {
         case PROTOCOL_BINARY_CMD_SET_PARAM:
             res = setParam(h,
                   reinterpret_cast<protocol_binary_request_set_param*>(request),
-                            &msg, &msg_size);
+                           dynamic_msg);
+            msg = dynamic_msg.c_str();
+            msg_size = dynamic_msg.length();
             h->decrementSessionCtr();
             break;
         case PROTOCOL_BINARY_CMD_EVICT_KEY:
@@ -1311,7 +1365,7 @@ extern "C" {
                 }
                 return h->getRandomKey(cookie, response);
             }
-        case CMD_GET_KEYS:
+        case PROTOCOL_BINARY_CMD_GET_KEYS:
             {
                 return h->getAllKeys(cookie,
                    reinterpret_cast<protocol_binary_request_get_keys*>
@@ -1353,13 +1407,7 @@ extern "C" {
                               cookie);
             delete itm;
         } else  if (rv == ENGINE_NOT_MY_VBUCKET) {
-            LockHolder lh(h->clusterConfig.lock);
-            return sendResponse(response, NULL, 0, NULL, 0,
-                                h->clusterConfig.config,
-                                h->clusterConfig.len,
-                                PROTOCOL_BINARY_RAW_BYTES,
-                                PROTOCOL_BINARY_RESPONSE_NOT_MY_VBUCKET, 0,
-                                cookie);
+            return h->sendNotMyVBucketResponse(response, cookie, 0);
         } else {
             msg_size = (msg_size > 0 || msg == NULL) ? msg_size : strlen(msg);
             rv = sendResponse(response, NULL, 0, NULL, 0,
@@ -1764,13 +1812,41 @@ extern "C" {
                                     const void *event_data,
                                     const void *cb_data)
     {
-        cb_assert(type == ON_DISCONNECT);
-        cb_assert(event_data == NULL);
+        if (type != ON_DISCONNECT) {
+            throw std::invalid_argument("EvpHandleDisconnect: type "
+                    "(which is" + std::to_string(type) +
+                    ") is not ON_DISCONNECT");
+        }
+        if (event_data != nullptr) {
+            throw std::invalid_argument("EvpHandleDisconnect: event_data "
+                    "is not NULL");
+        }
         void *c = const_cast<void*>(cb_data);
         getHandle(static_cast<ENGINE_HANDLE*>(c))->handleDisconnect(cookie);
         releaseHandle(static_cast<ENGINE_HANDLE*>(c));
     }
 
+    static void EvpHandleDeleteBucket(const void *cookie,
+                                      ENGINE_EVENT_TYPE type,
+                                      const void *event_data,
+                                      const void *cb_data) {
+        if (type != ON_DELETE_BUCKET) {
+            throw std::invalid_argument("EvpHandleDeleteBucket: type "
+                    "(which is" + std::to_string(type) +
+                    ") is not ON_DELETE_BUCKET");
+        }
+        if (event_data != nullptr) {
+            throw std::invalid_argument("EvpHandleDeleteBucket: event_data "
+                    "is not NULL");
+        }
+        void *c = const_cast<void*>(cb_data);
+        getHandle(static_cast<ENGINE_HANDLE*>(c))->handleDeleteBucket(cookie);
+        releaseHandle(static_cast<ENGINE_HANDLE*>(c));
+    }
+
+    void EvpSetLogLevel(ENGINE_HANDLE* handle, EXTENSION_LOG_LEVEL level) {
+        Logger::setGlobalLogLevel(level);
+    }
 
     /**
      * The only public interface to the eventually persistance engine.
@@ -1791,8 +1867,9 @@ extern "C" {
             return ENGINE_ENOTSUP;
         }
 
-        hooksApi = api->alloc_hooks;
-        loggerApi = api->log;
+        hooksApi.store(api->alloc_hooks, std::memory_order_relaxed);
+        Logger::setLoggerAPI(api->log);
+
         MemoryTracker::getInstance();
         ObjectRegistry::initialize(api->alloc_hooks->get_allocation_size);
 
@@ -1813,13 +1890,22 @@ extern "C" {
         }
         delete inital_tracking;
 
-        ep_current_time = api->core->get_current_time;
-        ep_abs_time = api->core->abstime;
-        ep_reltime = api->core->realtime;
+        initialize_time_functions(api->core);
 
         *handle = reinterpret_cast<ENGINE_HANDLE*> (engine);
 
         return ENGINE_SUCCESS;
+    }
+
+    /*
+        This method is called prior to unloading of the shared-object.
+        Global clean-up should be performed from this method.
+    */
+    void destroy_engine() {
+        ExecutorPool::shutdown();
+        // A single MemoryTracker exists for *all* buckets
+        // and must be destroyed before unloading the shared object.
+        MemoryTracker::destroyInstance();
     }
 
     static bool EvpGetItemInfo(ENGINE_HANDLE *handle, const void *,
@@ -1877,8 +1963,8 @@ extern "C" {
     {
         EventuallyPersistentEngine *h = getHandle(handle);
         LockHolder lh(h->clusterConfig.lock);
-        uint8_t *config = h->clusterConfig.config;
-        uint32_t len = h->clusterConfig.len;
+        const char* config = h->clusterConfig.config.data();
+        uint32_t len = h->clusterConfig.config.size();
         releaseHandle(handle);
         return callback(cookie, config, len);
     }
@@ -1886,40 +1972,27 @@ extern "C" {
 } // C linkage
 
 void LOG(EXTENSION_LOG_LEVEL severity, const char *fmt, ...) {
-    char buffer[2048];
-
-    if (loggerApi != NULL) {
-        EXTENSION_LOGGER_DESCRIPTOR* logger =
-            (EXTENSION_LOGGER_DESCRIPTOR*)loggerApi->get_logger();
-
-        if (loggerApi->get_level() <= severity) {
-            EventuallyPersistentEngine *engine = ObjectRegistry::onSwitchThread(NULL, true);
-            va_list va;
-            va_start(va, fmt);
-            vsnprintf(buffer, sizeof(buffer) - 1, fmt, va);
-            if (engine) {
-                logger->log(severity, NULL, "(%s) %s", engine->getName(),
-                            buffer);
-            } else {
-                logger->log(severity, NULL, "(No Engine) %s", buffer);
-            }
-            va_end(va);
-            ObjectRegistry::onSwitchThread(engine);
-        }
-    }
+    va_list va;
+    va_start(va, fmt);
+    global_logger.vlog(severity, fmt, va);
+    va_end(va);
 }
 
 ALLOCATOR_HOOKS_API *getHooksApi(void) {
-    return hooksApi;
+    return hooksApi.load(std::memory_order_relaxed);
 }
 
 EventuallyPersistentEngine::EventuallyPersistentEngine(
                                     GET_SERVER_API get_server_api) :
     clusterConfig(), epstore(NULL), workload(NULL),
     workloadPriority(NO_BUCKET_PRIORITY),
-    tapThrottle(NULL), getServerApiFunc(get_server_api),
-    dcpConnMap_(NULL), tapConnMap(NULL) ,tapConfig(NULL), checkpointConfig(NULL),
-    trafficEnabled(false), flushAllEnabled(false), startupTime(0)
+    replicationThrottle(NULL), getServerApiFunc(get_server_api),
+    dcpConnMap_(NULL),
+    dcpFlowControlManager_(NULL),
+    tapConnMap(NULL) ,
+    tapConfig(NULL), checkpointConfig(NULL),
+    trafficEnabled(false), flushAllEnabled(false), startupTime(0),
+    taskable(this)
 {
     interface.interface = 1;
     ENGINE_HANDLE_V1::get_info = EvpGetInfo;
@@ -1962,6 +2035,7 @@ EventuallyPersistentEngine::EventuallyPersistentEngine(
     ENGINE_HANDLE_V1::dcp.buffer_acknowledgement = EvpDcpBufferAcknowledgement;
     ENGINE_HANDLE_V1::dcp.control = EvpDcpControl;
     ENGINE_HANDLE_V1::dcp.response_handler = EvpDcpResponseHandler;
+    ENGINE_HANDLE_V1::set_log_level = EvpSetLogLevel;
 
     serverApi = getServerApiFunc();
     memset(&info, 0, sizeof(info));
@@ -2056,13 +2130,15 @@ ENGINE_ERROR_CODE EventuallyPersistentEngine::initialize(const char* config) {
     }
 
     if (configuration.getMemLowWat() == std::numeric_limits<size_t>::max()) {
+        stats.mem_low_wat_percent.store(0.75);
         configuration.setMemLowWat(percentOf(
-                                            configuration.getMaxSize(), 0.75));
+                configuration.getMaxSize(), stats.mem_low_wat_percent.load()));
     }
 
     if (configuration.getMemHighWat() == std::numeric_limits<size_t>::max()) {
+        stats.mem_high_wat_percent.store(0.85);
         configuration.setMemHighWat(percentOf(
-                                            configuration.getMaxSize(), 0.85));
+                configuration.getMaxSize(), stats.mem_high_wat_percent.load()));
     }
 
     maxItemSize = configuration.getMaxItemSize();
@@ -2090,21 +2166,32 @@ ENGINE_ERROR_CODE EventuallyPersistentEngine::initialize(const char* config) {
     }
 
     dcpConnMap_ = new DcpConnMap(*this);
+
+    /* Get the flow control policy */
+    std::string flowCtlPolicy = configuration.getDcpFlowControlPolicy();
+
+    if (!flowCtlPolicy.compare("static")) {
+        dcpFlowControlManager_ = new DcpFlowControlManagerStatic(*this);
+    } else if (!flowCtlPolicy.compare("dynamic")) {
+        dcpFlowControlManager_ = new DcpFlowControlManagerDynamic(*this);
+    } else if (!flowCtlPolicy.compare("aggressive")) {
+        dcpFlowControlManager_ = new DcpFlowControlManagerAggressive(*this);
+    } else {
+        /* Flow control is not enabled */
+        dcpFlowControlManager_ = new DcpFlowControlManager(*this);
+    }
+
     tapConnMap = new TapConnMap(*this);
     tapConfig = new TapConfig(*this);
-    tapThrottle = new TapThrottle(configuration, stats);
+    replicationThrottle = new ReplicationThrottle(configuration, stats);
     TapConfig::addConfigChangeListener(*this);
 
     checkpointConfig = new CheckpointConfig(*this);
     CheckpointConfig::addConfigChangeListener(*this);
 
     epstore = new EventuallyPersistentStore(*this);
-    if (epstore == NULL) {
-        return ENGINE_ENOMEM;
-    }
 
-    // Register the callback
-    registerEngineCallback(ON_DISCONNECT, EvpHandleDisconnect, this);
+    initializeEngineCallbacks();
 
     // Complete the initialization of the ep-store
     if (!epstore->initialize()) {
@@ -2119,7 +2206,7 @@ ENGINE_ERROR_CODE EventuallyPersistentEngine::initialize(const char* config) {
     dcpConnMap_->initialize(DCP_CONN_NOTIFIER);
 
     // record engine initialization time
-    startupTime = ep_real_time();
+    startupTime.store(ep_real_time());
 
     LOG(EXTENSION_LOG_DEBUG, "Engine init complete.\n");
 
@@ -2173,7 +2260,7 @@ ENGINE_ERROR_CODE EventuallyPersistentEngine::flush(const void *cookie,
 
     } else {
         storeEngineSpecific(cookie, NULL);
-        LOG(EXTENSION_LOG_WARNING, "Completed bucket flush operation");
+        LOG(EXTENSION_LOG_NOTICE, "Completed bucket flush operation");
         return ENGINE_SUCCESS;
     }
 }
@@ -2234,21 +2321,39 @@ ENGINE_ERROR_CODE EventuallyPersistentEngine::store(const void *cookie,
         break;
 
     case OPERATION_APPEND:
-    case OPERATION_PREPEND:
+    case OPERATION_PREPEND: {
+        bool locked = false;
         do {
+            get_options_t options = static_cast<get_options_t>(QUEUE_BG_FETCH |
+                                                               HONOR_STATES |
+                                                               TRACK_REFERENCE |
+                                                               DELETE_TEMP |
+                                                               HIDE_LOCKED_CAS);
             if ((ret = get(cookie, &i, it->getKey().c_str(),
-                           it->getNKey(), vbucket)) == ENGINE_SUCCESS) {
-                Item *old = reinterpret_cast<Item*>(i);
+                           it->getNKey(), vbucket,
+                           options)) == ENGINE_SUCCESS) {
+                Item *old = reinterpret_cast<Item *>(i);
+                locked = old->getCas() == uint64_t(-1);
 
-                if (old->getCas() == (uint64_t) -1) {
-                    // item is locked against updates
-                    itemRelease(cookie, i);
-                    return ENGINE_TMPFAIL;
-                }
-
-                if (it->getCas() != 0 && old->getCas() != it->getCas()) {
-                    itemRelease(cookie, i);
-                    return ENGINE_KEY_EEXISTS;
+                if (it->getCas() == 0) {
+                    // not allowed on locked items
+                    if (locked) {
+                        itemRelease(cookie, i);
+                        return ENGINE_TMPFAIL;
+                    }
+                } else {
+                    if (locked) {
+                        // The value is locked in the cache, and it is the
+                        // "old" object we're trying to operate on. Just set
+                        // the old objects cas value to the "what the user
+                        // specified" and if it it was the right one it'll
+                        // automatically unlock the object, otherwise it'll
+                        // return KEY_EEXISTS
+                        old->setCas(it->getCas());
+                    } else if (old->getCas() != it->getCas()) {
+                        itemRelease(cookie, i);
+                        return ENGINE_KEY_EEXISTS;
+                    }
                 }
 
                 if (operation == OPERATION_APPEND) {
@@ -2284,13 +2389,18 @@ ENGINE_ERROR_CODE EventuallyPersistentEngine::store(const void *cookie,
                 it->setBySeqno(old->getBySeqno());
                 itemRelease(cookie, i);
             }
-        } while (ret == ENGINE_KEY_EEXISTS);
+        } while (ret == ENGINE_KEY_EEXISTS && !locked);
+
+        // We tried to append with the wrong cas for a locked item
+        if (locked && ret == ENGINE_KEY_EEXISTS) {
+            ret = ENGINE_TMPFAIL;
+        }
 
         // Map the error code back to what memcapable expects
         if (ret == ENGINE_KEY_ENOENT) {
             ret = ENGINE_NOT_STORED;
         }
-
+    }
         break;
 
     default:
@@ -2359,14 +2469,14 @@ inline uint16_t EventuallyPersistentEngine::doWalkTapQueue(const void *cookie,
     if (ev.event != TAP_PAUSE) {
         switch (ev.event) {
         case TAP_VBUCKET_SET:
-            LOG(EXTENSION_LOG_WARNING,
+            LOG(EXTENSION_LOG_NOTICE,
                "%s Sending TAP_VBUCKET_SET with vbucket %d and state \"%s\"\n",
                 connection->logHeader(), ev.vbucket,
                 VBucket::toString(ev.state));
             connection->encodeVBucketStateTransition(ev, es, nes, vbucket);
             break;
         case TAP_OPAQUE:
-            LOG(EXTENSION_LOG_WARNING,
+            LOG(EXTENSION_LOG_NOTICE,
                 "%s Sending TAP_OPAQUE with command \"%s\" and vbucket %d\n",
                 connection->logHeader(),
                 TapProducer::opaqueCmdToString(ntohl((uint32_t) ev.state)),
@@ -2432,7 +2542,7 @@ inline uint16_t EventuallyPersistentEngine::doWalkTapQueue(const void *cookie,
     if (ret == TAP_PAUSE && (connection->dumpQueue || connection->doTakeOver)){
         VBucketEvent vbev = connection->checkDumpOrTakeOverCompletion();
         if (vbev.event == TAP_VBUCKET_SET) {
-            LOG(EXTENSION_LOG_WARNING,
+            LOG(EXTENSION_LOG_NOTICE,
                "%s Sending TAP_VBUCKET_SET with vbucket %d and state \"%s\"\n",
                 connection->logHeader(), vbev.vbucket,
                 VBucket::toString(vbev.state));
@@ -2585,8 +2695,6 @@ bool EventuallyPersistentEngine::createTapQueue(const void *cookie,
                 ptr += sizeof(uint64_t);
                 lastCheckpointIds[ntohs(vbid)] = ntohll(checkpointId);
             }
-            nuserdata -=
-                        ((sizeof(uint16_t) + sizeof(uint64_t)) * nCheckpoints);
         }
     }
 
@@ -2644,8 +2752,8 @@ ENGINE_ERROR_CODE EventuallyPersistentEngine::tapNotify(const void *cookie,
     ENGINE_ERROR_CODE ret = ENGINE_SUCCESS;
 
     if (tap_event == TAP_MUTATION || tap_event == TAP_DELETION) {
-        if (!tapThrottle->shouldProcess()) {
-            ++stats.tapThrottled;
+        if (!replicationThrottle->shouldProcess()) {
+            ++stats.replicationThrottled;
             if (connection->supportsAck()) {
                 ret = ENGINE_TMPFAIL;
             } else {
@@ -2664,7 +2772,7 @@ ENGINE_ERROR_CODE EventuallyPersistentEngine::tapNotify(const void *cookie,
         break;
     case TAP_FLUSH:
         ret = flush(cookie, 0);
-        LOG(EXTENSION_LOG_WARNING, "%s Received flush.\n",
+        LOG(EXTENSION_LOG_NOTICE, "%s Received flush.\n",
             connection->logHeader());
         break;
     case TAP_DELETION:
@@ -2790,7 +2898,7 @@ ENGINE_ERROR_CODE EventuallyPersistentEngine::tapNotify(const void *cookie,
                          "%s Failed to reset a vbucket %d. Force disconnect\n",
                             connection->logHeader(), vbucket);
                     } else {
-                        LOG(EXTENSION_LOG_WARNING,
+                        LOG(EXTENSION_LOG_NOTICE,
                          "%s Reset vbucket %d was completed succecssfully.\n",
                             connection->logHeader(), vbucket);
                     }
@@ -2900,7 +3008,7 @@ ENGINE_ERROR_CODE EventuallyPersistentEngine::ConnHandlerCheckPoint(
     else {
         ret = ENGINE_DISCONNECT;
         LOG(EXTENSION_LOG_WARNING, "%s Error processing "
-            "checkpoint %llu. Force disconnect\n",
+            "checkpoint %" PRIu64 ". Force disconnect\n",
             consumer->logHeader(), checkpointId);
     }
 
@@ -2922,6 +3030,13 @@ TapProducer* EventuallyPersistentEngine::getTapProducer(const void *cookie) {
         return NULL;
     }
     return rv;
+}
+
+void EventuallyPersistentEngine::initializeEngineCallbacks() {
+    // Register the ON_DISCONNECT callback
+    registerEngineCallback(ON_DISCONNECT, EvpHandleDisconnect, this);
+    // Register the ON_DELETE_BUCKET callback
+    registerEngineCallback(ON_DELETE_BUCKET, EvpHandleDeleteBucket, this);
 }
 
 ENGINE_ERROR_CODE EventuallyPersistentEngine::processTapAck(const void *cookie,
@@ -2983,33 +3098,26 @@ bool VBucketCountVisitor::visitBucket(RCPtr<VBucket> &vb) {
         queueDrain += vb->dirtyQueueDrain;
         queueAge += vb->getQueueAge();
         pendingWrites += vb->dirtyQueuePendingWrites;
+
+        rollbackItemCount += vb->getRollbackItemCount();
     }
 
     return false;
 }
 
-/**
- * A container class holding VBucketCountVisitors to aggregate stats for
- * different vbucket states.
- */
-class VBucketCountAggregator : public VBucketVisitor  {
-public:
-    bool visitBucket(RCPtr<VBucket> &vb)  {
-        std::map<vbucket_state_t, VBucketCountVisitor*>::iterator it;
-        it = visitorMap.find(vb->getState());
-        if ( it != visitorMap.end() ) {
-            it->second->visitBucket(vb);
-        }
-
-        return false;
+bool VBucketCountAggregator::visitBucket(RCPtr<VBucket> &vb) {
+    std::map<vbucket_state_t, VBucketCountVisitor*>::iterator it;
+    it = visitorMap.find(vb->getState());
+    if ( it != visitorMap.end() ) {
+        it->second->visitBucket(vb);
     }
 
-    void addVisitor(VBucketCountVisitor* visitor)  {
-        visitorMap[visitor->getVBucketState()] = visitor;
-    }
-private:
-    std::map<vbucket_state_t, VBucketCountVisitor*> visitorMap;
-};
+    return false;
+}
+
+void VBucketCountAggregator::addVisitor(VBucketCountVisitor* visitor) {
+    visitorMap[visitor->getVBucketState()] = visitor;
+}
 
 ENGINE_ERROR_CODE EventuallyPersistentEngine::doEngineStats(const void *cookie,
                                                            ADD_STAT add_stat) {
@@ -3031,7 +3139,7 @@ ENGINE_ERROR_CODE EventuallyPersistentEngine::doEngineStats(const void *cookie,
 
     epstore->updateCachedResidentRatio(activeCountVisitor.getMemResidentPer(),
                                       replicaCountVisitor.getMemResidentPer());
-    tapThrottle->adjustWriteQueueCap(activeCountVisitor.getNumItems() +
+    replicationThrottle->adjustWriteQueueCap(activeCountVisitor.getNumItems() +
                                      replicaCountVisitor.getNumItems() +
                                      pendingCountVisitor.getNumItems());
 
@@ -3064,6 +3172,8 @@ ENGINE_ERROR_CODE EventuallyPersistentEngine::doEngineStats(const void *cookie,
                     epstats.beginFailed, add_stat, cookie);
     add_casted_stat("ep_expired_access", epstats.expired_access,
                     add_stat, cookie);
+    add_casted_stat("ep_expired_compactor", epstats.expired_compactor,
+                    add_stat, cookie);
     add_casted_stat("ep_expired_pager", epstats.expired_pager,
                     add_stat, cookie);
     add_casted_stat("ep_item_flush_expired",
@@ -3091,9 +3201,8 @@ ENGINE_ERROR_CODE EventuallyPersistentEngine::doEngineStats(const void *cookie,
                     epstats.vbucketDeletionFail, add_stat, cookie);
     add_casted_stat("ep_flush_duration_total",
                     epstats.cumulativeFlushTime, add_stat, cookie);
-    add_casted_stat("ep_flush_all",
-                    epstore->isFlushAllScheduled() ? "true" : "false",
-                    add_stat, cookie);
+    add_casted_stat("ep_flush_all", epstore->isFlushAllScheduled(), add_stat,
+                    cookie);
     add_casted_stat("curr_items", activeCountVisitor.getNumItems(), add_stat,
                     cookie);
     add_casted_stat("curr_temp_items", activeCountVisitor.getNumTempItems(),
@@ -3148,6 +3257,9 @@ ENGINE_ERROR_CODE EventuallyPersistentEngine::doEngineStats(const void *cookie,
                     add_stat, cookie);
     add_casted_stat("vb_active_queue_drain",
                     activeCountVisitor.getQueueDrain(), add_stat, cookie);
+    add_casted_stat("vb_active_rollback_item_count",
+                    activeCountVisitor.getRollbackItemCount(),
+                    add_stat, cookie);
 
     add_casted_stat("vb_replica_num", replicaCountVisitor.getVBucketNumber(),
                     add_stat, cookie);
@@ -3193,6 +3305,9 @@ ENGINE_ERROR_CODE EventuallyPersistentEngine::doEngineStats(const void *cookie,
                     replicaCountVisitor.getQueueFill(), add_stat, cookie);
     add_casted_stat("vb_replica_queue_drain",
                     replicaCountVisitor.getQueueDrain(), add_stat, cookie);
+    add_casted_stat("vb_replica_rollback_item_count",
+                    replicaCountVisitor.getRollbackItemCount(),
+                    add_stat, cookie);
 
     add_casted_stat("vb_pending_num",
                     pendingCountVisitor.getVBucketNumber(), add_stat, cookie);
@@ -3240,6 +3355,9 @@ ENGINE_ERROR_CODE EventuallyPersistentEngine::doEngineStats(const void *cookie,
                     pendingCountVisitor.getQueueFill(), add_stat, cookie);
     add_casted_stat("vb_pending_queue_drain",
                     pendingCountVisitor.getQueueDrain(), add_stat, cookie);
+    add_casted_stat("vb_pending_rollback_item_count",
+                    pendingCountVisitor.getRollbackItemCount(),
+                    add_stat, cookie);
 
     add_casted_stat("vb_dead_num", deadCountVisitor.getVBucketNumber(),
                     add_stat, cookie);
@@ -3259,6 +3377,9 @@ ENGINE_ERROR_CODE EventuallyPersistentEngine::doEngineStats(const void *cookie,
 
     add_casted_stat("ep_vb_snapshot_total",
                     epstats.snapshotVbucketHisto.total(), add_stat, cookie);
+
+    add_casted_stat("ep_persist_vbstate_total",
+                    epstats.persistVBStateHisto.total(), add_stat, cookie);
 
     add_casted_stat("ep_vb_total",
                     activeCountVisitor.getVBucketNumber() +
@@ -3310,6 +3431,10 @@ ENGINE_ERROR_CODE EventuallyPersistentEngine::doEngineStats(const void *cookie,
 
     size_t memUsed =  stats.getTotalMemoryUsed();
     add_casted_stat("mem_used", memUsed, add_stat, cookie);
+    add_casted_stat("ep_mem_low_wat_percent", stats.mem_low_wat_percent,
+                    add_stat, cookie);
+    add_casted_stat("ep_mem_high_wat_percent", stats.mem_high_wat_percent,
+                    add_stat, cookie);
     add_casted_stat("bytes", memUsed, add_stat, cookie);
     add_casted_stat("ep_kv_size", stats.currentSize, add_stat, cookie);
     add_casted_stat("ep_blob_num", stats.numBlob, add_stat, cookie);
@@ -3334,11 +3459,17 @@ ENGINE_ERROR_CODE EventuallyPersistentEngine::doEngineStats(const void *cookie,
                     replicaCountVisitor.getCacheSize() +
                     pendingCountVisitor.getCacheSize(),
                     add_stat, cookie);
+
+    add_casted_stat("rollback_item_count",
+                    activeCountVisitor.getRollbackItemCount() +
+                    replicaCountVisitor.getRollbackItemCount() +
+                    pendingCountVisitor.getRollbackItemCount(),
+                    add_stat, cookie);
+
     add_casted_stat("ep_oom_errors", stats.oom_errors, add_stat, cookie);
     add_casted_stat("ep_tmp_oom_errors", stats.tmp_oom_errors,
                     add_stat, cookie);
-    add_casted_stat("ep_mem_tracker_enabled",
-                    stats.memoryTrackerEnabled ? "true" : "false",
+    add_casted_stat("ep_mem_tracker_enabled", stats.memoryTrackerEnabled,
                     add_stat, cookie);
     add_casted_stat("ep_bg_fetched", epstats.bg_fetched,
                     add_stat, cookie);
@@ -3427,22 +3558,23 @@ ENGINE_ERROR_CODE EventuallyPersistentEngine::doEngineStats(const void *cookie,
                     add_stat, cookie);
 
     add_casted_stat("ep_degraded_mode", isDegradedMode(), add_stat, cookie);
-    add_casted_stat("ep_exp_pager_stime", epstore->getExpiryPagerSleeptime(),
-                    add_stat, cookie);
 
     add_casted_stat("ep_mlog_compactor_runs", epstats.mlogCompactorRuns,
                     add_stat, cookie);
     add_casted_stat("ep_num_access_scanner_runs", epstats.alogRuns,
                     add_stat, cookie);
+    add_casted_stat("ep_num_access_scanner_skips",
+                    epstats.accessScannerSkips, add_stat, cookie);
     add_casted_stat("ep_access_scanner_last_runtime", epstats.alogRuntime,
                     add_stat, cookie);
     add_casted_stat("ep_access_scanner_num_items", epstats.alogNumItems,
                     add_stat, cookie);
 
-    if (getConfiguration().isAccessScannerEnabled()) {
+    if (epstore->isAccessScannerEnabled()) {
         char timestr[20];
         struct tm alogTim;
-        if (cb_gmtime_r((time_t *)&epstats.alogTime, &alogTim) == -1) {
+        hrtime_t alogTime = epstats.alogTime.load();
+        if (cb_gmtime_r((time_t *)&alogTime, &alogTim) == -1) {
             add_casted_stat("ep_access_scanner_task_time", "UNKNOWN", add_stat,
                             cookie);
         } else {
@@ -3455,11 +3587,30 @@ ENGINE_ERROR_CODE EventuallyPersistentEngine::doEngineStats(const void *cookie,
                         add_stat, cookie);
     }
 
-    add_casted_stat("ep_startup_time", startupTime, add_stat, cookie);
+    if (epstore->isExpPagerEnabled()) {
+        char timestr[20];
+        struct tm expPagerTim;
+        hrtime_t expPagerTime = epstats.expPagerTime.load();
+        if (cb_gmtime_r((time_t *)&expPagerTime, &expPagerTim) == -1) {
+            add_casted_stat("ep_expiry_pager_task_time", "UNKNOWN", add_stat,
+                            cookie);
+        } else {
+            strftime(timestr, 20, "%Y-%m-%d %H:%M:%S", &expPagerTim);
+            add_casted_stat("ep_expiry_pager_task_time", timestr, add_stat,
+                            cookie);
+        }
+    } else {
+        add_casted_stat("ep_expiry_pager_task_time", "NOT_SCHEDULED",
+                        add_stat, cookie);
+    }
+
+    add_casted_stat("ep_startup_time", startupTime.load(), add_stat, cookie);
 
     if (getConfiguration().isWarmup()) {
         Warmup *wp = epstore->getWarmup();
-        cb_assert(wp);
+        if (wp == nullptr) {
+            throw std::logic_error("EPEngine::doEngineStats: warmup is NULL");
+        }
         if (!epstore->isWarmingUp()) {
             add_casted_stat("ep_warmup_thread", "complete", add_stat, cookie);
         } else {
@@ -3506,6 +3657,31 @@ ENGINE_ERROR_CODE EventuallyPersistentEngine::doEngineStats(const void *cookie,
     add_casted_stat("ep_defragmenter_num_moved", epstats.defragNumMoved,
                     add_stat, cookie);
 
+    add_casted_stat("ep_cursor_dropping_lower_threshold",
+                    epstats.cursorDroppingLThreshold, add_stat, cookie);
+    add_casted_stat("ep_cursor_dropping_upper_threshold",
+                    epstats.cursorDroppingUThreshold, add_stat, cookie);
+    add_casted_stat("ep_cursors_dropped",
+                    epstats.cursorsDropped, add_stat, cookie);
+
+
+    // Note: These are also reported per-shard in 'kvstore' stats, however
+    // we want to be able to graph these over time, and hence need to expose
+    // to ns_sever at the top-level.
+    size_t value = 0;
+    if (epstore->getKVStoreStat("io_total_read_bytes", value)) {
+        add_casted_stat("ep_io_total_read_bytes",  value, add_stat, cookie);
+    }
+    if (epstore->getKVStoreStat("io_total_write_bytes", value)) {
+        add_casted_stat("ep_io_total_write_bytes",  value, add_stat, cookie);
+    }
+    if (epstore->getKVStoreStat("io_compaction_read_bytes", value)) {
+        add_casted_stat("ep_io_compaction_read_bytes",  value, add_stat, cookie);
+    }
+    if (epstore->getKVStoreStat("io_compaction_write_bytes", value)) {
+        add_casted_stat("ep_io_compaction_write_bytes",  value, add_stat, cookie);
+    }
+
     return ENGINE_SUCCESS;
 }
 
@@ -3518,7 +3694,11 @@ ENGINE_ERROR_CODE EventuallyPersistentEngine::doMemoryStats(const void *cookie,
     add_casted_stat("ep_overhead", stats.memOverhead, add_stat, cookie);
     add_casted_stat("ep_max_size", stats.getMaxDataSize(), add_stat, cookie);
     add_casted_stat("ep_mem_low_wat", stats.mem_low_wat, add_stat, cookie);
+    add_casted_stat("ep_mem_low_wat_percent", stats.mem_low_wat_percent,
+                    add_stat, cookie);
     add_casted_stat("ep_mem_high_wat", stats.mem_high_wat, add_stat, cookie);
+    add_casted_stat("ep_mem_high_wat_percent", stats.mem_high_wat_percent,
+                    add_stat, cookie);
     add_casted_stat("ep_oom_errors", stats.oom_errors, add_stat, cookie);
     add_casted_stat("ep_tmp_oom_errors", stats.tmp_oom_errors,
                     add_stat, cookie);
@@ -3538,11 +3718,6 @@ ENGINE_ERROR_CODE EventuallyPersistentEngine::doMemoryStats(const void *cookie,
 #endif
     add_casted_stat("ep_storedval_num", stats.numStoredVal, add_stat, cookie);
     add_casted_stat("ep_item_num", stats.numItem, add_stat, cookie);
-
-
-    add_casted_stat("ep_mem_tracker_enabled",
-                    stats.memoryTrackerEnabled ? "true" : "false",
-                    add_stat, cookie);
 
     std::map<std::string, size_t> alloc_stats;
     MemoryTracker::getInstance()->getAllocatorStats(alloc_stats);
@@ -3586,10 +3761,16 @@ ENGINE_ERROR_CODE EventuallyPersistentEngine::doVBucketStats(
             }
 
             if (isPrevStateRequested) {
-                char buf[16];
-                snprintf(buf, sizeof(buf), "vb_%d", vb->getId());
-                add_casted_stat(buf, VBucket::toString(vb->getInitialState()),
-                                add_stat, cookie);
+                try {
+                    char buf[16];
+                    checked_snprintf(buf, sizeof(buf), "vb_%d", vb->getId());
+                    add_casted_stat(buf,
+                                    VBucket::toString(vb->getInitialState()),
+                                    add_stat, cookie);
+                } catch (std::exception& error) {
+                    LOG(EXTENSION_LOG_WARNING,
+                        "addVBStats: Failed building stats: %s", error.what());
+                }
             } else {
                 vb->addStats(detailsRequested, add_stat, cookie,
                              store->getItemEvictionPolicy());
@@ -3637,35 +3818,49 @@ ENGINE_ERROR_CODE EventuallyPersistentEngine::doHashStats(const void *cookie,
         bool visitBucket(RCPtr<VBucket> &vb) {
             uint16_t vbid = vb->getId();
             char buf[32];
-            snprintf(buf, sizeof(buf), "vb_%d:state", vbid);
-            add_casted_stat(buf, VBucket::toString(vb->getState()),
-                            add_stat, cookie);
+            try {
+                checked_snprintf(buf, sizeof(buf), "vb_%d:state", vbid);
+                add_casted_stat(buf, VBucket::toString(vb->getState()),
+                                add_stat, cookie);
+            } catch (std::exception& error) {
+                LOG(EXTENSION_LOG_WARNING,
+                    "StatVBucketVisitor::visitBucket: Failed to build stat: %s",
+                    error.what());
+            }
 
             HashTableDepthStatVisitor depthVisitor;
             vb->ht.visitDepth(depthVisitor);
 
-            snprintf(buf, sizeof(buf), "vb_%d:size", vbid);
-            add_casted_stat(buf, vb->ht.getSize(), add_stat, cookie);
-            snprintf(buf, sizeof(buf), "vb_%d:locks", vbid);
-            add_casted_stat(buf, vb->ht.getNumLocks(), add_stat, cookie);
-            snprintf(buf, sizeof(buf), "vb_%d:min_depth", vbid);
-            add_casted_stat(buf, depthVisitor.min == -1 ? 0 : depthVisitor.min,
-                            add_stat, cookie);
-            snprintf(buf, sizeof(buf), "vb_%d:max_depth", vbid);
-            add_casted_stat(buf, depthVisitor.max, add_stat, cookie);
-            snprintf(buf, sizeof(buf), "vb_%d:histo", vbid);
-            add_casted_stat(buf, depthVisitor.depthHisto, add_stat, cookie);
-            snprintf(buf, sizeof(buf), "vb_%d:reported", vbid);
-            add_casted_stat(buf, vb->ht.getNumInMemoryItems(), add_stat, cookie);
-            snprintf(buf, sizeof(buf), "vb_%d:counted", vbid);
-            add_casted_stat(buf, depthVisitor.size, add_stat, cookie);
-            snprintf(buf, sizeof(buf), "vb_%d:resized", vbid);
-            add_casted_stat(buf, vb->ht.getNumResizes(), add_stat, cookie);
-            snprintf(buf, sizeof(buf), "vb_%d:mem_size", vbid);
-            add_casted_stat(buf, vb->ht.memSize, add_stat, cookie);
-            snprintf(buf, sizeof(buf), "vb_%d:mem_size_counted", vbid);
-            add_casted_stat(buf, depthVisitor.memUsed, add_stat, cookie);
-
+            try {
+                checked_snprintf(buf, sizeof(buf), "vb_%d:size", vbid);
+                add_casted_stat(buf, vb->ht.getSize(), add_stat, cookie);
+                checked_snprintf(buf, sizeof(buf), "vb_%d:locks", vbid);
+                add_casted_stat(buf, vb->ht.getNumLocks(), add_stat, cookie);
+                checked_snprintf(buf, sizeof(buf), "vb_%d:min_depth", vbid);
+                add_casted_stat(buf,
+                                depthVisitor.min == -1 ? 0 : depthVisitor.min,
+                                add_stat, cookie);
+                checked_snprintf(buf, sizeof(buf), "vb_%d:max_depth", vbid);
+                add_casted_stat(buf, depthVisitor.max, add_stat, cookie);
+                checked_snprintf(buf, sizeof(buf), "vb_%d:histo", vbid);
+                add_casted_stat(buf, depthVisitor.depthHisto, add_stat, cookie);
+                checked_snprintf(buf, sizeof(buf), "vb_%d:reported", vbid);
+                add_casted_stat(buf, vb->ht.getNumInMemoryItems(), add_stat,
+                                cookie);
+                checked_snprintf(buf, sizeof(buf), "vb_%d:counted", vbid);
+                add_casted_stat(buf, depthVisitor.size, add_stat, cookie);
+                checked_snprintf(buf, sizeof(buf), "vb_%d:resized", vbid);
+                add_casted_stat(buf, vb->ht.getNumResizes(), add_stat, cookie);
+                checked_snprintf(buf, sizeof(buf), "vb_%d:mem_size", vbid);
+                add_casted_stat(buf, vb->ht.memSize, add_stat, cookie);
+                checked_snprintf(buf, sizeof(buf), "vb_%d:mem_size_counted",
+                                 vbid);
+                add_casted_stat(buf, depthVisitor.memUsed, add_stat, cookie);
+            } catch (std::exception& error) {
+                LOG(EXTENSION_LOG_WARNING,
+                    "StatVBucketVisitor::visitBucket: Failed to build stat: %s",
+                    error.what());
+            }
             return false;
         }
 
@@ -3698,13 +3893,20 @@ public:
 
         uint16_t vbid = vb->getId();
         char buf[256];
-        snprintf(buf, sizeof(buf), "vb_%d:state", vbid);
-        add_casted_stat(buf, VBucket::toString(vb->getState()),
-                        add_stat, cookie);
-        vb->checkpointManager.addStats(add_stat, cookie);
-        snprintf(buf, sizeof(buf), "vb_%d:persisted_checkpoint_id", vbid);
-        add_casted_stat(buf, eps->getLastPersistedCheckpointId(vbid),
-                        add_stat, cookie);
+        try {
+            checked_snprintf(buf, sizeof(buf), "vb_%d:state", vbid);
+            add_casted_stat(buf, VBucket::toString(vb->getState()),
+                            add_stat, cookie);
+            vb->checkpointManager.addStats(add_stat, cookie);
+            checked_snprintf(buf, sizeof(buf), "vb_%d:persisted_checkpoint_id",
+                             vbid);
+            add_casted_stat(buf, eps->getLastPersistedCheckpointId(vbid),
+                            add_stat, cookie);
+        } catch (std::exception& error) {
+            LOG(EXTENSION_LOG_WARNING,
+                "StatCheckpointVisitor::addCheckpointStat: error building stats: %s",
+                error.what());
+        }
     }
 
     EventuallyPersistentStore *epstore;
@@ -3716,7 +3918,7 @@ public:
 class StatCheckpointTask : public GlobalTask {
 public:
     StatCheckpointTask(EventuallyPersistentEngine *e, const void *c,
-            ADD_STAT a) : GlobalTask(e, Priority::CheckpointStatsPriority,
+            ADD_STAT a) : GlobalTask(e, TaskId::StatCheckpointTask,
                                      0, false),
                           ep(e), cookie(c), add_stat(a) { }
     bool run(void) {
@@ -3772,23 +3974,23 @@ ENGINE_ERROR_CODE EventuallyPersistentEngine::doCheckpointStats(
  * Function object to send stats for a single tap or dcp connection.
  */
 struct ConnStatBuilder {
-    ConnStatBuilder(const void *c, ADD_STAT as, ConnCounter* tc)
+    ConnStatBuilder(const void *c, ADD_STAT as, ConnCounter& tc)
         : cookie(c), add_stat(as), aggregator(tc) {}
 
     void operator() (connection_t &tc) {
-        ++aggregator->totalConns;
+        ++aggregator.totalConns;
         tc->addStats(add_stat, cookie);
 
         Producer *tp = dynamic_cast<Producer*>(tc.get());
         if (tp) {
-            ++aggregator->totalProducers;
+            ++aggregator.totalProducers;
             tp->aggregateQueueStats(aggregator);
         }
     }
 
     const void *cookie;
     ADD_STAT    add_stat;
-    ConnCounter* aggregator;
+    ConnCounter& aggregator;
 };
 
 struct ConnAggStatBuilder {
@@ -3802,7 +4004,11 @@ struct ConnAggStatBuilder {
         if (tc.get()) {
             const std::string name(tc->getName());
             size_t pos1 = name.find(':');
-            cb_assert(pos1 != name.npos);
+            if (pos1 == name.npos) {
+                throw std::invalid_argument("ConnAggStatBuilder::getTarget: "
+                        "connection tc (which has name '" + tc->getName() +
+                        "' does not include a colon (:)");
+            }
             size_t pos2 = name.find(sep, pos1+1, sep_len);
             if (pos2 != name.npos) {
                 std::string prefix(name.substr(pos1+1, pos2 - pos1 - 1));
@@ -3824,7 +4030,7 @@ struct ConnAggStatBuilder {
             ++counter.totalProducers;
         }
 
-        c->aggregateQueueStats(&counter);
+        c->aggregateQueueStats(counter);
 
         ConnCounter* total = getTotalCounter();
         *total += counter;
@@ -3866,55 +4072,63 @@ static void showConnAggStat(const std::string &prefix,
                             ADD_STAT add_stat,
                             conn_type_t conn_type) {
 
-    char statname[80] = {0};
-    const size_t sl(sizeof(statname));
-    snprintf(statname, sl, "%s:count", prefix.c_str());
-    add_casted_stat(statname, counter->totalConns, add_stat, cookie);
+    try {
+        char statname[80] = {0};
+        const size_t sl(sizeof(statname));
+        checked_snprintf(statname, sl, "%s:count", prefix.c_str());
+        add_casted_stat(statname, counter->totalConns, add_stat, cookie);
 
-    snprintf(statname, sl, "%s:total_backlog_size", prefix.c_str());
-    add_casted_stat(statname, counter->conn_totalBacklogSize,
-                    add_stat, cookie);
-
-    snprintf(statname, sl, "%s:backoff", prefix.c_str());
-    add_casted_stat(statname, counter->conn_queueBackoff,
-                    add_stat, cookie);
-
-    if (conn_type == TAP_CONN) {
-        snprintf(statname, sl, "%s:qlen", prefix.c_str());
-        add_casted_stat(statname, counter->conn_queue, add_stat, cookie);
-
-        snprintf(statname, sl, "%s:fill", prefix.c_str());
-        add_casted_stat(statname, counter->conn_queueFill,
+        checked_snprintf(statname, sl, "%s:total_backlog_size", prefix.c_str());
+        add_casted_stat(statname, counter->conn_totalBacklogSize,
                         add_stat, cookie);
 
-        snprintf(statname, sl, "%s:drain", prefix.c_str());
-        add_casted_stat(statname, counter->conn_queueDrain,
+        checked_snprintf(statname, sl, "%s:backoff", prefix.c_str());
+        add_casted_stat(statname, counter->conn_queueBackoff,
                         add_stat, cookie);
 
-        snprintf(statname, sl, "%s:backfill_remaining", prefix.c_str());
-        add_casted_stat(statname, counter->conn_queueBackfillRemaining,
-                        add_stat, cookie);
+        if (conn_type == TAP_CONN) {
+            checked_snprintf(statname, sl, "%s:qlen", prefix.c_str());
+            add_casted_stat(statname, counter->conn_queue, add_stat, cookie);
 
-        snprintf(statname, sl, "%s:itemondisk", prefix.c_str());
-        add_casted_stat(statname, counter->conn_queueItemOnDisk,
-                        add_stat, cookie);
-    }
+            checked_snprintf(statname, sl, "%s:fill", prefix.c_str());
+            add_casted_stat(statname, counter->conn_queueFill,
+                            add_stat, cookie);
 
-    if (conn_type == DCP_CONN) {
-        snprintf(statname, sl, "%s:producer_count", prefix.c_str());
-        add_casted_stat(statname, counter->totalProducers, add_stat, cookie);
+            checked_snprintf(statname, sl, "%s:drain", prefix.c_str());
+            add_casted_stat(statname, counter->conn_queueDrain,
+                            add_stat, cookie);
 
-        snprintf(statname, sl, "%s:items_sent", prefix.c_str());
-        add_casted_stat(statname, counter->conn_queueDrain,
-                        add_stat, cookie);
+            checked_snprintf(statname, sl, "%s:backfill_remaining",
+                             prefix.c_str());
+            add_casted_stat(statname, counter->conn_queueBackfillRemaining,
+                            add_stat, cookie);
 
-        snprintf(statname, sl, "%s:items_remaining", prefix.c_str());
-        add_casted_stat(statname, counter->conn_queueRemaining,
-                        add_stat, cookie);
+            checked_snprintf(statname, sl, "%s:itemondisk", prefix.c_str());
+            add_casted_stat(statname, counter->conn_queueItemOnDisk,
+                            add_stat, cookie);
+        }
 
-        snprintf(statname, sl, "%s:total_bytes", prefix.c_str());
-        add_casted_stat(statname, counter->conn_totalBytes,
-                        add_stat, cookie);
+        if (conn_type == DCP_CONN) {
+            checked_snprintf(statname, sl, "%s:producer_count", prefix.c_str());
+            add_casted_stat(statname, counter->totalProducers, add_stat,
+                            cookie);
+
+            checked_snprintf(statname, sl, "%s:items_sent", prefix.c_str());
+            add_casted_stat(statname, counter->conn_queueDrain,
+                            add_stat, cookie);
+
+            checked_snprintf(statname, sl, "%s:items_remaining",
+                             prefix.c_str());
+            add_casted_stat(statname, counter->conn_queueRemaining,
+                            add_stat, cookie);
+
+            checked_snprintf(statname, sl, "%s:total_bytes", prefix.c_str());
+            add_casted_stat(statname, counter->conn_totalBytes,
+                            add_stat, cookie);
+        }
+    } catch (std::exception& error) {
+        LOG(EXTENSION_LOG_WARNING,
+            "showConnAggStat: Failed to build stats: %s", error.what());
     }
 }
 
@@ -3953,7 +4167,7 @@ ENGINE_ERROR_CODE EventuallyPersistentEngine::doConnAggStats(
 ENGINE_ERROR_CODE EventuallyPersistentEngine::doTapStats(const void *cookie,
                                                          ADD_STAT add_stat) {
     ConnCounter aggregator;
-    ConnStatBuilder tapVisitor(cookie, add_stat, &aggregator);
+    ConnStatBuilder tapVisitor(cookie, add_stat, aggregator);
     tapConnMap->each(tapVisitor);
 
     add_casted_stat("ep_tap_total_fetched", stats.numTapFetched,
@@ -3967,7 +4181,7 @@ ENGINE_ERROR_CODE EventuallyPersistentEngine::doTapStats(const void *cookie,
     add_casted_stat("ep_tap_fg_fetched", stats.numTapFGFetched,
                     add_stat, cookie);
     add_casted_stat("ep_tap_deletes", stats.numTapDeletes, add_stat, cookie);
-    add_casted_stat("ep_tap_throttled", stats.tapThrottled, add_stat, cookie);
+    add_casted_stat("ep_replication_throttled", stats.replicationThrottled, add_stat, cookie);
     add_casted_stat("ep_tap_noop_interval", tapConnMap->getNoopInterval(),
                     add_stat, cookie);
     add_casted_stat("ep_tap_count", aggregator.totalConns, add_stat, cookie);
@@ -3994,11 +4208,11 @@ ENGINE_ERROR_CODE EventuallyPersistentEngine::doTapStats(const void *cookie,
     add_casted_stat("ep_tap_backoff_period",
                     tapConfig->getBackoffSleepTime(),
                     add_stat, cookie);
-    add_casted_stat("ep_tap_throttle_threshold",
-                    stats.tapThrottleThreshold * 100.0,
+    add_casted_stat("ep_replication_throttle_threshold",
+                    stats.replicationThrottleThreshold * 100.0,
                     add_stat, cookie);
-    add_casted_stat("ep_tap_throttle_queue_cap",
-                    stats.tapThrottleWriteQueueCap, add_stat, cookie);
+    add_casted_stat("ep_replication_throttle_queue_cap",
+                    stats.replicationThrottleWriteQueueCap, add_stat, cookie);
 
     if (stats.tapBgNumOperations > 0) {
         add_casted_stat("ep_tap_bg_num_samples", stats.tapBgNumOperations,
@@ -4029,7 +4243,7 @@ ENGINE_ERROR_CODE EventuallyPersistentEngine::doTapStats(const void *cookie,
 ENGINE_ERROR_CODE EventuallyPersistentEngine::doDcpStats(const void *cookie,
                                                          ADD_STAT add_stat) {
     ConnCounter aggregator;
-    ConnStatBuilder dcpVisitor(cookie, add_stat, &aggregator);
+    ConnStatBuilder dcpVisitor(cookie, add_stat, aggregator);
     dcpConnMap_->each(dcpVisitor);
 
     add_casted_stat("ep_dcp_count", aggregator.totalConns, add_stat, cookie);
@@ -4050,6 +4264,7 @@ ENGINE_ERROR_CODE EventuallyPersistentEngine::doDcpStats(const void *cookie,
     add_casted_stat("ep_dcp_max_running_backfills",
                     dcpConnMap_->getMaxActiveSnoozingBackfills(), add_stat, cookie);
 
+    dcpConnMap_->addStats(add_stat, cookie);
     return ENGINE_SUCCESS;
 }
 
@@ -4061,7 +4276,7 @@ ENGINE_ERROR_CODE EventuallyPersistentEngine::doKeyStats(const void *cookie,
     ENGINE_ERROR_CODE rv = ENGINE_FAILED;
 
     Item *it = NULL;
-    shared_ptr<Item> diskItem;
+    std::shared_ptr<Item> diskItem;
     struct key_stats kstats;
 
     if (fetchLookupResult(cookie, &it)) {
@@ -4157,6 +4372,12 @@ ENGINE_ERROR_CODE EventuallyPersistentEngine::doTimingStats(const void *cookie,
     add_casted_stat("bg_tap_load", stats.tapBgLoadHisto, add_stat, cookie);
     add_casted_stat("pending_ops", stats.pendingOpsHisto, add_stat, cookie);
 
+    // Vbucket visitors
+    add_casted_stat("access_scanner", stats.accessScannerHisto, add_stat, cookie);
+    add_casted_stat("checkpoint_remover", stats.checkpointRemoverHisto, add_stat, cookie);
+    add_casted_stat("item_pager", stats.itemPagerHisto, add_stat, cookie);
+    add_casted_stat("expiry_pager", stats.expiryPagerHisto, add_stat, cookie);
+
     add_casted_stat("storage_age", stats.dirtyAgeHisto, add_stat, cookie);
 
     // Regular commands
@@ -4187,6 +4408,8 @@ ENGINE_ERROR_CODE EventuallyPersistentEngine::doTimingStats(const void *cookie,
     add_casted_stat("disk_commit", stats.diskCommitHisto, add_stat, cookie);
     add_casted_stat("disk_vbstate_snapshot", stats.snapshotVbucketHisto,
                     add_stat, cookie);
+    add_casted_stat("disk_persist_vbstate", stats.persistVBStateHisto,
+                    add_stat, cookie);
 
     add_casted_stat("item_alloc_sizes", stats.itemAllocSizeHisto,
                     add_stat, cookie);
@@ -4197,9 +4420,9 @@ ENGINE_ERROR_CODE EventuallyPersistentEngine::doSchedulerStats(const void
                                                                 *cookie,
                                                                 ADD_STAT
                                                                 add_stat) {
-    for (size_t i = 0; i < MAX_TYPE_ID; ++i) {
-        add_casted_stat(Priority::getTypeName(static_cast<type_id_t>(i)),
-                        stats.schedulingHisto[i],
+    for (TaskId id : GlobalTask::allTaskIds) {
+        add_casted_stat(GlobalTask::getTaskName(id),
+                        stats.schedulingHisto[static_cast<int>(id)],
                         add_stat, cookie);
     }
 
@@ -4210,9 +4433,9 @@ ENGINE_ERROR_CODE EventuallyPersistentEngine::doRunTimeStats(const void
                                                                 *cookie,
                                                                 ADD_STAT
                                                                 add_stat) {
-    for (size_t i = 0; i < MAX_TYPE_ID; ++i) {
-        add_casted_stat(Priority::getTypeName(static_cast<type_id_t>(i)),
-                        stats.taskRuntimeHisto[i],
+    for (TaskId id : GlobalTask::allTaskIds) {
+        add_casted_stat(GlobalTask::getTaskName(id),
+                        stats.taskRuntimeHisto[static_cast<int>(id)],
                         add_stat, cookie);
     }
 
@@ -4232,56 +4455,110 @@ ENGINE_ERROR_CODE EventuallyPersistentEngine::doWorkloadStats(const void
                                                               *cookie,
                                                               ADD_STAT
                                                               add_stat) {
-    char statname[80] = {0};
-    ExecutorPool *expool = ExecutorPool::get();
+    try {
+        char statname[80] = {0};
+        ExecutorPool* expool = ExecutorPool::get();
 
-    int readers = expool->getNumReaders();
-    snprintf(statname, sizeof(statname), "ep_workload:num_readers");
-    add_casted_stat(statname, readers, add_stat, cookie);
+        int readers = expool->getNumReaders();
+        checked_snprintf(statname, sizeof(statname), "ep_workload:num_readers");
+        add_casted_stat(statname, readers, add_stat, cookie);
 
-    int writers = expool->getNumWriters();
-    snprintf(statname, sizeof(statname), "ep_workload:num_writers");
-    add_casted_stat(statname, writers, add_stat, cookie);
+        int writers = expool->getNumWriters();
+        checked_snprintf(statname, sizeof(statname), "ep_workload:num_writers");
+        add_casted_stat(statname, writers, add_stat, cookie);
 
-    int auxio = expool->getNumAuxIO();
-    snprintf(statname, sizeof(statname), "ep_workload:num_auxio");
-    add_casted_stat(statname, auxio, add_stat, cookie);
+        int auxio = expool->getNumAuxIO();
+        checked_snprintf(statname, sizeof(statname), "ep_workload:num_auxio");
+        add_casted_stat(statname, auxio, add_stat, cookie);
 
-    int nonio = expool->getNumNonIO();
-    snprintf(statname, sizeof(statname), "ep_workload:num_nonio");
-    add_casted_stat(statname, nonio, add_stat, cookie);
+        int nonio = expool->getNumNonIO();
+        checked_snprintf(statname, sizeof(statname), "ep_workload:num_nonio");
+        add_casted_stat(statname, nonio, add_stat, cookie);
 
-    int max_readers = expool->getMaxReaders();
-    snprintf(statname, sizeof(statname), "ep_workload:max_readers");
-    add_casted_stat(statname, max_readers, add_stat, cookie);
+        int max_readers = expool->getMaxReaders();
+        checked_snprintf(statname, sizeof(statname), "ep_workload:max_readers");
+        add_casted_stat(statname, max_readers, add_stat, cookie);
 
-    int max_writers = expool->getMaxWriters();
-    snprintf(statname, sizeof(statname), "ep_workload:max_writers");
-    add_casted_stat(statname, max_writers, add_stat, cookie);
+        int max_writers = expool->getMaxWriters();
+        checked_snprintf(statname, sizeof(statname), "ep_workload:max_writers");
+        add_casted_stat(statname, max_writers, add_stat, cookie);
 
-    int max_auxio = expool->getMaxAuxIO();
-    snprintf(statname, sizeof(statname), "ep_workload:max_auxio");
-    add_casted_stat(statname, max_auxio, add_stat, cookie);
+        int max_auxio = expool->getMaxAuxIO();
+        checked_snprintf(statname, sizeof(statname), "ep_workload:max_auxio");
+        add_casted_stat(statname, max_auxio, add_stat, cookie);
 
-    int max_nonio = expool->getMaxNonIO();
-    snprintf(statname, sizeof(statname), "ep_workload:max_nonio");
-    add_casted_stat(statname, max_nonio, add_stat, cookie);
+        int max_nonio = expool->getMaxNonIO();
+        checked_snprintf(statname, sizeof(statname), "ep_workload:max_nonio");
+        add_casted_stat(statname, max_nonio, add_stat, cookie);
 
-    int shards = workload->getNumShards();
-    snprintf(statname, sizeof(statname), "ep_workload:num_shards");
-    add_casted_stat(statname, shards, add_stat, cookie);
+        int shards = workload->getNumShards();
+        checked_snprintf(statname, sizeof(statname), "ep_workload:num_shards");
+        add_casted_stat(statname, shards, add_stat, cookie);
 
-    int numReadyTasks = expool->getNumReadyTasks();
-    snprintf(statname, sizeof(statname), "ep_workload:ready_tasks");
-    add_casted_stat(statname, numReadyTasks, add_stat, cookie);
+        int numReadyTasks = expool->getNumReadyTasks();
+        checked_snprintf(statname, sizeof(statname), "ep_workload:ready_tasks");
+        add_casted_stat(statname, numReadyTasks, add_stat, cookie);
 
-    int numSleepers = expool->getNumSleepers();
-    snprintf(statname, sizeof(statname), "ep_workload:num_sleepers");
-    add_casted_stat(statname, numSleepers, add_stat, cookie);
+        int numSleepers = expool->getNumSleepers();
+        checked_snprintf(statname, sizeof(statname),
+                         "ep_workload:num_sleepers");
+        add_casted_stat(statname, numSleepers, add_stat, cookie);
 
-    expool->doTaskQStat(ObjectRegistry::getCurrentEngine(),
-                                      cookie, add_stat);
+        expool->doTaskQStat(ObjectRegistry::getCurrentEngine(),
+                            cookie, add_stat);
+
+    } catch (std::exception& error) {
+        LOG(EXTENSION_LOG_WARNING,
+            "doWorkloadStats: Error building stats: %s", error.what());
+    }
+
     return ENGINE_SUCCESS;
+}
+
+void EventuallyPersistentEngine::addSeqnoVbStats(const void *cookie,
+                                                 ADD_STAT add_stat,
+                                                 const RCPtr<VBucket> &vb) {
+    // MB-19359: An atomic read of vbucket state without acquiring the
+    // reader lock for state should suffice here.
+    uint64_t relHighSeqno = vb->getHighSeqno();
+    if (vb->getState() != vbucket_state_active) {
+        snapshot_info_t info = vb->checkpointManager.getSnapshotInfo();
+        relHighSeqno = info.range.end;
+    }
+
+    try {
+        char buffer[64];
+        failover_entry_t entry = vb->failovers->getLatestEntry();
+        checked_snprintf(buffer, sizeof(buffer), "vb_%d:high_seqno",
+                         vb->getId());
+        add_casted_stat(buffer, relHighSeqno, add_stat, cookie);
+        checked_snprintf(buffer, sizeof(buffer), "vb_%d:abs_high_seqno",
+                         vb->getId());
+        add_casted_stat(buffer, vb->getHighSeqno(), add_stat, cookie);
+        checked_snprintf(buffer, sizeof(buffer), "vb_%d:last_persisted_seqno",
+                         vb->getId());
+        add_casted_stat(buffer,
+                        epstore->getVBuckets().getPersistenceSeqno(vb->getId()),
+                        add_stat, cookie);
+        checked_snprintf(buffer, sizeof(buffer), "vb_%d:uuid", vb->getId());
+        add_casted_stat(buffer, entry.vb_uuid, add_stat, cookie);
+        checked_snprintf(buffer, sizeof(buffer), "vb_%d:purge_seqno",
+                         vb->getId());
+        add_casted_stat(buffer, vb->getPurgeSeqno(), add_stat, cookie);
+        snapshot_range_t range;
+        vb->getPersistedSnapshot(range);
+        checked_snprintf(buffer, sizeof(buffer),
+                         "vb_%d:last_persisted_snap_start",
+                         vb->getId());
+        add_casted_stat(buffer, range.start, add_stat, cookie);
+        checked_snprintf(buffer, sizeof(buffer),
+                         "vb_%d:last_persisted_snap_end",
+                         vb->getId());
+        add_casted_stat(buffer, range.end, add_stat, cookie);
+    } catch (std::exception& error) {
+        LOG(EXTENSION_LOG_WARNING,
+            "addSeqnoVbStats: error building stats: %s", error.what());
+    }
 }
 
 ENGINE_ERROR_CODE EventuallyPersistentEngine::doSeqnoStats(const void *cookie,
@@ -4299,48 +4576,20 @@ ENGINE_ERROR_CODE EventuallyPersistentEngine::doSeqnoStats(const void *cookie,
 
         int vbucket = atoi(value.c_str());
         RCPtr<VBucket> vb = getVBucket(vbucket);
-        if (!vb) {
+        if (!vb || vb->getState() == vbucket_state_dead) {
             return ENGINE_NOT_MY_VBUCKET;
         }
 
-        uint64_t relHighSeqno = vb->getHighSeqno();
-        if (vb->getState() != vbucket_state_active) {
-            relHighSeqno = vb->checkpointManager.getLastClosedChkBySeqno();
-        }
+        addSeqnoVbStats(cookie, add_stat, vb);
 
-        char buffer[32];
-        failover_entry_t entry = vb->failovers->getLatestEntry();
-        snprintf(buffer, sizeof(buffer), "vb_%d:high_seqno", vb->getId());
-        add_casted_stat(buffer, relHighSeqno, add_stat, cookie);
-        snprintf(buffer, sizeof(buffer), "vb_%d:abs_high_seqno", vb->getId());
-        add_casted_stat(buffer, vb->getHighSeqno(), add_stat, cookie);
-        snprintf(buffer, sizeof(buffer), "vb_%d:uuid", vb->getId());
-        add_casted_stat(buffer, entry.vb_uuid, add_stat, cookie);
-        snprintf(buffer, sizeof(buffer), "vb_%d:purge_seqno", vb->getId());
-        add_casted_stat(buffer, vb->getPurgeSeqno(), add_stat, cookie);
         return ENGINE_SUCCESS;
     }
 
-    std::vector<int> vbuckets = epstore->getVBuckets().getBuckets();
-    std::vector<int>::iterator itr = vbuckets.begin();
-    for (; itr != vbuckets.end(); ++itr) {
-        RCPtr<VBucket> vb = getVBucket(*itr);
+    auto vbuckets = epstore->getVBuckets().getBuckets();
+    for (auto vbid : vbuckets) {
+        RCPtr<VBucket> vb = getVBucket(vbid);
         if (vb) {
-            uint64_t relHighSeqno = vb->getHighSeqno();
-            if (vb->getState() != vbucket_state_active) {
-                relHighSeqno = vb->checkpointManager.getLastClosedChkBySeqno();
-            }
-
-            char buffer[32];
-            failover_entry_t entry = vb->failovers->getLatestEntry();
-            snprintf(buffer, sizeof(buffer), "vb_%d:high_seqno", vb->getId());
-            add_casted_stat(buffer, relHighSeqno, add_stat, cookie);
-            snprintf(buffer, sizeof(buffer), "vb_%d:abs_high_seqno", vb->getId());
-            add_casted_stat(buffer, vb->getHighSeqno(), add_stat, cookie);
-            snprintf(buffer, sizeof(buffer), "vb_%d:uuid", vb->getId());
-            add_casted_stat(buffer, entry.vb_uuid, add_stat, cookie);
-            snprintf(buffer, sizeof(buffer), "vb_%d:purge_seqno", vb->getId());
-            add_casted_stat(buffer, vb->getPurgeSeqno(), add_stat, cookie);
+            addSeqnoVbStats(cookie, add_stat, vb);
         }
     }
     return ENGINE_SUCCESS;
@@ -4371,10 +4620,16 @@ ENGINE_ERROR_CODE EventuallyPersistentEngine::doDiskStats(const void *cookie,
                 char buf[32];
                 uint16_t vbid = vb->getId();
 
-                snprintf(buf, sizeof(buf), "vb_%d:data_size", vbid);
-                add_casted_stat(buf, vb->fileSpaceUsed, add_stat, cookie);
-                snprintf(buf, sizeof(buf), "vb_%d:file_size", vbid);
-                add_casted_stat(buf, vb->fileSize, add_stat, cookie);
+                try {
+                    checked_snprintf(buf, sizeof(buf), "vb_%d:data_size", vbid);
+                    add_casted_stat(buf, vb->fileSpaceUsed, add_stat, cookie);
+                    checked_snprintf(buf, sizeof(buf), "vb_%d:file_size", vbid);
+                    add_casted_stat(buf, vb->fileSize, add_stat, cookie);
+                } catch (std::exception& error) {
+                    LOG(EXTENSION_LOG_WARNING,
+                        "DiskStatVisitor::visitBucket: Failed to build stat: %s",
+                        error.what());
+                }
             }
 
             fileSpaceUsed += vb->fileSpaceUsed;
@@ -4417,13 +4672,21 @@ void EventuallyPersistentEngine::runDefragmenterTask(void) {
     epstore->runDefragmenterTask();
 }
 
+bool EventuallyPersistentEngine::runAccessScannerTask(void) {
+    return epstore->runAccessScannerTask();
+}
+
+void EventuallyPersistentEngine::runVbStatePersistTask(int vbid) {
+    epstore->runVbStatePersistTask(vbid);
+}
+
 ENGINE_ERROR_CODE EventuallyPersistentEngine::getStats(const void* cookie,
                                                        const char* stat_key,
                                                        int nkey,
                                                        ADD_STAT add_stat) {
     BlockTimer timer(&stats.getStatsCmdHisto);
     if (stat_key != NULL) {
-        LOG(EXTENSION_LOG_DEBUG, "stats %s %d", stat_key, nkey);
+        LOG(EXTENSION_LOG_DEBUG, "stats %.*s", nkey, stat_key);
     } else {
         LOG(EXTENSION_LOG_DEBUG, "stats engine");
     }
@@ -4627,13 +4890,7 @@ ENGINE_ERROR_CODE EventuallyPersistentEngine::observe(
         } else if (rv == ENGINE_KEY_ENOENT) {
             keystatus = OBS_STATE_NOT_FOUND;
         } else if (rv == ENGINE_NOT_MY_VBUCKET) {
-            LockHolder lh(clusterConfig.lock);
-            return sendResponse(response, NULL, 0, NULL, 0,
-                                clusterConfig.config,
-                                clusterConfig.len,
-                                PROTOCOL_BINARY_RAW_BYTES,
-                                PROTOCOL_BINARY_RESPONSE_NOT_MY_VBUCKET, 0,
-                                cookie);
+            return sendNotMyVBucketResponse(response, cookie, 0);
         } else if (rv == ENGINE_EWOULDBLOCK) {
             return rv;
         } else {
@@ -4692,18 +4949,18 @@ ENGINE_ERROR_CODE EventuallyPersistentEngine::observe_seqno(
     memcpy(&vb_uuid, data, sizeof(uint64_t));
     vb_uuid = ntohll(vb_uuid);
 
-    LOG(EXTENSION_LOG_DEBUG, "Observing vbucket: %d with uuid: %llu\n",
+    LOG(EXTENSION_LOG_DEBUG, "Observing vbucket: %d with uuid: %" PRIu64,
                              vb_id, vb_uuid);
 
     RCPtr<VBucket> vb = epstore->getVBucket(vb_id);
 
     if (!vb) {
-        LockHolder lh(clusterConfig.lock);
-        return sendResponse(response, NULL, 0, NULL, 0,
-                            clusterConfig.config, clusterConfig.len,
-                            PROTOCOL_BINARY_RAW_BYTES,
-                            PROTOCOL_BINARY_RESPONSE_NOT_MY_VBUCKET, 0,
-                            cookie);
+        return sendNotMyVBucketResponse(response, cookie, 0);
+    }
+
+    ReaderLockHolder rlh(vb->getStateLock());
+    if (vb->getState() == vbucket_state_dead) {
+        return sendNotMyVBucketResponse(response, cookie, 0);
     }
 
     //Check if the vb uuid matches with the latest entry
@@ -4833,11 +5090,7 @@ ENGINE_ERROR_CODE EventuallyPersistentEngine::touch(const void *cookie,
                               msg.length(), PROTOCOL_BINARY_RAW_BYTES,
                               PROTOCOL_BINARY_RESPONSE_ETMPFAIL, 0, cookie);
         } else {
-            LockHolder lh(clusterConfig.lock);
-            rv = sendResponse(response, NULL, 0, NULL, 0, clusterConfig.config,
-                              clusterConfig.len, PROTOCOL_BINARY_RAW_BYTES,
-                              PROTOCOL_BINARY_RESPONSE_NOT_MY_VBUCKET, 0,
-                              cookie);
+            rv = sendNotMyVBucketResponse(response, cookie, 0);
         }
     }
 
@@ -4863,10 +5116,7 @@ ENGINE_ERROR_CODE EventuallyPersistentEngine::deregisterTapClient(
         // If the tap connection is not found, we still need to remove
         /// its checkpoint cursors.
         const VBucketMap &vbuckets = getEpStore()->getVBuckets();
-        size_t numOfVBuckets = vbuckets.getSize();
-        for (size_t i = 0; i < numOfVBuckets; ++i) {
-            cb_assert(i <= std::numeric_limits<uint16_t>::max());
-            uint16_t vbid = static_cast<uint16_t>(i);
+        for (VBucketMap::id_type vbid = 0; vbid < vbuckets.getSize(); ++vbid) {
             RCPtr<VBucket> vb = vbuckets.getBucket(vbid);
             if (!vb) {
                 continue;
@@ -4890,12 +5140,7 @@ EventuallyPersistentEngine::handleCheckpointCmds(const void *cookie,
     RCPtr<VBucket> vb = getVBucket(vbucket);
 
     if (!vb) {
-        LockHolder lh(clusterConfig.lock);
-        return sendResponse(response, NULL, 0, NULL, 0,
-                            clusterConfig.config, clusterConfig.len,
-                            PROTOCOL_BINARY_RAW_BYTES,
-                            PROTOCOL_BINARY_RESPONSE_NOT_MY_VBUCKET, 0,
-                            cookie);
+        return sendNotMyVBucketResponse(response, cookie, 0);
     }
 
     int16_t status = PROTOCOL_BINARY_RESPONSE_SUCCESS;
@@ -4914,12 +5159,7 @@ EventuallyPersistentEngine::handleCheckpointCmds(const void *cookie,
         break;
     case PROTOCOL_BINARY_CMD_CREATE_CHECKPOINT:
         if (vb->getState() != vbucket_state_active) {
-            status = PROTOCOL_BINARY_RESPONSE_NOT_MY_VBUCKET;
-            LockHolder lh(clusterConfig.lock);
-            return sendResponse(response, NULL, 0, NULL, 0,
-                                clusterConfig.config, clusterConfig.len,
-                                PROTOCOL_BINARY_RAW_BYTES,
-                                status, 0, cookie);
+            return sendNotMyVBucketResponse(response, cookie, 0);
 
         } else {
             uint64_t checkpointId = htonll(vb->checkpointManager.
@@ -4960,7 +5200,7 @@ EventuallyPersistentEngine::handleCheckpointCmds(const void *cookie,
                 } else {
                     storeEngineSpecific(cookie, NULL);
                     LOG(EXTENSION_LOG_INFO,
-                        "Checkpoint %llu persisted for vbucket %d.",
+                        "Checkpoint %" PRIu64 " persisted for vbucket %d.",
                         chk_id, vbucket);
                 }
             }
@@ -4990,12 +5230,7 @@ EventuallyPersistentEngine::handleSeqnoCmds(const void *cookie,
     RCPtr<VBucket> vb = getVBucket(vbucket);
 
     if (!vb) {
-        LockHolder lh(clusterConfig.lock);
-        return sendResponse(response, NULL, 0, NULL, 0,
-                            clusterConfig.config, clusterConfig.len,
-                            PROTOCOL_BINARY_RAW_BYTES,
-                            PROTOCOL_BINARY_RESPONSE_NOT_MY_VBUCKET, 0,
-                            cookie);
+        return sendNotMyVBucketResponse(response, cookie, 0);
     }
 
     int16_t status = PROTOCOL_BINARY_RESPONSE_SUCCESS;
@@ -5021,7 +5256,7 @@ EventuallyPersistentEngine::handleSeqnoCmds(const void *cookie,
         } else {
             storeEngineSpecific(cookie, NULL);
             LOG(EXTENSION_LOG_INFO,
-                "Sequence number %llu persisted for vbucket %d.",
+                "Sequence number %" PRIu64 " persisted for vbucket %d.",
                 seqno, vbucket);
         }
     }
@@ -5136,10 +5371,7 @@ ENGINE_ERROR_CODE EventuallyPersistentEngine::getMeta(const void* cookie,
                           PROTOCOL_BINARY_RESPONSE_SUCCESS,
                           metadata.cas, cookie);
     } else if (rv == ENGINE_NOT_MY_VBUCKET) {
-        LockHolder lh(clusterConfig.lock);
-        rv = sendResponse(response, NULL, 0, NULL, 0, clusterConfig.config,
-                          clusterConfig.len, PROTOCOL_BINARY_RAW_BYTES,
-                          PROTOCOL_BINARY_RESPONSE_NOT_MY_VBUCKET, 0, cookie);
+        rv = sendNotMyVBucketResponse(response, cookie, 0);
     } else if (rv != ENGINE_EWOULDBLOCK) {
         if (rv == ENGINE_KEY_ENOENT &&
             request->message.header.request.opcode == PROTOCOL_BINARY_CMD_GETQ_META) {
@@ -5329,10 +5561,7 @@ ENGINE_ERROR_CODE EventuallyPersistentEngine::setWithMeta(const void* cookie,
     }
 
     if (ret == ENGINE_NOT_MY_VBUCKET) {
-        LockHolder lh(clusterConfig.lock);
-        return sendResponse(response, NULL, 0, NULL, 0, clusterConfig.config,
-                            clusterConfig.len, PROTOCOL_BINARY_RAW_BYTES,
-                            rc, cas, cookie);
+        return sendNotMyVBucketResponse(response, cookie, cas);
     }
 
     if (ret == ENGINE_SUCCESS && isMutationExtrasSupported(cookie)) {
@@ -5448,10 +5677,7 @@ ENGINE_ERROR_CODE EventuallyPersistentEngine::deleteWithMeta(
     }
 
     if (ret == ENGINE_NOT_MY_VBUCKET) {
-        LockHolder lh(clusterConfig.lock);
-        return sendResponse(response, NULL, 0, NULL, 0, clusterConfig.config,
-                            clusterConfig.len, PROTOCOL_BINARY_RAW_BYTES,
-                            rc, cas, cookie);
+        return sendNotMyVBucketResponse(response, cookie, cas);
     }
 
     if (ret == ENGINE_SUCCESS && isMutationExtrasSupported(cookie)) {
@@ -5547,6 +5773,12 @@ EventuallyPersistentEngine::handleTrafficControlCmd(const void *cookie,
             // engine is still warming up, do not turn on data traffic yet
             msg << "Persistent engine is still warming up!";
             status = PROTOCOL_BINARY_RESPONSE_ETMPFAIL;
+        } else if (epstore->isWarmupOOMFailure()) {
+            // engine has completed warm up, but data traffic cannot be
+            // turned on due to an OOM failure
+            msg << "Data traffic to persistent engine cannot be enabled"
+                   " due to out of memory failures during warmup";
+            status = PROTOCOL_BINARY_RESPONSE_ENOMEM;
         } else {
             if (enableTraffic(true)) {
                 msg << "Data traffic to persistence engine is enabled";
@@ -5590,8 +5822,17 @@ EventuallyPersistentEngine::doDcpVbTakeoverStats(const void *cookie,
     const connection_t &conn = dcpConnMap_->findByName(dcpName);
     if (!conn) {
         size_t vb_items = vb->getNumItems(epstore->getItemEvictionPolicy());
-        size_t del_items = epstore->getRWUnderlying(vbid)->
+
+        size_t del_items = 0;
+        try {
+            del_items = epstore->getRWUnderlying(vbid)->
                                            getNumPersistedDeletes(vbid);
+        } catch (std::runtime_error& e) {
+            LOG(EXTENSION_LOG_WARNING,
+                "doDcpVbTakeoverStats: exception while getting num "
+                "persisted deletes for vbucket:%" PRIu16 " - treating as 0 "
+                "deletes. Details: %s", vbid, e.what());
+        }
         size_t chk_items = vb_items > 0 ?
                            vb->checkpointManager.getNumOpenChkItems() : 0;
         add_casted_stat("status", "does_not_exist", add_stat, cookie);
@@ -5623,8 +5864,17 @@ EventuallyPersistentEngine::doTapVbTakeoverStats(const void *cookie,
     std::string tapName("eq_tapq:");
     tapName.append(key);
     size_t vb_items = vb->getNumItems(epstore->getItemEvictionPolicy());
-    size_t del_items = epstore->getRWUnderlying(vbid)->
-                                           getNumPersistedDeletes(vbid);
+
+    size_t del_items = 0;
+    try {
+        del_items = epstore->getRWUnderlying(vbid)->
+                getNumPersistedDeletes(vbid);
+    } catch (std::runtime_error& e) {
+        LOG(EXTENSION_LOG_WARNING,
+            "doTapVbTakeoverStats: exception while getting num persisted "
+            "deletes for vbucket:%" PRIu16 " - treating as 0 deletes. "
+            "Details: %s", vbid, e.what());
+    }
 
     add_casted_stat("name", tapName, add_stat, cookie);
 
@@ -5743,11 +5993,7 @@ EventuallyPersistentEngine::returnMeta(const void* cookie,
     }
 
     if (ret == ENGINE_NOT_MY_VBUCKET) {
-        LockHolder lh(clusterConfig.lock);
-        return sendResponse(response, NULL, 0, NULL, 0, clusterConfig.config,
-                            clusterConfig.len, PROTOCOL_BINARY_RAW_BYTES,
-                            PROTOCOL_BINARY_RESPONSE_NOT_MY_VBUCKET, cas,
-                            cookie);
+        return sendNotMyVBucketResponse(response, cookie, cas);
     } else if (ret == ENGINE_EWOULDBLOCK) {
         return ret;
     } else if (ret != ENGINE_SUCCESS) {
@@ -5773,36 +6019,47 @@ EventuallyPersistentEngine::setClusterConfig(const void* cookie,
                            protocol_binary_request_set_cluster_config *request,
                            ADD_RESPONSE response) {
 
-    LOG(EXTENSION_LOG_DEBUG, "Updating cluster configuration!");
     uint64_t cas = ntohll(request->message.header.request.cas);
     uint32_t bodylen = ntohl(request->message.header.request.bodylen);
-    if (bodylen > clusterConfig.len) {
-        uint8_t *temp = (uint8_t*) malloc(bodylen);
-        memcpy (temp, request->bytes + sizeof(request->bytes), bodylen);
-        LockHolder lh(clusterConfig.lock);
-        free (clusterConfig.config);
-        clusterConfig.config = temp;
-        clusterConfig.len = bodylen;
-        lh.unlock();
-    } else {
-        LockHolder lh(clusterConfig.lock);
-        memcpy (clusterConfig.config, request->bytes + sizeof(request->bytes),
-                bodylen);
-        clusterConfig.len = bodylen;
-        lh.unlock();
+    {
+        try {
+            LockHolder lh(clusterConfig.lock);
+            const uint8_t* body = request->bytes + sizeof(request->message.header);
+            clusterConfig.config.assign(body, body + bodylen);
+        } catch (std::bad_alloc& e) {
+            LOG(EXTENSION_LOG_WARNING,
+                "Failed to update cluster configuration - %s", e.what());
+            return sendResponse(response, nullptr, 0, nullptr, 0, nullptr, 0,
+                                PROTOCOL_BINARY_RAW_BYTES,
+                                PROTOCOL_BINARY_RESPONSE_ENOMEM, cas, cookie);
+        }
     }
 
-    // clusterConfig is opaque to ep-engine, but typically there is a rev id
-    // at the start of it. Print the first 100 bytes which hopefully includes
-    // helpful identifying information.
-    const int CONFIG_LIMIT = 100;
-    if (clusterConfig.len > CONFIG_LIMIT) {
-        LOG(EXTENSION_LOG_WARNING, "Updated cluster configuration - first %d "
-                "bytes: '%.*s'...\n", CONFIG_LIMIT, CONFIG_LIMIT,
-                clusterConfig.config);
-    } else {
-        LOG(EXTENSION_LOG_WARNING, "Updated cluster configuration: '%.*s'\n",
-            clusterConfig.len, clusterConfig.config);
+    // clusterConfig is opaque to ep-engine, but it /should/ be in JSON, as
+    // that's what the clients expect. Attempt to parse it and log the revision.
+    bool found_rev = false;
+    cJSON* json = cJSON_Parse(clusterConfig.config.c_str());
+    if (json != nullptr) {
+        cJSON* rev = cJSON_GetObjectItem(json, "rev");
+        if (rev != nullptr) {
+            found_rev = true;
+            char* rev_string = cJSON_PrintUnformatted(rev);
+            LOG(EXTENSION_LOG_NOTICE,
+                "Updated cluster configuration. New revision: %s", rev_string);
+            cJSON_Free(rev_string);
+        }
+        cJSON_Delete(json);
+    }
+
+    if (!found_rev) {
+        // Failed to parse. Hail Mary time, let's just print the first 100
+        // bytes which hopefully includes helpful identifying information.
+        const int CONFIG_LIMIT = 100;
+        if (clusterConfig.config.size() > CONFIG_LIMIT) {
+            LOG(EXTENSION_LOG_WARNING, "Updated cluster configuration. "
+                "Failed to parse JSON config - first %d bytes: '%.*s'...\n",
+                CONFIG_LIMIT, CONFIG_LIMIT, clusterConfig.config.data());
+        }
     }
 
     return sendResponse(response, NULL, 0, NULL, 0, NULL, 0,
@@ -5815,10 +6072,61 @@ EventuallyPersistentEngine::getClusterConfig(const void* cookie,
                             protocol_binary_request_get_cluster_config*,
                             ADD_RESPONSE response) {
     LockHolder lh(clusterConfig.lock);
-    return sendResponse(response, NULL, 0, NULL, 0, clusterConfig.config,
-                        clusterConfig.len, PROTOCOL_BINARY_RAW_BYTES,
+    return sendResponse(response, NULL, 0, NULL, 0, clusterConfig.config.data(),
+                        clusterConfig.config.size(), PROTOCOL_BINARY_RAW_BYTES,
                         PROTOCOL_BINARY_RESPONSE_SUCCESS, 0, cookie);
 }
+
+/**
+ * Callback class used by AllKeysAPI, for caching fetched keys
+ *
+ * As by default (or in most cases), number of keys is 1000,
+ * and an average key could be 32B in length, initialize buffersize of
+ * allKeys to 34000 (1000 * 32 + 1000 * 2), the additional 2 bytes per
+ * key is for the keylength.
+ *
+ * This initially allocated buffersize is doubled whenever the length
+ * of the buffer holding all the keys, crosses the buffersize.
+ */
+class AllKeysCallback : public Callback<uint16_t&, char*&> {
+public:
+    AllKeysCallback() {
+        length = 0;
+        buffersize = (avgKeySize + sizeof(uint16_t)) * expNumKeys;
+        buffer = (char *) malloc(buffersize);
+    }
+
+    ~AllKeysCallback() {
+        free(buffer);
+    }
+
+    void callback(uint16_t& len, char*& buf) {
+        if (length + len + sizeof(uint16_t) > buffersize) {
+            buffersize *= 2;
+            char *temp = (char *) malloc (buffersize);
+            memcpy (temp, buffer, length);
+            free (buffer);
+            buffer = temp;
+        }
+        len = htons(len);
+        memcpy (buffer + length, &len, sizeof(uint16_t));
+        len = ntohs(len);
+        memcpy (buffer + length + sizeof(uint16_t), buf, len);
+        length += len + sizeof(uint16_t);
+    }
+
+    char* getAllKeysPtr() { return buffer; }
+    uint64_t getAllKeysLen() { return length; }
+
+private:
+    uint64_t length;
+    uint64_t buffersize;
+    char *buffer;
+
+    static const int avgKeySize = 32;
+    static const int expNumKeys = 1000;
+
+};
 
 /*
  * Task that fetches all_docs and returns response,
@@ -5828,8 +6136,8 @@ class FetchAllKeysTask : public GlobalTask {
 public:
     FetchAllKeysTask(EventuallyPersistentEngine *e, const void *c,
                      ADD_RESPONSE resp, const std::string &start_key_,
-                     uint16_t vbucket, uint32_t count_, const Priority &p) :
-        GlobalTask(e, p, 0, false), engine(e), cookie(c),
+                     uint16_t vbucket, uint32_t count_) :
+        GlobalTask(e, TaskId::FetchAllKeysTask, 0, false), engine(e), cookie(c),
         response(resp), start_key(start_key_), vbid(vbucket),
         count(count_) { }
 
@@ -5847,17 +6155,17 @@ public:
                                PROTOCOL_BINARY_RESPONSE_SUCCESS, 0,
                                cookie);
         } else {
-            AllKeysCB *cb = new AllKeysCB();
+            std::shared_ptr<Callback<uint16_t&, char*&> > cb(new AllKeysCallback());
             err = engine->getEpStore()->getROUnderlying(vbid)->getAllKeys(
                                                     vbid, start_key, count, cb);
             if (err == ENGINE_SUCCESS) {
                 err =  sendResponse(response, NULL, 0, NULL, 0,
-                                    cb->getAllKeysPtr(), cb->getAllKeysLen(),
+                                    ((AllKeysCallback*)cb.get())->getAllKeysPtr(),
+                                    ((AllKeysCallback*)cb.get())->getAllKeysLen(),
                                     PROTOCOL_BINARY_RAW_BYTES,
                                     PROTOCOL_BINARY_RESPONSE_SUCCESS, 0,
                                     cookie);
             }
-            delete cb;
         }
         engine->addLookupAllKeys(cookie, err);
         engine->notifyIOComplete(cookie, err);
@@ -5879,7 +6187,7 @@ EventuallyPersistentEngine::getAllKeys(const void* cookie,
                                 ADD_RESPONSE response) {
 
     LockHolder lh(lookupMutex);
-    unordered_map<const void*, ENGINE_ERROR_CODE>::iterator it =
+    std::unordered_map<const void*, ENGINE_ERROR_CODE>::iterator it =
         allKeysLookups.find(cookie);
     if (it != allKeysLookups.end()) {
         ENGINE_ERROR_CODE err = it->second;
@@ -5890,7 +6198,13 @@ EventuallyPersistentEngine::getAllKeys(const void* cookie,
 
     uint16_t vbucket = ntohs(request->message.header.request.vbucket);
     RCPtr<VBucket> vb = getVBucket(vbucket);
-    if (!vb || vb->getState() != vbucket_state_active) {
+
+    if (!vb) {
+        return ENGINE_NOT_MY_VBUCKET;
+    }
+
+    ReaderLockHolder rlh(vb->getStateLock());
+    if (vb->getState() != vbucket_state_active) {
         return ENGINE_NOT_MY_VBUCKET;
     }
     //key: key, ext: no. of keys to fetch, sorting-order
@@ -5900,7 +6214,9 @@ EventuallyPersistentEngine::getAllKeys(const void* cookie,
     uint32_t count = 1000;
 
     if (extlen > 0) {
-        cb_assert(extlen == (sizeof(uint32_t)));
+        if (extlen != sizeof(uint32_t)) {
+            return ENGINE_EINVAL;
+        }
         memcpy(&count, request->bytes + sizeof(request->bytes),
                sizeof(uint32_t));
         count = ntohl(count);
@@ -5914,8 +6230,7 @@ EventuallyPersistentEngine::getAllKeys(const void* cookie,
     std::string start_key(keyptr, keylen);
 
     ExTask task = new FetchAllKeysTask(this, cookie, response, start_key,
-                                       vbucket, count,
-                                       Priority::BgFetcherPriority);
+                                       vbucket, count);
     ExecutorPool::get()->schedule(task, READER_TASK_IDX);
     return ENGINE_EWOULDBLOCK;
 }
@@ -5950,17 +6265,11 @@ ENGINE_ERROR_CODE EventuallyPersistentEngine::getAdjustedTime(
     uint16_t vbucket = ntohs(request->message.header.request.vbucket);
     RCPtr<VBucket> vb = getVBucket(vbucket);
     if (!vb) {
-        LockHolder lh(clusterConfig.lock);
-        return sendResponse(response, NULL, 0, NULL, 0,
-                            clusterConfig.config,
-                            clusterConfig.len,
-                            PROTOCOL_BINARY_RAW_BYTES,
-                            PROTOCOL_BINARY_RESPONSE_NOT_MY_VBUCKET, 0,
-                            cookie);
+        return sendNotMyVBucketResponse(response, cookie, 0);
     }
     // Will return the vbucket's adjusted time, only if
     // time synchronization for the vbucket is enabled
-    if (vb->isTimeSyncEnabled()) {
+    if (vb->getTimeSyncConfig() == time_sync_t::ENABLED_WITH_DRIFT) {
         int64_t adjusted_time = gethrtime() + vb->getDriftCounter();
         adjusted_time = htonll(adjusted_time);
         return sendResponse(response, NULL, 0, NULL, 0,
@@ -5983,18 +6292,34 @@ ENGINE_ERROR_CODE EventuallyPersistentEngine::setDriftCounterState(
     uint16_t vbucket = ntohs(request->message.header.request.vbucket);
     RCPtr<VBucket> vb = getVBucket(vbucket);
     if (!vb) {
-        LockHolder lh(clusterConfig.lock);
-        return sendResponse(response, NULL, 0, NULL, 0,
-                            clusterConfig.config,
-                            clusterConfig.len,
+        return sendNotMyVBucketResponse(response, cookie, 0);
+    }
+
+    if (vb->getTimeSyncConfig() != time_sync_t::ENABLED_WITH_DRIFT) {
+        return sendResponse(response, NULL, 0, NULL, 0, NULL, 0,
                             PROTOCOL_BINARY_RAW_BYTES,
-                            PROTOCOL_BINARY_RESPONSE_NOT_MY_VBUCKET, 0,
+                            PROTOCOL_BINARY_RESPONSE_NOT_SUPPORTED, 0,
                             cookie);
     }
-    int64_t initialDriftCount = ntohll(request->message.body.initial_drift);
-    uint8_t timeSync = request->message.body.time_sync;
-    vb->setDriftCounterState(initialDriftCount, timeSync);
-    return sendResponse(response, NULL, 0, NULL, 0, NULL, 0,
+
+    int64_t driftCount = ntohll(request->message.body.initial_drift);
+    if (driftCount == INITIAL_DRIFT) {
+        return sendResponse(response, NULL, 0, NULL, 0, NULL, 0,
+                            PROTOCOL_BINARY_RAW_BYTES,
+                            PROTOCOL_BINARY_RESPONSE_EINVAL, 0,
+                            cookie);
+    }
+
+    set_drift_state_resp_t resp = vb->setDriftCounterState(driftCount);
+    uint64_t uuid = htonll(resp.last_vb_uuid);
+    int64_t seqno = htonll(resp.last_seqno);
+
+    std::stringstream result;
+    result.write((char*) &uuid, sizeof(uuid));
+    result.write((char*) &seqno, sizeof(seqno));
+
+    return sendResponse(response, NULL, 0, NULL, 0,
+                        result.str().data(), result.str().length(),
                         PROTOCOL_BINARY_RAW_BYTES,
                         PROTOCOL_BINARY_RESPONSE_SUCCESS, 0 , cookie);
 }
@@ -6003,7 +6328,7 @@ ENGINE_ERROR_CODE EventuallyPersistentEngine::dcpOpen(const void* cookie,
                                                        uint32_t opaque,
                                                        uint32_t seqno,
                                                        uint32_t flags,
-                                                       void *stream_name,
+                                                       const void *stream_name,
                                                        uint16_t nname)
 {
     (void) opaque;
@@ -6031,9 +6356,13 @@ ENGINE_ERROR_CODE EventuallyPersistentEngine::dcpOpen(const void* cookie,
         handler = dcpConnMap_->newConsumer(cookie, connName);
     }
 
-    cb_assert(handler);
-    storeEngineSpecific(cookie, handler);
-
+    if (handler == nullptr) {
+        LOG(EXTENSION_LOG_WARNING, "EPEngine::dcpOpen: failed to create a handler");
+        releaseCookie(cookie);
+        return ENGINE_DISCONNECT;
+    } else {
+        storeEngineSpecific(cookie, handler);
+    }
     return ENGINE_SUCCESS;
 }
 
@@ -6045,7 +6374,7 @@ ENGINE_ERROR_CODE EventuallyPersistentEngine::dcpAddStream(const void* cookie,
     ENGINE_ERROR_CODE errCode = ENGINE_DISCONNECT;
     ConnHandler* conn = getConnHandler(cookie);
     if (conn) {
-        errCode = dcpConnMap_->addPassiveStream(conn, opaque, vbucket, flags);
+        errCode = dcpConnMap_->addPassiveStream(*conn, opaque, vbucket, flags);
     }
     return errCode;
 }
@@ -6085,6 +6414,13 @@ void EventuallyPersistentEngine::handleDisconnect(const void *cookie) {
     }
 }
 
+void EventuallyPersistentEngine::handleDeleteBucket(const void *cookie) {
+    LOG(EXTENSION_LOG_NOTICE, "Shutting down TAP,DCP connections for bucket "
+        "whose cookie is: %p", cookie);
+    tapConnMap->shutdownAllConnections();
+    dcpConnMap_->shutdownAllConnections();
+}
+
 ENGINE_ERROR_CODE EventuallyPersistentEngine::getAllVBucketSequenceNumbers(
                                     const void *cookie,
                                     protocol_binary_request_header *request,
@@ -6092,36 +6428,18 @@ ENGINE_ERROR_CODE EventuallyPersistentEngine::getAllVBucketSequenceNumbers(
     protocol_binary_request_get_all_vb_seqnos *req =
         reinterpret_cast<protocol_binary_request_get_all_vb_seqnos*>(request);
 
-    // if extlen is non-zero, it limits the result to only include the
-    // vbuckets in the specified vbucket state.
+    // if extlen (hence bodylen) is non-zero, it limits the result to only
+    // include the vbuckets in the specified vbucket state.
     size_t bodylen = ntohl(req->message.header.request.bodylen);
-    uint8_t extlen = req->message.header.request.extlen;
-
-    if ((bodylen != extlen) ||
-        ((bodylen != 0) && (bodylen != sizeof(vbucket_state_t)))) {
-        const std::string msg("Incorrect packet format");
-        return sendResponse(response, NULL, 0, NULL, 0, msg.c_str(),
-                            msg.length(), PROTOCOL_BINARY_RAW_BYTES,
-                            PROTOCOL_BINARY_RESPONSE_EINVAL,
-                            0, cookie);
-    }
 
     vbucket_state_t reqState = static_cast<vbucket_state_t>(0);;
     if (bodylen != 0) {
         memcpy(&reqState, &req->message.body.state, sizeof(reqState));
         reqState = static_cast<vbucket_state_t>(ntohl(reqState));
-
-        if (!is_valid_vbucket_state_t(reqState)) {
-            const std::string msg("Invalid vbucket state");
-            return sendResponse(response, NULL, 0, NULL, 0, msg.c_str(),
-                                msg.length(), PROTOCOL_BINARY_RAW_BYTES,
-                                PROTOCOL_BINARY_RESPONSE_EINVAL,
-                                0, cookie);
-        }
     }
 
     std::vector<uint8_t> payload;
-    std::vector<int> vbuckets = epstore->getVBuckets().getBuckets();
+    auto vbuckets = epstore->getVBuckets().getBuckets();
 
     /* Reserve a buffer that's big enough to hold all of them (we might
      * not use all of them. Each entry in the array occupies 10 bytes
@@ -6154,7 +6472,9 @@ ENGINE_ERROR_CODE EventuallyPersistentEngine::getAllVBucketSequenceNumbers(
                 if (vb->getState() == vbucket_state_active) {
                     highSeqno = htonll(vb->getHighSeqno());
                 } else {
-                    highSeqno = htonll(vb->checkpointManager.getLastClosedChkBySeqno());
+                    snapshot_info_t info =
+                                        vb->checkpointManager.getSnapshotInfo();
+                    highSeqno = htonll(info.range.end);
                 }
                 auto offset = payload.size();
                 payload.resize(offset + sizeof(vbid) + sizeof(highSeqno));
@@ -6174,13 +6494,56 @@ ENGINE_ERROR_CODE EventuallyPersistentEngine::getAllVBucketSequenceNumbers(
                         cookie);
 }
 
+void EventuallyPersistentEngine::updateDcpMinCompressionRatio(float value) {
+    if (dcpConnMap_) {
+        dcpConnMap_->updateMinCompressionRatioForProducers(value);
+    }
+}
+
+ENGINE_ERROR_CODE EventuallyPersistentEngine::sendNotMyVBucketResponse(
+        ADD_RESPONSE response, const void* cookie, uint64_t cas) {
+    LockHolder lh(clusterConfig.lock);
+    return sendResponse(response, nullptr, 0, nullptr, 0,
+                        clusterConfig.config.data(),
+                        clusterConfig.config.size(), PROTOCOL_BINARY_RAW_BYTES,
+                        PROTOCOL_BINARY_RESPONSE_NOT_MY_VBUCKET, cas, cookie);
+}
+
 EventuallyPersistentEngine::~EventuallyPersistentEngine() {
     delete epstore;
     delete workload;
     delete dcpConnMap_;
+    delete dcpFlowControlManager_;
     delete tapConnMap;
     delete tapConfig;
     delete checkpointConfig;
-    delete tapThrottle;
-    free(clusterConfig.config);
+    delete replicationThrottle;
+}
+
+const std::string& EpEngineTaskable::getName() const {
+    return myEngine->getName();
+}
+
+task_gid_t EpEngineTaskable::getGID() const {
+    return reinterpret_cast<task_gid_t>(myEngine);
+}
+
+bucket_priority_t EpEngineTaskable::getWorkloadPriority() const {
+    return myEngine->getWorkloadPriority();
+}
+
+void  EpEngineTaskable::setWorkloadPriority(bucket_priority_t prio) {
+    myEngine->setWorkloadPriority(prio);
+}
+
+WorkLoadPolicy&  EpEngineTaskable::getWorkLoadPolicy(void) {
+    return myEngine->getWorkLoadPolicy();
+}
+
+void EpEngineTaskable::logQTime(TaskId id, hrtime_t enqTime) {
+    myEngine->getEpStore()->logQTime(id, enqTime);
+}
+
+void EpEngineTaskable::logRunTime(TaskId id, hrtime_t runTime) {
+    myEngine->getEpStore()->logRunTime(id, runTime);
 }

@@ -20,17 +20,8 @@
 
 #include "config.h"
 
-#include <memcached/engine.h>
-
-#include <algorithm>
-#include <map>
-#include <set>
-#include <sstream>
-#include <vector>
-
-#include "bgfetcher.h"
-#include "kvstore.h"
-
+#include "atomic.h"
+#include "utility.h"
 
 /**
  * Base class encapsulating individual couchstore(vbucket) into a
@@ -60,12 +51,15 @@
  *   -----------------------------------
  *
  */
+class EventuallyPersistentStore;
 class Flusher;
 
 class KVShard {
     friend class VBucketMap;
 public:
-    KVShard(uint16_t id, EventuallyPersistentStore &store);
+    // Identifier for a KVShard
+    typedef uint16_t id_type;
+    KVShard(KVShard::id_type id, EventuallyPersistentStore &store);
     ~KVShard();
 
     KVStore *getRWUnderlying();
@@ -76,13 +70,13 @@ public:
 
     void notifyFlusher();
 
-    RCPtr<VBucket> getBucket(uint16_t id) const;
+    RCPtr<VBucket> getBucket(VBucket::id_type id) const;
     void setBucket(const RCPtr<VBucket> &b);
-    void resetBucket(uint16_t id);
+    void resetBucket(VBucket::id_type id);
 
-    uint16_t getId() { return shardId; }
-    std::vector<int> getVBucketsSortedByState();
-    std::vector<int> getVBuckets();
+    KVShard::id_type getId() { return shardId; }
+    std::vector<VBucket::id_type> getVBucketsSortedByState();
+    std::vector<VBucket::id_type> getVBuckets();
     size_t getMaxNumVbuckets() { return maxVbuckets; }
 
     /**
@@ -151,10 +145,26 @@ private:
     AtomicValue<bool> highPrioritySnapshot;
     AtomicValue<bool> lowPrioritySnapshot;
 
+    KVStoreConfig kvConfig;
+
 public:
     AtomicValue<size_t> highPriorityCount;
 
     DISALLOW_COPY_AND_ASSIGN(KVShard);
+};
+
+/**
+ * Callback for notifying flusher about pending mutations.
+ */
+class NotifyFlusherCB: public Callback<uint16_t> {
+public:
+    NotifyFlusherCB(KVShard *sh)
+        : shard(sh) {}
+
+    void callback(uint16_t &vb);
+
+private:
+    KVShard *shard;
 };
 
 #endif  // SRC_KVSHARD_H_

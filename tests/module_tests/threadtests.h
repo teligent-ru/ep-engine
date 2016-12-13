@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "locks.h"
+#include "utility.h"
 
 #ifndef TESTS_MODULE_TESTS_THREADTESTS_H_
 #define TESTS_MODULE_TESTS_THREADTESTS_H_ 1
@@ -39,15 +40,15 @@ public:
     CountDownLatch(int n=1) : count(n) {}
 
     void decr(void) {
-        LockHolder lh(so);
+        std::unique_lock<std::mutex> lh(so);
         --count;
-        so.notify();
+        so.notify_all();
     }
 
     void wait(void) {
-        LockHolder lh(so);
+        std::unique_lock<std::mutex> lh(so);
         while (count > 0) {
-            so.wait();
+            so.wait(lh);
         }
     }
 

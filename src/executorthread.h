@@ -27,8 +27,9 @@
 #include <utility>
 #include <vector>
 
+#include <relaxed_atomic.h>
+
 #include "atomic.h"
-#include "common.h"
 #include "mutex.h"
 #include "objectregistry.h"
 #include "tasks.h"
@@ -43,14 +44,13 @@ class ExecutorThread;
 class TaskQueue;
 class WorkLoadPolicy;
 
-typedef enum {
-    EXECUTOR_CREATING,
+enum executor_state_t {
     EXECUTOR_RUNNING,
     EXECUTOR_WAITING,
     EXECUTOR_SLEEPING,
     EXECUTOR_SHUTDOWN,
     EXECUTOR_DEAD
-} executor_state_t;
+};
 
 
 class ExecutorThread {
@@ -61,11 +61,11 @@ public:
     ExecutorThread(ExecutorPool *m, int startingQueue,
                    const std::string nm) : manager(m),
           startIndex(startingQueue), name(nm),
-          state(EXECUTOR_CREATING), taskStart(0),
+          state(EXECUTOR_RUNNING), taskStart(0),
           currentTask(NULL), curTaskType(NO_TASK_TYPE),
           tasklog(TASK_LOG_SIZE), slowjobs(TASK_LOG_SIZE) {
-              gettimeofday(&now, NULL);
-              set_max_tv(waketime);
+              now = gethrtime();
+              waketime = hrtime_t(-1);
     }
 
     ~ExecutorThread() {
@@ -78,21 +78,32 @@ public:
 
     void stop(bool wait=true);
 
-    void shutdown() { state = EXECUTOR_SHUTDOWN; }
-
     void schedule(ExTask &task);
 
     void reschedule(ExTask &task);
 
     void wake(ExTask &task);
 
+    // Changes this threads' current task to the specified task
+    void setCurrentTask(ExTask newTask);
+
     const std::string& getName() const { return name; }
 
-    const std::string getTaskName() const {
+    const std::string getTaskName() {
+        LockHolder lh(currentTaskMutex);
         if (currentTask) {
             return currentTask->getDescription();
         } else {
             return std::string("Not currently running any task");
+        }
+    }
+
+    const std::string getTaskableName() {
+        LockHolder lh(currentTaskMutex);
+        if (currentTask) {
+            return currentTask->getTaskable().getName();
+        } else {
+            return std::string();
         }
     }
 
@@ -114,11 +125,11 @@ public:
         return slowjobs.contents();
     }
 
-    struct timeval getWaketime(void) { return waketime; }
+    const hrtime_t getWaketime(void) { return waketime; }
 
-    struct timeval getCurTime(void) { return now; }
+    const hrtime_t getCurTime(void) { return now; }
 
-private:
+protected:
 
     cb_thread_t thread;
     ExecutorPool *manager;
@@ -126,11 +137,14 @@ private:
     const std::string name;
     AtomicValue<executor_state_t> state;
 
-    struct  timeval    now;  // record of current time
-    struct timeval waketime; // set to the earliest
+    AtomicValue<hrtime_t> now;  // record of current time
+    AtomicValue<hrtime_t> waketime; // set to the earliest
 
-    hrtime_t taskStart;
+    Couchbase::RelaxedAtomic<hrtime_t> taskStart;
+
+    Mutex currentTaskMutex; // Protects currentTask
     ExTask currentTask;
+
     task_type_t curTaskType;
 
     Mutex logMutex;

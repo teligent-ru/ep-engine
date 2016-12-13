@@ -1,6 +1,6 @@
 /* -*- Mode: C++; tab-width: 4; c-basic-offset: 4; indent-tabs-mode: nil -*- */
 /*
- *     Copyright 2013 Couchbase, Inc
+ *     Copyright 2015 Couchbase, Inc
  *
  *   Licensed under the Apache License, Version 2.0 (the "License");
  *   you may not use this file except in compliance with the License.
@@ -27,11 +27,10 @@
 #include <string>
 #include <vector>
 
-#include "atomic.h"
-#include "common.h"
-#include "locks.h"
-#include "mutex.h"
+#include "logger.h"
 #include "statwriter.h"
+#include "vbucket.h"
+#include "utility.h"
 
 // forward decl
 class ConnHandler;
@@ -170,10 +169,10 @@ public:
     queued_item item_;
 };
 
-typedef enum {
+enum conn_type_t {
     TAP_CONN, //!< TAP connnection
     DCP_CONN  //!< DCP connection
-} conn_type_t;
+};
 
 class ConnHandler : public RCValue {
 public:
@@ -256,21 +255,23 @@ public:
     }
 
     const char* logHeader() {
-        return logString.c_str();
+        return logger.prefix.c_str();
     }
 
     void setLogHeader(const std::string &header) {
-        logString = header;
+        logger.prefix = header;
     }
+
+    const Logger& getLogger() const;
 
     void releaseReference(bool force = false);
 
     void setSupportAck(bool ack) {
-        supportAck = ack;
+        supportAck.store(ack);
     }
 
     bool supportsAck() const {
-        return supportAck;
+        return supportAck.load();
     }
 
     void setSupportCheckpointSync(bool checkpointSync) {
@@ -284,7 +285,7 @@ public:
     virtual const char *getType() const = 0;
 
     template <typename T>
-    void addStat(const char *nm, const T &val, ADD_STAT add_stat, const void *c) {
+    void addStat(const char *nm, const T &val, ADD_STAT add_stat, const void *c) const {
         std::stringstream tap;
         tap << name << ":" << nm;
         std::stringstream value;
@@ -293,16 +294,16 @@ public:
         add_casted_stat(n.data(), value.str().data(), add_stat, c);
     }
 
-    void addStat(const char *nm, bool val, ADD_STAT add_stat, const void *c) {
+    void addStat(const char *nm, bool val, ADD_STAT add_stat, const void *c) const {
         addStat(nm, val ? "true" : "false", add_stat, c);
     }
 
     virtual void addStats(ADD_STAT add_stat, const void *c) {
         addStat("type", getType(), add_stat, c);
-        addStat("created", created, add_stat, c);
-        addStat("connected", connected, add_stat, c);
-        addStat("pending_disconnect", disconnect, add_stat, c);
-        addStat("supports_ack", supportAck, add_stat, c);
+        addStat("created", created.load(), add_stat, c);
+        addStat("connected", connected.load(), add_stat, c);
+        addStat("pending_disconnect", disconnect.load(), add_stat, c);
+        addStat("supports_ack", supportAck.load(), add_stat, c);
         addStat("reserved", reserved.load(), add_stat, c);
 
         if (numDisconnects > 0) {
@@ -310,7 +311,7 @@ public:
         }
     }
 
-    virtual void aggregateQueueStats(ConnCounter* stats_aggregator) {
+    virtual void aggregateQueueStats(ConnCounter& stats_aggregator) {
         // Empty
     }
 
@@ -337,11 +338,11 @@ public:
     }
 
     const void *getCookie() const {
-        return cookie;
+        return cookie.load();
     }
 
     void setCookie(const void *c) {
-        cookie = c;
+        cookie.store(const_cast<void*>(c));
     }
 
     void setExpiryTime(rel_time_t t) {
@@ -364,19 +365,19 @@ public:
         if (!s) {
             ++numDisconnects;
         }
-        connected = s;
+        connected.store(s);
     }
 
     bool isConnected() {
-        return connected;
+        return connected.load();
     }
 
     bool doDisconnect() {
-        return disconnect;
+        return disconnect.load();
     }
 
     virtual void setDisconnect(bool val) {
-        disconnect = val;
+        disconnect.store(val);
     }
 
     static std::string getAnonName() {
@@ -396,16 +397,16 @@ protected:
     EPStats &stats;
     bool supportCheckpointSync_;
 
+    //! The logger for this connection
+    Logger logger;
+
 private:
 
      //! The name for this connection
     std::string name;
 
-    //! The string used to prefix all log messages for this connection
-    std::string logString;
-
     //! The cookie representing this connection (provided by the memcached code)
-    const void* cookie;
+    AtomicValue<void*> cookie;
 
     //! Whether or not the connection is reserved in the memcached layer
     AtomicValue<bool> reserved;
@@ -414,16 +415,16 @@ private:
     hrtime_t connToken;
 
     //! Connection creation time
-    rel_time_t created;
+    AtomicValue<rel_time_t> created;
 
     //! The last time this connection's step function was called
     AtomicValue<rel_time_t> lastWalkTime;
 
     //! Should we disconnect as soon as possible?
-    bool disconnect;
+    AtomicValue<bool> disconnect;
 
     //! Is this tap conenction connected?
-    bool connected;
+    AtomicValue<bool> connected;
 
     //! Number of times this connection was disconnected
     AtomicValue<size_t> numDisconnects;
@@ -432,18 +433,18 @@ private:
     rel_time_t expiryTime;
 
     //! Whether or not this connection supports acking
-    bool supportAck;
+    AtomicValue<bool> supportAck;
 
     //! A counter used to generate unique names
     static AtomicValue<uint64_t> counter_;
 };
 
-typedef enum {
+enum proto_checkpoint_state {
     backfill,
     checkpoint_start,
     checkpoint_end,
     checkpoint_end_synced
-} proto_checkpoint_state;
+};
 
 
 /**
@@ -673,14 +674,16 @@ public:
  */
 class BGFetchCallback : public GlobalTask {
 public:
-    BGFetchCallback(EventuallyPersistentEngine *e, const std::string &n,
+    BGFetchCallback(EventuallyPersistentEngine& e, const std::string &n,
                     const std::string &k, uint16_t vbid, hrtime_t token,
-                    const Priority &p, double sleeptime = 0) :
-        GlobalTask(e, p, sleeptime, false), name(n), key(k), epe(e),
-        init(gethrtime()), connToken(token), vbucket(vbid)
-    {
-        cb_assert(epe);
-    }
+                    double sleeptime = 0)
+        : GlobalTask(&e, TaskId::BGFetchCallback, sleeptime, false),
+          name(n),
+          key(k),
+          epe(e),
+          init(gethrtime()),
+          connToken(token),
+          vbucket(vbid) {}
 
     bool run();
 
@@ -693,7 +696,7 @@ public:
 private:
     const std::string name;
     const std::string key;
-    EventuallyPersistentEngine *epe;
+    EventuallyPersistentEngine& epe;
     hrtime_t init;
     hrtime_t connToken;
     uint16_t vbucket;
@@ -806,8 +809,6 @@ public:
 
     virtual void clearQueues() = 0;
 
-    virtual void appendQueue(std::list<queued_item> *q) = 0;
-
     virtual size_t getBackfillQueueSize() = 0;
 
     void incrBackfillRemaining(size_t incr) {
@@ -856,13 +857,12 @@ public:
         delete queue;
         delete []specificData;
         delete []transmitted;
-        cb_assert(!isReserved());
     }
 
     virtual void addStats(ADD_STAT add_stat, const void *c);
     virtual void processedEvent(uint16_t event, ENGINE_ERROR_CODE ret);
 
-    void aggregateQueueStats(ConnCounter* stats_aggregator);
+    void aggregateQueueStats(ConnCounter& stats_aggregator);
 
     void suspendedConnection_UNLOCKED(bool value);
     void suspendedConnection(bool value);
@@ -941,6 +941,11 @@ public:
         clearQueues_UNLOCKED();
     }
 
+    bool shouldDisconnect(rel_time_t now) {
+        LockHolder lh(queueLock);
+        return supportsAck() && (getExpiryTime() < now) && windowIsFull();
+    }
+
     static const char* opaqueCmdToString(uint32_t opaque_code);
 
 protected:
@@ -994,7 +999,6 @@ protected:
             TapLogElement log(seqno, qi);
             ackLog_.push_back(log);
             stats.memOverhead.fetch_add(sizeof(TapLogElement));
-            cb_assert(stats.memOverhead.load() < GIGANTOR);
         }
     }
 
@@ -1009,7 +1013,6 @@ protected:
             TapLogElement log(seqno, e);
             ackLog_.push_back(log);
             stats.memOverhead.fetch_add(sizeof(TapLogElement));
-            cb_assert(stats.memOverhead.load() < GIGANTOR);
         }
     }
 

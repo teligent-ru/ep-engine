@@ -30,20 +30,11 @@ AtomicValue<size_t> GlobalTask::task_id_counter(1);
 extern "C" {
     static void launch_executor_thread(void *arg) {
         ExecutorThread *executor = (ExecutorThread*) arg;
-        try {
-            executor->run();
-        } catch (std::exception& e) {
-            LOG(EXTENSION_LOG_WARNING, "%s: Caught an exception: %s\n",
-                executor->getName().c_str(), e.what());
-        } catch(...) {
-            LOG(EXTENSION_LOG_WARNING, "%s: Caught a fatal exception\n",
-                executor->getName().c_str());
-        }
+        executor->run();
     }
 }
 
 void ExecutorThread::start() {
-    cb_assert(state == EXECUTOR_CREATING);
     std::string thread_name("mc:" + getName());
     // Only permitted 15 characters of name; therefore abbreviate thread names.
     std::string worker("_worker");
@@ -64,109 +55,120 @@ void ExecutorThread::stop(bool wait) {
     if (!wait && (state == EXECUTOR_SHUTDOWN || state == EXECUTOR_DEAD)) {
         return;
     }
+
     state = EXECUTOR_SHUTDOWN;
+
     if (!wait) {
-        LOG(EXTENSION_LOG_INFO, "%s: Stopping", name.c_str());
+        LOG(EXTENSION_LOG_WARNING, "%s: Stopping", name.c_str());
         return;
     }
     cb_join_thread(thread);
-    LOG(EXTENSION_LOG_INFO, "%s: Stopped", name.c_str());
+    LOG(EXTENSION_LOG_WARNING, "%s: Stopped", name.c_str());
 }
 
 void ExecutorThread::run() {
-    state = EXECUTOR_RUNNING;
-
     LOG(EXTENSION_LOG_DEBUG, "Thread %s running..", getName().c_str());
 
     for (uint8_t tick = 1;; tick++) {
-        currentTask.reset();
+        {
+            LockHolder lh(currentTaskMutex);
+            currentTask.reset();
+        }
         if (state != EXECUTOR_RUNNING) {
             break;
         }
 
+        now = gethrtime();
         if (TaskQueue *q = manager->nextTask(*this, tick)) {
             EventuallyPersistentEngine *engine = currentTask->getEngine();
-            ObjectRegistry::onSwitchThread(engine);
+
+            // Not all tasks are associated with an engine, only switch
+            // for those that do.
+            if (engine) {
+                ObjectRegistry::onSwitchThread(engine);
+            }
+
             if (currentTask->isdead()) {
                 // release capacity back to TaskQueue
                 manager->doneWork(curTaskType);
-                manager->cancel(currentTask->taskId, true);
+                manager->cancel(currentTask->uid, true);
                 continue;
             }
 
             // Measure scheduling overhead as difference between the time
             // that the task wanted to wake up and the current time
-            gettimeofday(&now, NULL);
-            struct timeval woketime = currentTask->waketime;
-            uint64_t diffsec = now.tv_sec > woketime.tv_sec ?
-                               now.tv_sec - woketime.tv_sec : 0;
-            uint64_t diffusec = now.tv_usec > woketime.tv_usec ?
-                                now.tv_usec - woketime.tv_usec : 0;
+            hrtime_t woketime = currentTask->getWaketime();
+            currentTask->getTaskable().logQTime(currentTask->getTypeId(),
+                                                now > woketime ?
+                                                (now - woketime) / 1000 : 0);
 
-            engine->getEpStore()->logQTime(currentTask->getTypeId(),
-                                   diffsec*1000000 + diffusec);
-
-            taskStart = gethrtime();
+            taskStart = now;
             rel_time_t startReltime = ep_current_time();
-            try {
-                LOG(EXTENSION_LOG_DEBUG,
-                    "%s: Run task \"%s\" id %d waketime %d",
+
+            LOG(EXTENSION_LOG_DEBUG,
+                "%s: Run task \"%s\" id %" PRIu64,
                 getName().c_str(), currentTask->getDescription().c_str(),
-                currentTask->getId(), currentTask->waketime.tv_sec);
+                uint64_t(currentTask->getId()));
 
-                // Now Run the Task ....
-                currentTask->setState(TASK_RUNNING, TASK_SNOOZED);
-                bool again = currentTask->run();
+            // Now Run the Task ....
+            currentTask->setState(TASK_RUNNING, TASK_SNOOZED);
+            bool again = currentTask->run();
 
-                // Task done, log it ...
-                hrtime_t runtime((gethrtime() - taskStart) / 1000);
-                engine->getEpStore()->logRunTime(currentTask->getTypeId(),
-                                               runtime);
+            // Task done, log it ...
+            hrtime_t runtime((gethrtime() - taskStart) / 1000);
+            currentTask->getTaskable().logRunTime(currentTask->getTypeId(),
+                                                  runtime);
+            if (engine) {
                 ObjectRegistry::onSwitchThread(NULL);
-                addLogEntry(engine->getName() + currentTask->getDescription(),
-                        q->getQueueType(), runtime, startReltime,
-                        (runtime >
-                         (hrtime_t)currentTask->maxExpectedDuration()));
+            }
+
+            addLogEntry(currentTask->getTaskable().getName() +
+                        currentTask->getDescription(),
+                       q->getQueueType(), runtime, startReltime,
+                       (runtime >
+                       (hrtime_t)currentTask->maxExpectedDuration()));
+
+            if (engine) {
                 ObjectRegistry::onSwitchThread(engine);
-                // Check if task is run once or needs to be rescheduled..
-                if (!again || currentTask->isdead()) {
-                    // release capacity back to TaskQueue
-                    manager->doneWork(curTaskType);
-                    manager->cancel(currentTask->taskId, true);
-                } else {
-                    struct timeval timetowake;
-                    // if a task has not set snooze, update its waketime to now
-                    // before rescheduling for more accurate timing histograms
-                    if (less_eq_tv(currentTask->waketime, now)) {
-                        currentTask->waketime = now;
-                    }
-                    // release capacity back to TaskQueue ..
-                    manager->doneWork(curTaskType);
-                    timetowake = q->reschedule(currentTask, curTaskType);
-                    // record min waketime ...
-                    if (less_tv(timetowake, waketime)) {
-                        waketime = timetowake;
-                    }
-                    LOG(EXTENSION_LOG_DEBUG,
-                            "%s: Reschedule a task \"%s\" id %d[%d %d |%d]",
-                            name.c_str(),
-                            currentTask->getDescription().c_str(),
-                            currentTask->getId(), timetowake.tv_sec,
-                            currentTask->waketime.tv_sec,
-                            waketime.tv_sec);
+            }
+
+            // Check if task is run once or needs to be rescheduled..
+            if (!again || currentTask->isdead()) {
+                // release capacity back to TaskQueue
+                manager->doneWork(curTaskType);
+                manager->cancel(currentTask->uid, true);
+            } else {
+                hrtime_t new_waketime;
+                // if a task has not set snooze, update its waketime to now
+                // before rescheduling for more accurate timing histograms
+                currentTask->updateWaketimeIfLessThan(now);
+
+                // release capacity back to TaskQueue ..
+                manager->doneWork(curTaskType);
+                new_waketime = q->reschedule(currentTask, curTaskType);
+                // record min waketime ...
+                if (new_waketime < waketime) {
+                    waketime = new_waketime;
                 }
-            } catch (std::exception& e) {
-                LOG(EXTENSION_LOG_WARNING,
-                    "%s: Exception caught in task \"%s\": %s", name.c_str(),
-                    currentTask->getDescription().c_str(), e.what());
-            } catch(...) {
-                LOG(EXTENSION_LOG_WARNING,
-                    "%s: Fatal exception caught in task \"%s\"\n",
-                    name.c_str(), currentTask->getDescription().c_str());
+                LOG(EXTENSION_LOG_DEBUG, "%s: Reschedule a task"
+                        " \"%s\" id %" PRIu64 "[%" PRIu64 " %" PRIu64 " |%" PRIu64 "]",
+                        name.c_str(),
+                        currentTask->getDescription().c_str(),
+                        uint64_t(currentTask->getId()), uint64_t(new_waketime),
+                        uint64_t(currentTask->getWaketime()),
+                        uint64_t(waketime.load()));
             }
         }
     }
+    // Thread is about to terminate - disassociate it from any engine.
+    ObjectRegistry::onSwitchThread(nullptr);
+
     state = EXECUTOR_DEAD;
+}
+
+void ExecutorThread::setCurrentTask(ExTask newTask) {
+    LockHolder lh(currentTaskMutex);
+    currentTask = newTask;
 }
 
 void ExecutorThread::addLogEntry(const std::string &desc,
@@ -184,8 +186,6 @@ void ExecutorThread::addLogEntry(const std::string &desc,
 
 const std::string ExecutorThread::getStateName() {
     switch (state.load()) {
-    case EXECUTOR_CREATING:
-        return std::string("creating");
     case EXECUTOR_RUNNING:
         return std::string("running");
     case EXECUTOR_WAITING:

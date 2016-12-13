@@ -1,6 +1,6 @@
 /* -*- Mode: C++; tab-width: 4; c-basic-offset: 4; indent-tabs-mode: nil -*- */
 /*
- *     Copyright 2010 Couchbase, Inc
+ *     Copyright 2015 Couchbase, Inc
  *
  *   Licensed under the Apache License, Version 2.0 (the "License");
  *   you may not use this file except in compliance with the License.
@@ -20,13 +20,7 @@
 
 #include "config.h"
 
-#include <set>
-#include <string>
-#include <utility>
-
-#include "common.h"
 #include "tasks.h"
-#include "stats.h"
 
 typedef std::pair<int64_t, int64_t> row_range_t;
 
@@ -36,18 +30,18 @@ class EventuallyPersistentEngine;
 /**
  * The item pager phase
  */
-typedef enum {
+enum item_pager_phase {
     PAGING_UNREFERENCED,
     PAGING_RANDOM
-} item_pager_phase;
+};
 
 /**
  * Item eviction policy
  */
-typedef enum {
+enum item_eviction_policy_t {
     VALUE_ONLY, // Only evict an item's value.
     FULL_EVICTION // Evict an item's key, metadata and value together.
-} item_eviction_policy_t;
+};
 
 /**
  * Dispatcher job responsible for periodically pushing data out of
@@ -62,10 +56,7 @@ public:
      * @param s the store (where we'll visit)
      * @param st the stats
      */
-    ItemPager(EventuallyPersistentEngine *e, EPStats &st) :
-        GlobalTask(e, Priority::ItemPagerPriority, 10, false),
-        engine(e), stats(st), available(true), phase(PAGING_UNREFERENCED),
-        doEvict(false) {}
+    ItemPager(EventuallyPersistentEngine *e, EPStats &st);
 
     bool run(void);
 
@@ -81,11 +72,14 @@ public:
 
 private:
 
-    EventuallyPersistentEngine *engine;
-    EPStats &stats;
-    AtomicValue<bool> available;
-    item_pager_phase phase;
-    bool doEvict;
+    EventuallyPersistentEngine     *engine;
+    EPStats                        &stats;
+    std::shared_ptr<AtomicValue<bool>>   available;
+
+    // Current pager phase. Atomic as may be accessed by multiple PagingVisitor
+    // objects running on different threads.
+    std::atomic<item_pager_phase> phase;
+    bool                            doEvict;
 };
 
 /**
@@ -103,10 +97,7 @@ public:
      * @param stime number of seconds to wait between runs
      */
     ExpiredItemPager(EventuallyPersistentEngine *e, EPStats &st,
-                     size_t stime) :
-        GlobalTask(e, Priority::ItemPagerPriority, static_cast<double>(stime),
-        false), engine(e), stats(st), sleepTime(static_cast<double>(stime)),
-        available(true) { }
+                     size_t stime, ssize_t taskTime = -1);
 
     bool run(void);
 
@@ -115,10 +106,16 @@ public:
     }
 
 private:
-    EventuallyPersistentEngine *engine;
-    EPStats                    &stats;
-    double                     sleepTime;
-    AtomicValue<bool>          available;
+    /**
+     *  This function is to update the next expiry pager
+     *  task time, based on the current snooze time.
+     */
+    void updateExpPagerTime(double sleepSecs);
+
+    EventuallyPersistentEngine     *engine;
+    EPStats                        &stats;
+    double                          sleepTime;
+    std::shared_ptr<AtomicValue<bool>>   available;
 };
 
 #endif  // SRC_ITEM_PAGER_H_

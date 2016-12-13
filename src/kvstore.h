@@ -22,13 +22,74 @@
 
 #include <cstring>
 #include <map>
+#include <list>
 #include <string>
+#include <unordered_map>
 #include <utility>
+#include <unordered_map>
 #include <vector>
+#include <relaxed_atomic.h>
 
+#include "item.h"
 #include "configuration.h"
-#include "tasks.h"
-#include "vbucket.h"
+
+class PersistenceCallback;
+
+class VBucketBGFetchItem {
+public:
+    VBucketBGFetchItem(const void *c, bool meta_only) :
+        cookie(c), initTime(gethrtime()), metaDataOnly(meta_only)
+    { }
+    ~VBucketBGFetchItem() {}
+
+    void delValue() {
+        delete value.getValue();
+        value.setValue(NULL);
+    }
+
+    GetValue value;
+    const void * cookie;
+    hrtime_t initTime;
+    bool metaDataOnly;
+};
+
+const size_t CONFLICT_RES_META_LEN = 1;
+
+static const int MUTATION_FAILED = -1;
+static const int DOC_NOT_FOUND = 0;
+static const int MUTATION_SUCCESS = 1;
+
+static const int64_t INITIAL_DRIFT = -140737488355328; //lowest possible 48-bit integer
+
+typedef struct {
+    std::list<VBucketBGFetchItem *> bgfetched_list;
+    bool isMetaOnly;
+} vb_bgfetch_item_ctx_t;
+
+typedef std::unordered_map<std::string, vb_bgfetch_item_ctx_t> vb_bgfetch_queue_t;
+typedef std::pair<std::string, VBucketBGFetchItem *> bgfetched_item_t;
+
+/**
+ * Compaction context to perform compaction
+ */
+
+typedef struct {
+    uint64_t revSeqno;
+    std::string keyStr;
+} expiredItemCtx;
+
+typedef uint16_t DBFileId;
+
+typedef struct {
+    uint64_t purge_before_ts;
+    uint64_t purge_before_seq;
+    uint64_t max_purged_seq;
+    uint8_t  drop_deletes;
+    DBFileId db_file_id;
+    uint32_t curr_time;
+    std::shared_ptr<Callback<std::string&, bool&> > bloomFilterCallback;
+    std::shared_ptr<Callback<std::string&, uint64_t&> > expiryCallback;
+} compaction_ctx;
 
 /**
  * Result of database mutation operations.
@@ -43,6 +104,19 @@
  * it requires you to be firing an update at a missing rowid).
  */
 typedef std::pair<int, bool> mutation_result;
+
+typedef union {
+    Callback <mutation_result> *setCb;
+    Callback <int> *delCb;
+} MutationRequestCallback;
+
+
+class NoLookupCallback : public Callback<CacheLookup> {
+public:
+    NoLookupCallback() {}
+    ~NoLookupCallback() {}
+    void callback(CacheLookup&) {}
+};
 
 typedef struct RollbackResult {
     RollbackResult(bool _success, uint64_t _highSeqno, uint64_t _snapStartSeqno,
@@ -80,6 +154,33 @@ struct vbucket_state {
         driftCounter = vbstate.driftCounter;
     }
 
+    std::string toJSON() const;
+
+    bool needsToBePersisted(const vbucket_state& vbstate) {
+        /**
+         * The vbucket state information is to be persisted
+         * only if a change is detected in the state or the
+         * failovers fields.
+         */
+        if (state != vbstate.state ||
+            failovers.compare(vbstate.failovers) != 0) {
+            return true;
+        }
+        return false;
+    }
+
+    void reset() {
+        checkpointId = 0;
+        maxDeletedSeqno = 0;
+        highSeqno = 0;
+        purgeSeqno = 0;
+        lastSnapStart = 0;
+        lastSnapEnd = 0;
+        maxCas = 0;
+        driftCounter = INITIAL_DRIFT;
+        failovers.assign("[{\"id\":0, \"seq\":0}]");
+    }
+
     vbucket_state_t state;
     uint64_t checkpointId;
     uint64_t maxDeletedSeqno;
@@ -101,37 +202,65 @@ struct DBFileInfo {
     uint64_t spaceUsed;
 };
 
-typedef enum {
+enum scan_error_t {
     scan_success,
     scan_again,
     scan_failed
-} scan_error_t;
+};
+
+enum class DocumentFilter {
+    ALL_ITEMS,
+    NO_DELETES,
+    ONLY_DELETES
+};
+
+enum class ValueFilter {
+    KEYS_ONLY,
+    VALUES_COMPRESSED,
+    VALUES_DECOMPRESSED
+};
 
 class ScanContext {
 public:
-    ScanContext(shared_ptr<Callback<GetValue> > cb,
-                shared_ptr<Callback<CacheLookup> > cl,
+    ScanContext(std::shared_ptr<Callback<GetValue> > cb,
+                std::shared_ptr<Callback<CacheLookup> > cl,
                 uint16_t vb, size_t id, uint64_t start,
-                uint64_t end, bool _onlyKeys, bool _noDeletes,
-                bool _onlyDeletes)
+                uint64_t end, DocumentFilter _docFilter,
+                ValueFilter _valFilter, uint64_t _documentCount)
     : callback(cb), lookup(cl), lastReadSeqno(0), startSeqno(start),
-      maxSeqno(end), scanId(id), vbid(vb), onlyKeys(_onlyKeys),
-      noDeletes(_noDeletes), onlyDeletes(_onlyDeletes) {}
+      maxSeqno(end), scanId(id), vbid(vb), docFilter(_docFilter),
+      valFilter(_valFilter), documentCount(_documentCount) {}
 
     ~ScanContext() {}
 
-    const shared_ptr<Callback<GetValue> > callback;
-    const shared_ptr<Callback<CacheLookup> > lookup;
+    const std::shared_ptr<Callback<GetValue> > callback;
+    const std::shared_ptr<Callback<CacheLookup> > lookup;
 
     uint64_t lastReadSeqno;
     const uint64_t startSeqno;
     const uint64_t maxSeqno;
     const size_t scanId;
     const uint16_t vbid;
-    const bool onlyKeys;
-    const bool noDeletes;
-    const bool onlyDeletes;
+    const DocumentFilter docFilter;
+    const ValueFilter valFilter;
+    const uint64_t documentCount;
 };
+
+// First bool is true if an item exists in VB DB file.
+// second bool is true if the operation is SET (i.e., insert or update).
+typedef std::pair<bool, bool> kstat_entry_t;
+
+struct KVStatsCtx{
+    KVStatsCtx() : vbucket(std::numeric_limits<uint16_t>::max()),
+                   fileSpaceUsed(0), fileSize(0) {}
+
+    uint16_t vbucket;
+    size_t fileSpaceUsed;
+    size_t fileSize;
+    std::unordered_map<std::string, kstat_entry_t> keyStats;
+};
+
+typedef struct KVStatsCtx kvstats_ctx;
 
 /**
  * Type of vbucket map.
@@ -143,7 +272,7 @@ public:
 typedef std::map<uint16_t, vbucket_state> vbucket_map_t;
 
 /**
- * Properites of the storage layer.
+ * Properties of the storage layer.
  *
  * If concurrent filesystem access is possible, maxConcurrency() will
  * be greater than one.  One will need to determine whether more than
@@ -175,26 +304,92 @@ private:
     bool efficientGet;
 };
 
-/**
- * Database strategy
- */
-enum db_type {
-    single_db,           //!< single database strategy
-    multi_db,            //!< multi-database strategy
-    single_mt_db,        //!< single database, multi-table strategy
-    multi_mt_db,         //!< multi-database, multi-table strategy
-    multi_mt_vb_db       //!< multi-db, multi-table strategy sharded by vbucket
+class RollbackCB;
+class Configuration;
+
+class KVStoreConfig {
+public:
+    KVStoreConfig(Configuration& config, uint16_t shardId);
+
+    KVStoreConfig(uint16_t _maxVBuckets, uint16_t _maxShards,
+                  const std::string& _dbname,
+                  const std::string& _backend,
+                  uint16_t _shardId);
+
+    uint16_t getMaxVBuckets() {
+        return maxVBuckets;
+    }
+
+    uint16_t getMaxShards() {
+        return maxShards;
+    }
+
+    std::string getDBName() {
+        return dbname;
+    }
+
+    std::string getBackend() {
+        return backend;
+    }
+
+    uint16_t getShardId() {
+        return shardId;
+    }
+
+private:
+    uint16_t maxVBuckets;
+    uint16_t maxShards;
+    std::string dbname;
+    std::string backend;
+    uint16_t shardId;
 };
 
-class RollbackCB;
-class AllKeysCB;
+class IORequest {
+public:
+    IORequest(uint16_t vbId, MutationRequestCallback &cb, bool del,
+              const std::string &itmKey);
+
+    virtual ~IORequest() { }
+
+    bool isDelete() {
+        return deleteItem;
+    }
+
+    uint16_t getVBucketId() {
+        return vbucketId;
+    }
+
+    hrtime_t getDelta() {
+        return (gethrtime() - start)/1000;
+    }
+
+    Callback<mutation_result>* getSetCallback(void) {
+        return callback.setCb;
+    }
+
+    Callback<int>* getDelCallback(void) {
+        return callback.delCb;
+    }
+
+    const std::string& getKey(void) const {
+        return key;
+    }
+
+protected:
+    uint16_t vbucketId;
+    bool deleteItem;
+    MutationRequestCallback callback;
+    hrtime_t start;
+    std::string key;
+};
 
 /**
  * Base class representing kvstore operations.
  */
 class KVStore {
 public:
-    KVStore(bool read_only = false) : readOnly(read_only) { }
+    KVStore(KVStoreConfig &config, bool read_only = false)
+        : configuration(config), readOnly(read_only) { }
 
     virtual ~KVStore() {}
 
@@ -212,6 +407,18 @@ public:
     }
 
     /**
+     * Request the specified statistic name from the kvstore.
+     *
+     * @param name The name of the statistic to fetch.
+     * @param[out] value Value of the given stat (if exists).
+     * @return True if the stat exists, is of type size_t and was successfully
+     *         returned, else false.
+     */
+    virtual bool getStat(const char* name, size_t& value) {
+        return false;
+    }
+
+    /**
      * Show kvstore specific timing stats.
      *
      * @param prefix prefix to use for the stats
@@ -224,8 +431,8 @@ public:
     /**
      * Resets kvstore specific stats
      */
-     virtual void resetStats() {
-     }
+    virtual void resetStats() {
+    }
 
     /**
      * Reset the store to a clean state.
@@ -244,9 +451,7 @@ public:
      *
      * @return false if the commit fails
      */
-    virtual bool commit(Callback<kvstats_ctx> *cb, uint64_t snapStartSeqno,
-                        uint64_t snapEndSeqno, uint64_t maxCas,
-                        uint64_t driftCounter) = 0;
+    virtual bool commit(Callback<kvstats_ctx> *cb) = 0;
 
     /**
      * Rollback the current transaction.
@@ -273,7 +478,6 @@ public:
     virtual void getWithHeader(void *dbHandle, const std::string &key,
                                uint16_t vb, Callback<GetValue> &cb,
                                bool fetchDelete = false) = 0;
-
     /**
      * Get multiple items if supported by the kv store
      */
@@ -297,6 +501,7 @@ public:
      */
     virtual std::vector<vbucket_state *> listPersistedVbuckets(void) = 0;
 
+
     /**
      * Get a list of all persisted engine and tap stats. This API is mainly
      * invoked during warmup to get the engine stats from the previous session.
@@ -311,39 +516,44 @@ public:
     /**
      * Persist a snapshot of a collection of stats.
      */
-    virtual bool snapshotStats(const std::map<std::string, std::string> &m) = 0;
+    bool snapshotStats(const std::map<std::string, std::string> &m);
 
     /**
-     * Snapshot vbucket state.
+     * Snapshot vbucket state
+     * @param vbucketId id of the vbucket that needs to be snapshotted
+     * @param vbstate   state of the vbucket
+     * @param cb        stats callback
+     * @param persist   whether state needs to be persisted to disk
      */
     virtual bool snapshotVBucket(uint16_t vbucketId, vbucket_state &vbstate,
-                                 Callback<kvstats_ctx> *cb) = 0;
+                                 Callback<kvstats_ctx> *cb,
+                                 bool persist = true) = 0;
 
     /**
-     * Compact a vbucket file.
+     * Compact a database file.
      */
-    virtual bool compactVBucket(const uint16_t vbid,
-                                compaction_ctx *c,
-                                Callback<compaction_ctx> &cb,
-                                Callback<kvstats_ctx> &kvcb) = 0;
+    virtual bool compactDB(compaction_ctx *c,
+                           Callback<kvstats_ctx> &kvcb) = 0;
+
+    virtual vbucket_state *getVBucketState(uint16_t vbid) = 0;
 
     /**
-     * Check if the kv-store supports a dumping all of the keys
-     * @return true you may call dumpKeys() to do a prefetch
-     *              of the keys
+     * Get the number of deleted items that are persisted to a vbucket file
+     *
+     * @param vbid The vbucket if of the file to get the number of deletes for.
+     * @returns the number of deletes which are persisted
+     * @throws std::runtime_error (and subclasses) if it was not possible to
+     *         obtain a count of persisted deletes.
      */
-    virtual bool isKeyDumpSupported() {
-        return false;
-    }
-
-    virtual size_t getNumPersistedDeletes(uint16_t) {
-        return 0;
-    }
+    virtual size_t getNumPersistedDeletes(uint16_t vbid) = 0;
 
     /**
      * This method will return information about the file whose id
      * is passed in as an argument. The information returned contains
      * the item count, file size and space used.
+     *
+     * @throws std::runtime_error (and subclasses) if it was not possible to
+     *         obtain the DB file info.
      */
     virtual DBFileInfo getDbFileInfo(uint16_t dbFileId) = 0;
 
@@ -352,15 +562,27 @@ public:
     }
 
     virtual RollbackResult rollback(uint16_t vbid, uint64_t rollbackseqno,
-                                    shared_ptr<RollbackCB> cb) = 0;
+                                    std::shared_ptr<RollbackCB> cb) = 0;
 
     /**
      * This method is called before persisting a batch of data if you'd like to
      * do stuff to them that might improve performance at the IO layer.
      */
-    virtual void optimizeWrites(std::vector<queued_item> &items) {
-        (void)items;
-        // EMPTY
+    void optimizeWrites(std::vector<queued_item> &items) {
+        if (isReadOnly()) {
+            throw std::logic_error("KVStore::optimizeWrites: Not valid on a "
+                    "read-only object");
+        }
+        if (items.empty()) {
+            return;
+        }
+
+        CompareQueuedItemsBySeqnoAndKey cq;
+        std::sort(items.begin(), items.end(), cq);
+    }
+
+    std::list<PersistenceCallback *>& getPersistenceCbList() {
+        return pcbs;
     }
 
     /**
@@ -369,29 +591,52 @@ public:
      */
     virtual void pendingTasks() = 0;
 
-    virtual uint64_t getLastPersistedSeqno(uint16_t vbid) = 0;
+    uint64_t getLastPersistedSeqno(uint16_t vbid) {
+        vbucket_state *state = cachedVBStates[vbid];
+        if (state) {
+            return state->highSeqno;
+        }
+        return 0;
+    }
 
     bool isReadOnly(void) {
         return readOnly;
     }
 
-    virtual ENGINE_ERROR_CODE getAllKeys(uint16_t vbid,
-                                         std::string &start_key, uint32_t count,
-                                         AllKeysCB *cb) = 0;
+    KVStoreConfig& getConfig(void) {
+        return configuration;
+    }
 
-    virtual ScanContext* initScanContext(shared_ptr<Callback<GetValue> > cb,
-                                         shared_ptr<Callback<CacheLookup> > cl,
+    virtual ENGINE_ERROR_CODE getAllKeys(uint16_t vbid,
+                            std::string &start_key, uint32_t count,
+                            std::shared_ptr<Callback<uint16_t&, char*&> > cb) = 0;
+
+    virtual ScanContext* initScanContext(std::shared_ptr<Callback<GetValue> > cb,
+                                         std::shared_ptr<Callback<CacheLookup> > cl,
                                          uint16_t vbid, uint64_t startSeqno,
-                                         bool keysOnly, bool noDeletes,
-                                         bool deletesOnly) = 0;
+                                         DocumentFilter options,
+                                         ValueFilter valOptions) = 0;
 
     virtual scan_error_t scan(ScanContext* sctx) = 0;
 
     virtual void destroyScanContext(ScanContext* ctx) = 0;
 
 protected:
+    KVStoreConfig &configuration;
     bool readOnly;
+    std::vector<vbucket_state *> cachedVBStates;
+    std::list<PersistenceCallback *> pcbs;
+    void createDataDir(const std::string& dbname);
 
+    /**
+     * Updates the cached state for a vbucket
+     *
+     * @param vbid the vbucket id
+     * @param vbState the new state information for the vbucket
+     *
+     * @return true if the cached vbucket state is updated
+     */
+    bool updateCachedVBState(uint16_t vbid, const vbucket_state& vbState);
 };
 
 /**
@@ -404,11 +649,10 @@ public:
     /**
      * Create a KVStore with the given type.
      *
-     * @param stats     instance of ep-engine stats
      * @param config    engine configuration
      * @param read_only true if the kvstore instance is for read operations only
      */
-    static KVStore *create(Configuration &config, bool read_only = false);
+    static KVStore *create(KVStoreConfig &config, bool read_only = false);
 };
 
 /**
@@ -416,86 +660,18 @@ public:
  */
 class RollbackCB : public Callback<GetValue> {
 public:
-    RollbackCB(EventuallyPersistentEngine& e) :
-        engine_(e), dbHandle(NULL) { }
+    RollbackCB() : dbHandle(NULL) { }
+
+    virtual void callback(GetValue &val) = 0;
 
     void setDbHeader(void *db) {
         dbHandle = db;
     }
 
-    void callback(GetValue &val);
-
-private:
-    EventuallyPersistentEngine& engine_;
+protected:
     void *dbHandle;
 };
 
-/**
- * Callback class used by EpStore, for adding relevent keys
- * to bloomfilter during compaction.
- */
-class BfilterCB {
-public:
-    BfilterCB(EventuallyPersistentStore *eps, uint16_t vbid,
-              bool residentRatioAlert) :
-        store(eps), vbucketId(vbid),
-        residentRatioLessThanThreshold(residentRatioAlert) { }
 
-    void addKeyToFilter(const char *key, size_t keylen, bool isDeleted);
-
-private:
-    EventuallyPersistentStore *store;
-    uint16_t vbucketId;
-    bool residentRatioLessThanThreshold;
-};
-
-/**
- * Callback class used by AllKeysAPI, for caching fetched keys
- *
- * As by default (or in most cases), number of keys is 1000,
- * and an average key could be 32B in length, initialize buffersize of
- * allKeys to 34000 (1000 * 32 + 1000 * 2), the additional 2 bytes per
- * key is for the keylength.
- *
- * This initially allocated buffersize is doubled whenever the length
- * of the buffer holding all the keys, crosses the buffersize.
- */
-class AllKeysCB {
-public:
-    AllKeysCB() {
-        length = 0;
-        buffersize = 34000;
-        buffer = (char *) malloc(buffersize);
-    }
-
-    ~AllKeysCB() {
-        free(buffer);
-    }
-
-    void addtoAllKeys (uint16_t len, char *buf);
-
-    char* getAllKeysPtr() { return buffer; }
-    uint64_t getAllKeysLen() { return length; }
-
-private:
-    uint64_t length;
-    uint64_t buffersize;
-    char *buffer;
-
-};
-
-/**
- * Callback for notifying flusher about pending mutations.
- */
-class NotifyFlusherCB: public Callback<uint16_t> {
-public:
-    NotifyFlusherCB(KVShard *sh)
-        : shard(sh) {}
-
-    void callback(uint16_t &vbid);
-
-private:
-    KVShard *shard;
-};
 
 #endif  // SRC_KVSTORE_H_

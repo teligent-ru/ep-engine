@@ -22,8 +22,9 @@
 #include <limits>
 
 #include "checkpoint.h"
+#include "common.h"
 #include "ep.h"
-#include "histo.h"
+#include <platform/histogram.h>
 #include "item.h"
 #include "stored-value.h"
 #include "vbucket.h"

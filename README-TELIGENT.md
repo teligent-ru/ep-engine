@@ -158,8 +158,7 @@ INCLUDE_DIRECTORIES(BEFORE ${CMAKE_INSTALL_PREFIX}/include
 --------------------------------------------------------------------------
 
 ~~~
-#(было лень переименовывать папку, не обращайте внимания)
-[root@rualpe-vm1 couchbase.4.0.0.RHEL7]#  make PREFIX=/opt/couchbase CMAKE_PREFIX_PATH=/opt/couchbase EXTRA_CMAKE_OPTIONS='-D CMAKE_BUILD_TYPE=RelWithDebInfo'
+make -j4 PREFIX=/opt/couchbase CMAKE_PREFIX_PATH=/opt/couchbase EXTRA_CMAKE_OPTIONS='-D CMAKE_BUILD_TYPE=RelWithDebInfo'
 ...
 Install the project...
 -- Install configuration: "RelWithDebInfo"
@@ -198,3 +197,12 @@ tar vxzf ~/couchbase-4.1.0-patch-to-4.1.0.teligent.7-centos7.x86_64.tgz -C /
 сводная инструкция на конечном узле
 -----------------------------------
 man cb
+
+
+merge изменений из couchbase
+----------------------------
+cd ep-engine
+git remote add couchbase https://github.com/couchbase/ep-engine.git
+git pull couchbase <имя branch, который хотите подтянуть; пока не разбирался, как подтягивать в ветке до определённого commit, было нужно всю 4.5.1 только, в ней последний commit совпал с manifest>
+#manifest: https://github.com/couchbase/manifest/blob/master/released/4.5.1.xml, искать ep-engine, смотреть upstream:
+# <project groups="kv" name="ep-engine" revision="e9a655b49393e1302bf75aa759b11969545c986a" upstream="4.5.1"/>

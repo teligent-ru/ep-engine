@@ -17,9 +17,9 @@
 
 #include "config.h"
 
-#include "ep.h"
 #include "htresizer.h"
-#include "stored-value.h"
+
+#include <memory>
 
 static const double FREQUENCY(60.0);
 
@@ -39,9 +39,9 @@ public:
 };
 
 bool HashtableResizerTask::run(void) {
-    shared_ptr<ResizingVisitor> pv(new ResizingVisitor);
+    std::shared_ptr<ResizingVisitor> pv(new ResizingVisitor);
     store->visit(pv, "Hashtable resizer", NONIO_TASK_IDX,
-            Priority::ItemPagerPriority);
+            TaskId::HashtableResizerVisitorTask);
 
     snooze(FREQUENCY);
     return true;
