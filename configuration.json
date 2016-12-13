@@ -244,6 +244,7 @@
             "default": "11300",
             "descr": "Expiration UDP messages are sent to expiry_host:expiry_port, if both are defined.",
             "type": "size_t"
+        },
         "exp_pager_initial_run_time": {
             "default": "-1",
             "descr": "Hour in GMT time when expiry pager can be scheduled for initial run",
