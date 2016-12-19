@@ -740,16 +740,13 @@ public:
     void setBackfillMemoryThreshold(double threshold);
 
     void setExpiryPagerSleeptime(size_t val);
-<<<<<<< HEAD
     void setExpiryHost(std::string val);
     void setExpiryPort(size_t val);
     void setFlusherMinSleepTime(float val);
 
-=======
     void setExpiryPagerTasktime(ssize_t val);
     void enableExpiryPager();
     void disableExpiryPager();
->>>>>>> e9a655b49393e1302bf75aa759b11969545c986a
 
     void enableAccessScannerTask();
     void disableAccessScannerTask();
@@ -1040,11 +1037,8 @@ protected:
     uint32_t bgFetchDelay;
     double backfillMemoryThreshold;
     struct ExpiryPagerDelta {
-<<<<<<< HEAD
         ExpiryPagerDelta() : sleeptime(0), port(0), task(0) {}
-=======
         ExpiryPagerDelta() : sleeptime(0), task(0), enabled(true) {}
->>>>>>> e9a655b49393e1302bf75aa759b11969545c986a
         Mutex mutex;
         size_t sleeptime;
         std::string host;
