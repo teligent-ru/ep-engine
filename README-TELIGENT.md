@@ -128,15 +128,17 @@ g git://github.com/couchbase tlm f515995bab8229b88bcb15e05c71dd815029aa4c
 #g git://github.com/couchbase v8 05120013843918f7e3712159c03b509d3e328cf7 #нет в manifest 4.1.0, пока оставил, неясно, как так
 g git://github.com/couchbase memcached 3185fbb2a8a6ec126bf924eaf94e7d52e8a2da8e
 g git://github.com/couchbase couchstore bce1f234b312f24968643e55f821bd75327cfc60
+g git://github.com/couchbase forestdb 0d24efb9f5aed4c19ba5e66256e3b5b53190a874
 ~~~
 
 Уберите эти ADD_SUBDIRECTORY из корневого CMakeList.txt
   add_subdirectory given source "googletest" which is not an existing
   add_subdirectory given source "subjson" which is not an existing directory.
-  add_subdirectory given source "forestdb" which is not an existing
   add_subdirectory given source "sigar" which is not an existing directory.
   add_subdirectory given source "moxi" which is not an existing directory.
 
+В platform уберите тесты
+#ADD_SUBDIRECTORY(tests)
 Уберите механизмы сборки memcached и couchstore, сами по себе эти модули не нужны. Нужны только их заголовочные файлы:
 ~~~
 [root@rualpe-vm1 couchbase.4.5.1.teligent.RHEL7]# cat>memcached/CMakeLists.txt

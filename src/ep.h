@@ -1037,8 +1037,7 @@ protected:
     uint32_t bgFetchDelay;
     double backfillMemoryThreshold;
     struct ExpiryPagerDelta {
-        ExpiryPagerDelta() : sleeptime(0), port(0), task(0) {}
-        ExpiryPagerDelta() : sleeptime(0), task(0), enabled(true) {}
+        ExpiryPagerDelta() : sleeptime(0), port(0), task(0), enabled(true) {}
         Mutex mutex;
         size_t sleeptime;
         std::string host;
