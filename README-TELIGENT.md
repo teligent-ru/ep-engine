@@ -129,17 +129,15 @@ g git://github.com/couchbase tlm f515995bab8229b88bcb15e05c71dd815029aa4c
 g git://github.com/couchbase memcached 3185fbb2a8a6ec126bf924eaf94e7d52e8a2da8e
 g git://github.com/couchbase couchstore bce1f234b312f24968643e55f821bd75327cfc60
 g git://github.com/couchbase forestdb 0d24efb9f5aed4c19ba5e66256e3b5b53190a874
+g git://github.com/couchbasedeps googletest f397fa5ec6365329b2e82eb2d8c03a7897bbefb5
 ~~~
 
 Уберите эти ADD_SUBDIRECTORY из корневого CMakeList.txt
-  add_subdirectory given source "googletest" which is not an existing
   add_subdirectory given source "subjson" which is not an existing directory.
   add_subdirectory given source "sigar" which is not an existing directory.
   add_subdirectory given source "moxi" which is not an existing directory.
 
-В platform уберите тесты
-#ADD_SUBDIRECTORY(tests)
-Уберите механизмы сборки memcached и couchstore, сами по себе эти модули не нужны. Нужны только их заголовочные файлы:
+Уберите механизмы сборки memcached, сам по себе этот модуль не нужен. Нужны толькозаголовочные файлы:
 ~~~
 [root@rualpe-vm1 couchbase.4.5.1.teligent.RHEL7]# cat>memcached/CMakeLists.txt
 PROJECT(Memcached)
@@ -158,21 +156,6 @@ INCLUDE_DIRECTORIES(BEFORE
                     ${CMAKE_CURRENT_SOURCE_DIR}/include
                     ${CMAKE_CURRENT_BINARY_DIR}
                     ${CMAKE_CURRENT_SOURCE_DIR})
-[root@rualpe-vm1 couchbase.4.5.1.teligent.RHEL7]# cat>couchstore/CMakeLists.txt
-PROJECT(Couchstore)
-CMAKE_MINIMUM_REQUIRED(VERSION 2.8)
-
-IF (${CMAKE_MAJOR_VERSION} GREATER 2)
-    CMAKE_POLICY(SET CMP0042 NEW)
-ENDIF (${CMAKE_MAJOR_VERSION} GREATER 2)
-
-INCLUDE_DIRECTORIES(BEFORE ${CMAKE_INSTALL_PREFIX}/include
-                           ${CMAKE_CURRENT_SOURCE_DIR}/include
-                           ${CMAKE_CURRENT_SOURCE_DIR}/src
-                           ${CMAKE_CURRENT_BINARY_DIR}
-                           ${CMAKE_CURRENT_SOURCE_DIR}
-                           ${Platform_SOURCE_DIR}/include)
-
 [root@rualpe-vm1 couchbase.4.5.1.teligent.RHEL7]# 
 ~~~
 
@@ -180,8 +163,6 @@ INCLUDE_DIRECTORIES(BEFORE ${CMAKE_INSTALL_PREFIX}/include
 --------------------------------------------------------------------------
 
 ~~~
-#make build/Makefile EXTRA_CMAKE_OPTIONS='-G "Unix Makefiles" -D CMAKE_BUILD_TYPE=RelWithDebInfo -D CMAKE_INSTALL_PREFIX=/opt/couchbase'
-
 mkdir build
 cd build
 cmake -G "Unix Makefiles" -D CMAKE_BUILD_TYPE=RelWithDebInfo -D CMAKE_INSTALL_PREFIX=/opt/couchbase -D COUCHBASE_KV_COMMIT_VALIDATION=1 ..
@@ -190,22 +171,33 @@ make -j6 install
 ...
 Install the project...
 -- Install configuration: "RelWithDebInfo"
--- Up-to-date: /opt/couchbase/lib/libcJSON.so.1.0.0
--- Up-to-date: /opt/couchbase/lib/libcJSON.so
--- Up-to-date: /opt/couchbase/lib/libJSON_checker.so.1.0.0
--- Up-to-date: /opt/couchbase/lib/libJSON_checker.so
--- Up-to-date: /opt/couchbase/lib/libplatform.so.0.1.0
--- Up-to-date: /opt/couchbase/lib/libplatform.so
--- Up-to-date: /opt/couchbase/lib/libdirutils.so.0.1.0
--- Up-to-date: /opt/couchbase/lib/libdirutils.so
--- Up-to-date: /opt/couchbase/lib/memcached/ep.so
-[root@rualpe-vm1 couchbase.4.0.0.RHEL7]#
+-- Installing: /opt/couchbase/bin/cbepctl
+-- Installing: /opt/couchbase/bin/cbstats
+-- Installing: /opt/couchbase/bin/cbcompact
+-- Installing: /opt/couchbase/bin/cbvdiff
+-- Installing: /opt/couchbase/bin/cbvbucketctl
+-- Installing: /opt/couchbase/bin/cbanalyze-core
+-- Installing: /opt/couchbase/lib/python/cbepctl
+-- Installing: /opt/couchbase/lib/python/cbstats
+-- Installing: /opt/couchbase/lib/python/cbcompact
+-- Installing: /opt/couchbase/lib/python/cbvdiff
+-- Installing: /opt/couchbase/lib/python/cbvbucketctl
+-- Installing: /opt/couchbase/lib/python/clitool.py
+-- Installing: /opt/couchbase/lib/python/mc_bin_client.py
+-- Installing: /opt/couchbase/lib/python/mc_bin_server.py
+-- Installing: /opt/couchbase/lib/python/memcacheConstants.py
+-- Installing: /opt/couchbase/lib/python/tap.py
+-- Installing: /opt/couchbase/lib/python/tap_example.py
+-- Installing: /opt/couchbase/share/doc/ep-engine/stats.org
+-- Installing: /opt/couchbase/lib/ep.so
+-- Set runtime path of "/opt/couchbase/lib/ep.so" to "$ORIGIN/../lib:/opt/couchbase/lib:/opt/couchbase/lib/memcached"
+[root@rualpe-vm1 ep-engine]# 
 ~~~
 
 
 выложить результат
 ------------------
-
+find
 ~~~
 os=7
 a2x --doctype manpage --format manpage ep-engine/cb.asciidoc -D /usr/share/man/man1/

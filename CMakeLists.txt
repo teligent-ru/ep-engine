@@ -178,7 +178,37 @@ SET_TARGET_PROPERTIES(ep PROPERTIES PREFIX "")
 TARGET_LINK_LIBRARIES(ep cJSON JSON_checker couchstore forestdb
   dirutils platform ${LIBEVENT_LIBRARIES})
 
+INSTALL(PROGRAMS
+        ${CMAKE_CURRENT_BINARY_DIR}/wrapper/cbepctl
+        ${CMAKE_CURRENT_BINARY_DIR}/wrapper/cbstats
+        ${CMAKE_CURRENT_BINARY_DIR}/wrapper/cbcompact
+        ${CMAKE_CURRENT_BINARY_DIR}/wrapper/cbvdiff
+        ${CMAKE_CURRENT_BINARY_DIR}/wrapper/cbvbucketctl
+        management/cbanalyze-core
+        DESTINATION bin)
+
+INSTALL(PROGRAMS
+        management/cbepctl
+        management/cbstats
+        management/cbcompact
+        management/cbvdiff
+        management/cbvbucketctl
+        DESTINATION lib/python)
+
+INSTALL(FILES
+        management/clitool.py
+        management/mc_bin_client.py
+        management/mc_bin_server.py
+        management/memcacheConstants.py
+        management/tap.py
+        management/tap_example.py
+        DESTINATION lib/python)
+
 INSTALL(FILES
         docs/stats.org
         DESTINATION share/doc/ep-engine)
 
+INSTALL(TARGETS ep
+        RUNTIME DESTINATION bin
+        LIBRARY DESTINATION lib
+        ARCHIVE DESTINATION lib)
