@@ -52,10 +52,16 @@ service ntpdate restart
 залить scp couchbase-server-enterprise-4.5.1-centos7.x86_64.rpm  alexander.petrossian@gigant:/var/www/kickstarts/3RD_PARTY/couchbase/RHEL7/x86_64/
 #теперь доступно http://gigant.teligent.ru/kickstarts/3RD_PARTY/couchbase/RHEL7/x86_64/couchbase-server-enterprise-4.5.1-centos7.x86_64.rpm
 
+~~~
 mkdir -p ~/rpmbuild/SPECS
 cd ~/rpmbuild/SPECS
-восстановть спеку rpmrebuild -e couchbase-server-enterprise и подправить couchbase-server -> couchbase-server-community и наоборот в одном месте
-залить scp couchbase-server-community-4.5.1.spec alexander.petrossian@gigant:/var/www/kickstarts/3RD_PARTY/couchbase/SRPM/
+#восстановть спеку 
+rpmrebuild -e couchbase-server-enterprise 
+:w couchbase-server-community-4.5.1.spec
+:q
+#и подправить couchbase-server -> couchbase-server-community и наоборот в одном месте
+#залить
+scp couchbase-server-community-4.5.1.spec alexander.petrossian@gigant:/var/www/kickstarts/3RD_PARTY/couchbase/SRPM/
 #теперь доступно http://gigant.teligent.ru/kickstarts/3RD_PARTY/couchbase/SRPM/couchbase-server-community-4.5.1.spec
 
 mkdir couchbase.4.5.1.RHEL7
@@ -92,11 +98,11 @@ cd ~/rpmbuild/SPECS
 rpmbuild -bs couchbase-server-community-4.5.1.spec #если будет упираться, chown root:root на все файлы о которых ругань
 rpmbuild -bb couchbase-server-community-4.5.1.spec
 
-залить 
+#залить 
 scp /root/rpmbuild/SRPMS/couchbase-server-community-4.5.1-2844.src.rpm  alexander.petrossian@gigant:/var/www/kickstarts/3RD_PARTY/couchbase/SRPM/
 scp /root/rpmbuild/RPMS/x86_64/couchbase-server-community-4.5.1-2844.x86_64.rpm alexander.petrossian@gigant:/var/www/kickstarts/3RD_PARTY/couchbase/RHEL7/x86_64/
-будет доступно
-http://gigant.teligent.ru/kickstarts/3RD_PARTY/couchbase/RHEL7/x86_64/couchbase-server-community-4.5.1-2844.x86_64.rpm
+#будет доступно http://gigant.teligent.ru/kickstarts/3RD_PARTY/couchbase/RHEL7/x86_64/couchbase-server-community-4.5.1-2844.x86_64.rpm
+~~~
 
 merge изменений из couchbase
 ----------------------------
