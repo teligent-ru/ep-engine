@@ -139,12 +139,9 @@ function g {
 #https://github.com/couchbase/manifest/blob/master/released/4.5.1.xml
 
 g ssh://git@github.com/teligent-ru ep-engine 4.1.5.teligent.10
-#g ssh://git@github.com/teligent-ru platform 4.1.0.teligent.7
 g git://github.com/couchbase platform 349e6e8a62bc383967a81fd8cf12e53b0d760d3e
-#g ssh://git@github.com/teligent-ru tlm 4.1.0.teligent.7
 g git://github.com/couchbase tlm f515995bab8229b88bcb15e05c71dd815029aa4c
 \cp -p tlm/CMakeLists.txt .
-#g git://github.com/couchbase v8 05120013843918f7e3712159c03b509d3e328cf7 #нет в manifest 4.1.0, пока оставил, неясно, как так
 g git://github.com/couchbase memcached 3185fbb2a8a6ec126bf924eaf94e7d52e8a2da8e
 g git://github.com/couchbase couchstore bce1f234b312f24968643e55f821bd75327cfc60
 g git://github.com/couchbase forestdb 0d24efb9f5aed4c19ba5e66256e3b5b53190a874
