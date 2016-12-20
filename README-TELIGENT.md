@@ -262,11 +262,6 @@ http://gigant.teligent.ru/kickstarts/3RD_PARTY/couchbase/RHEL7/x86_64/couchbase-
 http://gigant.teligent.ru/kickstarts/3RD_PARTY/couchbase/SRPM/couchbase-server-community-4.5.1-2844.teligent.10.src.rpm
 
 
-установить couchbase-server-4.5.1
----------------------------------
-
-http://autobuild.teligent.ru/kickstarts/3RD_PARTY/couchbase/RHEL7/x86_64/couchbase-server-community-4.5.1-centos7.x86_64.rpm
-
 сводная инструкция на конечном узле
 -----------------------------------
 man cb
