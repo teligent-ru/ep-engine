@@ -138,7 +138,7 @@ function g {
 #ключи официальных релизов можно подсматривать в manifest:
 #https://github.com/couchbase/manifest/blob/master/released/4.5.1.xml
 
-g ssh://git@github.com/teligent-ru ep-engine 4.1.5.teligent.10
+g ssh://git@github.com/teligent-ru ep-engine 4.1.5.teligent.11
 g git://github.com/couchbase platform 349e6e8a62bc383967a81fd8cf12e53b0d760d3e
 g git://github.com/couchbase tlm f515995bab8229b88bcb15e05c71dd815029aa4c
 \cp -p tlm/CMakeLists.txt .
@@ -216,7 +216,7 @@ Install the project...
 ~~~
 os=7
 version=4.5.1
-teligent=10
+teligent=11
 arch=x86_64
 a2x --doctype manpage --format manpage ep-engine/cb.asciidoc -D /usr/share/man/man1/
 tar -czvf ~/rpmbuild/SOURCES/couchbase-$version-patch-to-$version.teligent.$teligent-centos$os.$arch.tgz /opt/couchbase/lib/{ep.so,libcJSON*} /opt/couchbase/lib/python/cbepctl /usr/share/man/man1/cb.1
@@ -231,16 +231,16 @@ tar -czvf ~/rpmbuild/SOURCES/couchbase-$version-patch-to-$version.teligent.$teli
 os=7
 version=4.5.1
 release=2844
-teligent=10
+teligent=11
 cd ~/rpmbuild/SPECS/
 cp  couchbase-server-community-$version{,.teligent.$teligent}.spec
 vim couchbase-server-community-$version.teligent.$teligent.spec
 #поправил на
-#Release:       2844.teligent.10
+#Release:       2844.teligent.11
 #добавил
 #%attr(0777, root, root) "/usr/share/man/man1/cb.1"
 #залил scp couchbase-server-community-$version.teligent.$teligent.spec alexander.petrossian@gigant:/var/www/kickstarts/3RD_PARTY/couchbase/SRPM/
-#теперь доступно http://gigant.teligent.ru/kickstarts/3RD_PARTY/couchbase/SRPM/couchbase-server-community-4.5.1.teligent.10.spec
+#теперь доступно http://gigant.teligent.ru/kickstarts/3RD_PARTY/couchbase/SRPM/couchbase-server-community-4.5.1.teligent.11.spec
 
 rpmbuild -bs couchbase-server-community-$version.teligent.$teligent.spec #если будет упираться, chown root:root на все файлы о которых ругань
 rpmbuild -bb couchbase-server-community-$version.teligent.$teligent.spec
@@ -252,11 +252,11 @@ scp /root/rpmbuild/RPMS/x86_64/couchbase-server-community-$version-$release.teli
 
 ссылка для скачивания rpm
 -------------------------
-http://gigant.teligent.ru/kickstarts/3RD_PARTY/couchbase/RHEL7/x86_64/couchbase-server-community-4.5.1-2844.teligent.10.x86_64.rpm
+http://gigant.teligent.ru/kickstarts/3RD_PARTY/couchbase/RHEL7/x86_64/couchbase-server-community-4.5.1-2844.teligent.11.x86_64.rpm
 
 ссылка для скачивания srpm (там spec ещё раз)
 ---------------------------------------------
-http://gigant.teligent.ru/kickstarts/3RD_PARTY/couchbase/SRPM/couchbase-server-community-4.5.1-2844.teligent.10.src.rpm
+http://gigant.teligent.ru/kickstarts/3RD_PARTY/couchbase/SRPM/couchbase-server-community-4.5.1-2844.teligent.11.src.rpm
 
 
 сводная инструкция на конечном узле
