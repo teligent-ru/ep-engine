@@ -77,6 +77,7 @@ bool ExpiryChannel::open(const std::string& dstAddr, const int dstPort) {
 		sockaddr_in addr;
 		memset(&addr, 0, sizeof(addr));
 		addr.sin_family = AF_INET;
+		assert(hp->h_length <= sizeof addr.sin_addr);
 		memcpy((char *) &addr.sin_addr, (char *) hp->h_addr, hp->h_length);
 		addr.sin_port = htons(dstPort);
 		
@@ -131,7 +132,7 @@ void ExpiryChannel::sendNotification(const std::string& name, const StoredValue*
 			if (jbody)
 				cJSON_AddItemToObject(root, "body", jbody); // assumes responsibility
 			else
-				LOG(EXTENSION_LOG_WARNING, "%s[%s.%s]: reported its type as JSON but can not parse it, bailing out...", __func__, name.c_str(), v->getKey().c_str());
+				LOG(EXTENSION_LOG_WARNING, "%s[%.%s]: reported its type as JSON but can not parse it, bailing out...", __func__, name.c_str(), v->getKey().c_str());
 			break;
 		}
 		case PROTOCOL_BINARY_RAW_BYTES: {
@@ -139,7 +140,7 @@ void ExpiryChannel::sendNotification(const std::string& name, const StoredValue*
 			break;
 		}
 		default:
-			LOG(EXTENSION_LOG_WARNING, "%s[%s.%s]: can not handle its type[%d] (it's neither RAW=0 nor JSON=1), sending without body", __func__, name.c_str(), v->getKey().c_str(), t);
+			LOG(EXTENSION_LOG_WARNING, "%s[%.%s]: can not handle its type[%d] (it's neither RAW=0 nor JSON=1), sending without body", __func__, name.c_str(), v->getKey().c_str(), t);
 			break;
 	}
 
@@ -147,7 +148,7 @@ void ExpiryChannel::sendNotification(const std::string& name, const StoredValue*
 	cJSON_Delete(root);
 
 	if (!json_cstr) {
-		LOG(EXTENSION_LOG_WARNING, "%s[%s.%s]: failed to serialize to json. Had good type[%d] (RAW=0, JSON=1), bailing out...", __func__, name.c_str(), v->getKey().c_str(), t);
+		LOG(EXTENSION_LOG_WARNING, "%s[%s.%s]: failed to serialize to json. Had good type[%u] (RAW=0, JSON=1), bailing out...", __func__, name.c_str(), v->getKey().c_str(), (unsigned)t);
 		return;
 	}
 	size_t json_length = strlen(json_cstr);
@@ -161,10 +162,13 @@ void ExpiryChannel::sendNotification(const std::string& name, const StoredValue*
 	// (came ICMP with error as a reply to PREVIOUS message)
 	// official way to deal with it is to retry that case
 	// here discovered errno==EINTR also for previous message, tried 1.1.1.1
-	static struct previous_tag {
-		std::string name;
-		std::string key;
-	} previous;
+// think there was a race to handle this data from 4 threads
+// must rework this if we want that warning back
+// but, as comments below go, that warning is false, so replaced it to truer one
+//	static struct previous_tag {
+//		std::string name;
+//		std::string key;
+//	} previous;
 	ssize_t written = -1;
 	for(int attempt = 0; attempt < 2; attempt++) {
 		written = send(mSocket, json_cstr, json_length, 0);
@@ -179,8 +183,12 @@ void ExpiryChannel::sendNotification(const std::string& name, const StoredValue*
 			//
 			// due to this mess, maybe we should remove this confusing warning
 			// leaving it here for now to see if we will ever see that
-			LOG(EXTENSION_LOG_WARNING, "%s[%s.%s]: probably this notification was not delivered. errno[%d]",
-				__func__, previous.name.c_str(), previous.key.c_str(), errno);
+//			LOG(EXTENSION_LOG_WARNING, "%s[%s.%s]: probably this notification was not delivered. errno[%d]",
+//				__func__, previous.name.c_str(), previous.key.c_str(), errno);
+
+			// actually can not say from which bucket so will just give a general warning
+			LOG(EXTENSION_LOG_WARNING, "%s[can not say, which bucket/key, sorry about that]: Previous notification was not delivered. errno[%d]",
+				__func__, errno);
 			continue;
 		}
 		break;
@@ -192,8 +200,8 @@ void ExpiryChannel::sendNotification(const std::string& name, const StoredValue*
 
 	cJSON_Free(json_cstr);
 
-	previous.name = name;
-	previous.key = v->getKey();
+//	previous.name = name;
+//	previous.key = v->getKey();
 }
 
 void ExpiryChannel::close() {
