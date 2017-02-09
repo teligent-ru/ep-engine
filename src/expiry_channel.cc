@@ -132,7 +132,7 @@ void ExpiryChannel::sendNotification(const std::string& name, const StoredValue*
 			if (jbody)
 				cJSON_AddItemToObject(root, "body", jbody); // assumes responsibility
 			else
-				LOG(EXTENSION_LOG_WARNING, "%s[%.%s]: reported its type as JSON but can not parse it, bailing out...", __func__, name.c_str(), v->getKey().c_str());
+				LOG(EXTENSION_LOG_WARNING, "%s[%s.%s]: reported its type as JSON but can not parse it, bailing out...", __func__, name.c_str(), v->getKey().c_str());
 			break;
 		}
 		case PROTOCOL_BINARY_RAW_BYTES: {
@@ -140,7 +140,7 @@ void ExpiryChannel::sendNotification(const std::string& name, const StoredValue*
 			break;
 		}
 		default:
-			LOG(EXTENSION_LOG_WARNING, "%s[%.%s]: can not handle its type[%d] (it's neither RAW=0 nor JSON=1), sending without body", __func__, name.c_str(), v->getKey().c_str(), t);
+			LOG(EXTENSION_LOG_WARNING, "%s[%s.%s]: can not handle its type[%d] (it's neither RAW=0 nor JSON=1), sending without body", __func__, name.c_str(), v->getKey().c_str(), t);
 			break;
 	}
 
